@@ -1,0 +1,51 @@
+name: Publish npm package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish @agboxhq/cli
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build macOS arm64 binary
+        run: |
+          go build -trimpath -ldflags "-s -w" -o npm/cli/dist/agbox-darwin-arm64 ./cmd/agbox
+          chmod +x npm/cli/bin/agbox npm/cli/dist/agbox-darwin-arm64
+
+      - name: Verify npm package
+        working-directory: npm/cli
+        run: |
+          node bin/agbox --help
+          npm pack --dry-run
+
+      - name: Publish npm package
+        working-directory: npm/cli
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public

@@ -124,3 +124,11 @@ agbox export rollback <export-id>
 go test ./...
 go run ./cmd/agbox --help
 ```
+
+## Release
+
+The npm package is published by GitHub Actions from `npm/cli`.
+
+1. Create an npm automation token with publish access to `@agboxhq/cli`.
+2. Add it to the GitHub repository as `NPM_TOKEN`.
+3. Run the `Publish npm package` workflow, or push a `v*` tag.
