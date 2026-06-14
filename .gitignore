@@ -1,0 +1,25 @@
+# Go build/test output
+/agbox
+*.test
+*.out
+coverage.*
+
+# Local Go caches
+.gocache/
+
+# Local runtime data
+*.db
+*.db-*
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# npm package output
+*.tgz
+
+# OS/editor noise
+.DS_Store
+*.swp
+*.swo
