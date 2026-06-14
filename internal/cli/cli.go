@@ -109,7 +109,15 @@ func runInit(args []string, stdout io.Writer) error {
 	if err := ensureGitignore(".agbox/"); err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "Initialized agbox\nstore: %s\nproject: .agbox/\n", s.Path())
+	fmt.Fprintf(stdout, `Initialized agbox
+store: %s
+project: .agbox/
+
+Next steps:
+  agbox demo              # See the workflow in action
+  agbox connect all --apply  # Connect to your AI agents
+  agbox capture --agent codex "Your workflow rule"
+`, s.Path())
 	return nil
 }
 

@@ -61,6 +61,36 @@ func TestExecuteEndToEndPromotionLoop(t *testing.T) {
 	}
 }
 
+func TestInitShowsNextSteps(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(wd)
+
+	var out bytes.Buffer
+	if err := Execute([]string{"init"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"Initialized agbox",
+		"Next steps:",
+		"agbox demo              # See the workflow in action",
+		"agbox connect all --apply  # Connect to your AI agents",
+		"agbox capture --agent codex \"Your workflow rule\"",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("init output missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestHookCaptureIsSilentAndStoresRedactedExcerpt(t *testing.T) {
 	root := t.TempDir()
 	dbPath := filepath.Join(root, "agbox.db")
