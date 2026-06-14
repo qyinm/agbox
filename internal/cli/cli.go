@@ -30,10 +30,28 @@ func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		printUsage(stdout)
 		return nil
 	}
+	if args[0] == "help" {
+		if len(args) == 1 || hasHelpFlag(args[1:]) {
+			printUsage(stdout)
+			return nil
+		}
+		if printCommandHelp(stdout, args[1]) {
+			return nil
+		}
+		return fmt.Errorf("unknown command %q", args[1])
+	}
 	switch args[0] {
-	case "help", "-h", "--help":
+	case "-h", "--help":
 		printUsage(stdout)
 		return nil
+	}
+	if hasHelpFlag(args[1:]) {
+		if printCommandHelp(stdout, args[0]) {
+			return nil
+		}
+		return fmt.Errorf("unknown command %q", args[0])
+	}
+	switch args[0] {
 	case "init":
 		return runInit(args[1:], stdout)
 	case "capture":
@@ -710,6 +728,18 @@ func reorderFlags(args []string, valueFlags map[string]bool) []string {
 	return append(flags, positionals...)
 }
 
+func hasHelpFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		if arg == "--help" || arg == "-h" {
+			return true
+		}
+	}
+	return false
+}
+
 func ensureGitignore(entry string) error {
 	existing, err := os.ReadFile(".gitignore")
 	if err != nil && !os.IsNotExist(err) {
@@ -756,5 +786,151 @@ Usage:
   agbox audit [--profile private|shareable|client] [--out audit.md]
   agbox manifest verify
   agbox doctor
-  agbox repair`)
+  agbox repair
+
+Run agbox <command> --help for command-specific help.`)
+}
+
+func printCommandHelp(w io.Writer, command string) bool {
+	text, ok := commandHelp[strings.ToLower(strings.TrimSpace(command))]
+	if !ok {
+		return false
+	}
+	fmt.Fprintln(w, strings.TrimSpace(text))
+	return true
+}
+
+var commandHelp = map[string]string{
+	"init": `Usage:
+  agbox init
+
+Initialize agbox in the current project, create .agbox/, and ensure .agbox/ is ignored by Git.`,
+	"capture": `Usage:
+  agbox capture [--source manual] [--agent codex] [--project name] [--raw] [--no-excerpt] "Your workflow rule"
+
+Capture a workflow signal manually. If text is omitted, agbox reads from stdin.
+
+Options:
+  --source name    Capture source label. Default: manual
+  --agent name     Agent name. Default: unknown
+  --project name   Project name. Default: current directory name
+  --raw            Store redacted raw text
+  --no-excerpt     Store hash and metadata only`,
+	"hook": `Usage:
+  agbox hook <claude|codex> [--verbose]
+
+Capture a workflow signal from an agent hook payload read from stdin.
+
+Options:
+  --verbose        Print the captured event ID and hash`,
+	"connect": `Usage:
+  agbox connect <claude|codex|all> [--dry-run|--apply] [--command /path/to/agbox]
+
+Install agbox-managed hook config for Claude Code, Codex, or both.
+
+Options:
+  --dry-run        Print the hook config plan without writing
+  --apply          Apply the hook config change
+  --command path   Absolute agbox command path for installed hooks`,
+	"disconnect": `Usage:
+  agbox disconnect <claude|codex|all> [--dry-run|--apply]
+
+Remove only agbox-managed hook config for Claude Code, Codex, or both.
+
+Options:
+  --dry-run        Print the hook config plan without writing
+  --apply          Apply the hook config change`,
+	"discover": `Usage:
+  agbox discover [--min-repeats 2] [--state pending|all] [--limit 5]
+
+Scan captured events and show reviewable workflow candidates with next actions.
+
+Options:
+  --min-repeats n  Minimum repeated signals. Default: 2
+  --state state    Candidate state filter, or all. Default: pending
+  --limit n        Maximum candidates to show. Default: 5`,
+	"demo": `Usage:
+  agbox demo
+
+Show the agbox workflow in a temporary store without touching your data.`,
+	"scan": `Usage:
+  agbox scan [--min-repeats 2]
+
+Scan captured events for repeated workflow signals.
+
+Options:
+  --min-repeats n  Minimum repeated signals. Default: 2`,
+	"inbox": `Usage:
+  agbox inbox [--state pending]
+
+List workflow candidates in the promotion inbox.
+
+Options:
+  --state state    Candidate state filter`,
+	"evidence": `Usage:
+  agbox evidence <candidate-id>
+
+Show evidence, privacy status, and excerpts for a workflow candidate.`,
+	"approve": `Usage:
+  agbox approve <candidate-id> [--name workflow-name]
+
+Approve a workflow candidate for export.
+
+Options:
+  --name name      Candidate skill name`,
+	"reject": `Usage:
+  agbox reject <candidate-id> [--name workflow-name]
+
+Reject a workflow candidate.
+
+Options:
+  --name name      Candidate skill name`,
+	"compile": `Usage:
+  agbox compile <candidate-id> [--target agents-md|claude|codex|cursor|cline]
+
+Render an approved workflow candidate for a target agent format.
+
+Options:
+  --target target  Output format. Default: agents-md`,
+	"export": `Usage:
+  agbox export [candidate-id...] [--target agents-md] [--path relative/path] [--dry-run]
+  agbox export rollback <export-id>
+
+Export approved workflow candidates or roll back an export.
+
+Options:
+  --target target  Export target. Default: agents-md
+  --path path      Relative export path
+  --dry-run        Print the export plan without writing`,
+	"manifest": `Usage:
+  agbox manifest verify
+
+Verify exported agbox manifest state for the current project.`,
+	"impact": `Usage:
+  agbox impact <candidate-id>
+
+Show before/after recurrence counts for an exported workflow candidate.`,
+	"audit": `Usage:
+  agbox audit [--profile private|shareable|client] [--out audit.md]
+
+Render an audit report.
+
+Options:
+  --profile name   Audit profile. Default: private
+  --out path       Write markdown to a file instead of stdout`,
+	"doctor": `Usage:
+  agbox doctor
+
+Check agbox store and hook health.`,
+	"debug-bundle": `Usage:
+  agbox debug-bundle [--out agbox-debug-bundle.txt]
+
+Write a local debug bundle for troubleshooting.
+
+Options:
+  --out path       Debug bundle output path`,
+	"repair": `Usage:
+  agbox repair
+
+Repair exported files from agbox manifest state.`,
 }

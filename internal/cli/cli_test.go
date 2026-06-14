@@ -91,6 +91,48 @@ func TestInitShowsNextSteps(t *testing.T) {
 	}
 }
 
+func TestCommandHelpDoesNotOpenStore(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "agbox.db")
+	t.Setenv("AGBOX_DB", dbPath)
+
+	var out bytes.Buffer
+	if err := Execute([]string{"capture", "--help"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"Usage:",
+		"agbox capture",
+		"--agent name",
+		"reads from stdin",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("capture help missing %q:\n%s", want, got)
+		}
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("capture help opened store: %v", err)
+	}
+}
+
+func TestHelpCommandShowsCommandHelp(t *testing.T) {
+	var out bytes.Buffer
+	if err := Execute([]string{"help", "connect"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"agbox connect <claude|codex|all>",
+		"--command path",
+		"Install agbox-managed hook config",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("connect help missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestHookCaptureIsSilentAndStoresRedactedExcerpt(t *testing.T) {
 	root := t.TempDir()
 	dbPath := filepath.Join(root, "agbox.db")
