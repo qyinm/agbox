@@ -17,7 +17,16 @@ agbox is not trying to count exported files. The product loop is:
 3. Let the user approve, edit, export, and roll back a portable skill.
 4. Measure whether the same correction stops recurring after export.
 
-## Install from source
+## Install
+
+```sh
+npm install -g @agboxhq/cli
+agbox doctor
+```
+
+The npm package currently ships a macOS arm64 binary.
+
+For local development from source:
 
 ```sh
 go install ./cmd/agbox

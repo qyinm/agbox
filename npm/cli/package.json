@@ -1,0 +1,32 @@
+{
+  "name": "@agboxhq/cli",
+  "version": "0.1.0",
+  "description": "Local-first CLI for turning repeated AI-agent workflow signals into reusable skills.",
+  "license": "MIT",
+  "homepage": "https://github.com/qyinm/agbox#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qyinm/agbox.git"
+  },
+  "bin": {
+    "agbox": "bin/agbox"
+  },
+  "files": [
+    "bin/",
+    "dist/",
+    "scripts/",
+    "README.md"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
