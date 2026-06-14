@@ -13,6 +13,7 @@ import (
 	"github.com/hippoom/agbox/internal/audit"
 	"github.com/hippoom/agbox/internal/capture"
 	"github.com/hippoom/agbox/internal/compile"
+	hookconnect "github.com/hippoom/agbox/internal/connect"
 	"github.com/hippoom/agbox/internal/doctor"
 	"github.com/hippoom/agbox/internal/evidence"
 	agexport "github.com/hippoom/agbox/internal/export"
@@ -41,6 +42,12 @@ func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return withStore(func(s *store.Store) error { return runHook(s, args[1:], stdin, stdout) })
 	case "connect":
 		return runConnect(args[1:], stdout)
+	case "disconnect":
+		return runDisconnect(args[1:], stdout)
+	case "discover":
+		return withStore(func(s *store.Store) error { return runDiscover(s, args[1:], stdout) })
+	case "demo":
+		return runDemo(stdout)
 	case "scan":
 		return withStore(func(s *store.Store) error { return runScan(s, args[1:], stdout) })
 	case "inbox":
@@ -136,41 +143,110 @@ func runCapture(s *store.Store, args []string, stdin io.Reader, stdout io.Writer
 }
 
 func runHook(s *store.Store, args []string, stdin io.Reader, stdout io.Writer) error {
-	if len(args) == 0 {
+	fs := flag.NewFlagSet("hook", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	verbose := fs.Bool("verbose", false, "print capture result")
+	if err := fs.Parse(reorderFlags(args, map[string]bool{})); err != nil {
+		return err
+	}
+	if len(fs.Args()) == 0 {
 		return errors.New("usage: agbox hook <claude|codex>")
 	}
+	agent := fs.Args()[0]
 	data, err := io.ReadAll(stdin)
 	if err != nil {
 		return err
 	}
 	text := extractHookText(data)
 	e, err := capture.Capture(s, text, capture.Options{
-		Source: "hook", Agent: args[0], Project: defaultProject(), NoExcerpt: true,
+		Source: "hook", Agent: agent, Project: defaultProject(), Redact: true,
 	})
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "hook captured %s hash=%s\n", e.ID, e.Hash[:12])
+	if *verbose {
+		fmt.Fprintf(stdout, "hook captured %s hash=%s\n", e.ID, e.Hash[:12])
+	}
 	return nil
 }
 
 func runConnect(args []string, stdout io.Writer) error {
-	if len(args) == 0 {
-		return errors.New("usage: agbox connect <claude|codex>")
+	return runHookConfig(hookconnect.ActionConnect, args, stdout)
+}
+
+func runDisconnect(args []string, stdout io.Writer) error {
+	return runHookConfig(hookconnect.ActionDisconnect, args, stdout)
+}
+
+func runHookConfig(action string, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet(action, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	apply := fs.Bool("apply", false, "apply the hook config change")
+	dryRun := fs.Bool("dry-run", false, "print the hook config plan without writing")
+	command := fs.String("command", "", "absolute agbox command path for installed hook")
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"command": true})); err != nil {
+		return err
 	}
-	switch args[0] {
-	case "claude":
-		fmt.Fprintln(stdout, "Claude Code hook command:")
-		fmt.Fprintln(stdout, "  agbox hook claude")
-		fmt.Fprintln(stdout, "Keep raw transcripts off by default; this captures hash+metadata workflow signals.")
-	case "codex":
-		fmt.Fprintln(stdout, "Codex hook command:")
-		fmt.Fprintln(stdout, "  agbox hook codex")
-		fmt.Fprintln(stdout, "Use the official Codex hooks config to call this command for prompt/session events.")
-	default:
-		return fmt.Errorf("unsupported agent %q", args[0])
+	if *apply && *dryRun {
+		return errors.New("--apply and --dry-run are mutually exclusive")
+	}
+	if len(fs.Args()) == 0 {
+		return fmt.Errorf("usage: agbox %s <claude|codex|all> [--dry-run|--apply]", action)
+	}
+	agents, err := hookConfigAgents(fs.Args()[0])
+	if err != nil {
+		return err
+	}
+	plans := make([]hookconnect.Plan, 0, len(agents))
+	for _, agent := range agents {
+		plan, err := hookconnect.BuildPlan(agent, action, hookconnect.Options{Command: *command})
+		if err != nil {
+			return err
+		}
+		plans = append(plans, plan)
+	}
+	var data []byte
+	if len(plans) == 1 {
+		data, _ = json.MarshalIndent(plans[0], "", "  ")
+	} else {
+		data, _ = json.MarshalIndent(plans, "", "  ")
+	}
+	fmt.Fprintln(stdout, string(data))
+	if !*apply {
+		return nil
+	}
+	for _, plan := range plans {
+		if err := hookconnect.ValidateApply(plan); err != nil {
+			return err
+		}
+	}
+	for _, plan := range plans {
+		result, err := hookconnect.Apply(plan)
+		if err != nil {
+			return err
+		}
+		printHookConfigResult(stdout, action, result)
 	}
 	return nil
+}
+
+func printHookConfigResult(stdout io.Writer, action string, result hookconnect.Result) {
+	fmt.Fprintf(stdout, "%s applied agent=%s path=%s changed=%t", action, result.Plan.Agent, result.Plan.Path, result.Changed)
+	if result.BackupPath != "" {
+		fmt.Fprintf(stdout, " backup=%s", result.BackupPath)
+	}
+	fmt.Fprintln(stdout)
+}
+
+func hookConfigAgents(agent string) ([]string, error) {
+	switch strings.ToLower(strings.TrimSpace(agent)) {
+	case "all":
+		return []string{hookconnect.AgentCodex, hookconnect.AgentClaude}, nil
+	case hookconnect.AgentCodex, hookconnect.AgentClaude:
+		return []string{strings.ToLower(strings.TrimSpace(agent))}, nil
+	default:
+		return nil, fmt.Errorf("unsupported agent %q", agent)
+	}
 }
 
 func runScan(s *store.Store, args []string, stdout io.Writer) error {
@@ -203,7 +279,7 @@ func runInbox(s *store.Store, args []string, stdout io.Writer) error {
 		return err
 	}
 	if len(candidates) == 0 {
-		fmt.Fprintln(stdout, "Inbox empty. Run `agbox capture` and `agbox scan`.")
+		fmt.Fprintln(stdout, "Inbox empty. Run `agbox discover` after a few agent sessions, or test manually with `agbox capture` and `agbox scan`.")
 		return nil
 	}
 	fmt.Fprintln(stdout, "Promotion Inbox")
@@ -211,6 +287,159 @@ func runInbox(s *store.Store, args []string, stdout io.Writer) error {
 		fmt.Fprintf(stdout, "%s  %-9s  repeats=%d projects=%d confidence=%s  %s\n", c.ID, c.State, c.EventCount, c.ProjectCount, c.Confidence, c.Name)
 	}
 	return nil
+}
+
+func runDiscover(s *store.Store, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("discover", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	minRepeats := fs.Int("min-repeats", 2, "minimum repeated signals")
+	state := fs.String("state", string(model.CandidatePending), "candidate state filter, or all")
+	limit := fs.Int("limit", 5, "maximum candidates to show")
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"min-repeats": true, "state": true, "limit": true})); err != nil {
+		return err
+	}
+	if *limit < 0 {
+		return errors.New("--limit must be 0 or greater")
+	}
+	result, err := scan.Run(s, *minRepeats)
+	if err != nil {
+		return err
+	}
+	stateFilter := strings.ToLower(strings.TrimSpace(*state))
+	if stateFilter == "all" {
+		stateFilter = ""
+	}
+	candidates, err := s.ListCandidates(stateFilter)
+	if err != nil {
+		return err
+	}
+	if *limit > 0 && len(candidates) > *limit {
+		candidates = candidates[:*limit]
+	}
+	if len(candidates) == 0 {
+		fmt.Fprintf(stdout, "No workflow candidates yet.\nscanned %d events, found %d repeated signals\n", result.Scanned, len(result.Candidates))
+		if result.Scanned == 0 {
+			fmt.Fprintln(stdout, "agbox has not captured any prompts in this store.")
+		} else {
+			fmt.Fprintf(stdout, "Capture at least %d matching prompts before a candidate appears.\n", normalizedMinRepeats(*minRepeats))
+		}
+		printHookStatus(stdout)
+		printDiscoverNext(stdout)
+		return nil
+	}
+	fmt.Fprintf(stdout, "Workflow candidates\nscanned %d events, found %d repeated signals, showing %d %s candidates\n",
+		result.Scanned, len(result.Candidates), len(candidates), displayState(stateFilter))
+	for i, c := range candidates {
+		card, err := evidence.Build(s, c.ID)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "\n%d. %s (%s)\n", i+1, c.Name, c.ID)
+		fmt.Fprintf(stdout, "   repeats=%d projects=%d sources=%d confidence=%s state=%s\n",
+			c.EventCount, c.ProjectCount, c.SourceCount, c.Confidence, c.State)
+		fmt.Fprintf(stdout, "   why: %s\n", card.Reason)
+		if len(card.Excerpts) > 0 {
+			fmt.Fprintf(stdout, "   excerpt: %s\n", card.Excerpts[0])
+		}
+		fmt.Fprintf(stdout, "   next: agbox evidence %s\n", c.ID)
+		fmt.Fprintf(stdout, "         agbox approve %s --name %s\n", c.ID, c.Name)
+		fmt.Fprintf(stdout, "         agbox export %s --target agents-md --dry-run\n", c.ID)
+	}
+	return nil
+}
+
+func runDemo(stdout io.Writer) error {
+	dir, err := os.MkdirTemp("", "agbox-demo-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	s, err := store.Open(filepath.Join(dir, "agbox.db"))
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	for _, input := range []struct {
+		agent string
+		text  string
+	}{
+		{agent: "codex", text: "Use bun, not npm."},
+		{agent: "claude", text: "Use bun, not npm."},
+	} {
+		if _, err := capture.Capture(s, input.text, capture.Options{
+			Source: "demo", Agent: input.agent, Project: "agbox-demo", Redact: true,
+		}); err != nil {
+			return err
+		}
+	}
+	result, err := scan.Run(s, 2)
+	if err != nil {
+		return err
+	}
+	if len(result.Candidates) == 0 {
+		return errors.New("demo did not produce a candidate")
+	}
+	c := result.Candidates[0]
+	card, err := evidence.Build(s, c.ID)
+	if err != nil {
+		return err
+	}
+	if err := s.SetCandidateState(c.ID, model.CandidateApproved, "package-manager-workflow"); err != nil {
+		return err
+	}
+	approved, err := s.GetCandidate(c.ID)
+	if err != nil {
+		return err
+	}
+	artifact, err := compile.Render(approved, "agents-md")
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, "agbox demo: repeated workflow signal detected")
+	fmt.Fprintf(stdout, "%s  repeats=%d confidence=%s\n", c.ID, c.EventCount, c.Confidence)
+	if len(card.Excerpts) > 0 {
+		fmt.Fprintf(stdout, "excerpt: %s\n", card.Excerpts[0])
+	}
+	fmt.Fprintln(stdout, "\nSkill preview:")
+	fmt.Fprintln(stdout, strings.TrimSpace(artifact.Body))
+	fmt.Fprintln(stdout, "\nNo files were changed; this demo used a temporary local store.")
+	fmt.Fprintln(stdout, "Use this on your own agent sessions:")
+	fmt.Fprintln(stdout, "  agbox connect all --apply")
+	fmt.Fprintln(stdout, "  agbox discover")
+	return nil
+}
+
+func normalizedMinRepeats(n int) int {
+	if n <= 0 {
+		return 2
+	}
+	return n
+}
+
+func displayState(state string) string {
+	if strings.TrimSpace(state) == "" {
+		return "all"
+	}
+	return state
+}
+
+func printHookStatus(stdout io.Writer) {
+	fmt.Fprintln(stdout, "\nHook status")
+	for _, status := range hookconnect.StatusAll() {
+		line := fmt.Sprintf("- %s: %s", status.Agent, status.State)
+		if status.Detail != "" {
+			line += " (" + status.Detail + ")"
+		}
+		fmt.Fprintln(stdout, line)
+	}
+}
+
+func printDiscoverNext(stdout io.Writer) {
+	fmt.Fprintln(stdout, "\nNext")
+	fmt.Fprintln(stdout, "1. agbox connect all --apply")
+	fmt.Fprintln(stdout, "2. Work normally in Codex or Claude for a few prompts.")
+	fmt.Fprintln(stdout, "3. agbox discover")
+	fmt.Fprintln(stdout, "\nWant to see the loop without touching your data? Run `agbox demo`.")
 }
 
 func runEvidence(s *store.Store, args []string, stdout io.Writer) error {
@@ -510,6 +739,11 @@ Usage:
   agbox compile <candidate-id> [--target agents-md|claude|codex|cursor|cline]
   agbox export [candidate-id...] [--target agents-md] [--dry-run]
   agbox export rollback <export-id>
+  agbox hook <claude|codex> [--verbose]
+  agbox connect <claude|codex|all> [--dry-run|--apply] [--command /path/to/agbox]
+  agbox disconnect <claude|codex|all> [--dry-run|--apply]
+  agbox discover [--min-repeats 2] [--state pending|all] [--limit 5]
+  agbox demo
   agbox impact <candidate-id>
   agbox audit [--profile private|shareable|client] [--out audit.md]
   agbox manifest verify

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
+	hookconnect "github.com/hippoom/agbox/internal/connect"
 	"github.com/hippoom/agbox/internal/store"
 )
 
@@ -24,6 +25,22 @@ func Run(s *store.Store) Report {
 	r.Lines = append(r.Lines, fmt.Sprintf("events: %d", stats.Events))
 	r.Lines = append(r.Lines, fmt.Sprintf("candidates: %d", stats.Candidates))
 	r.Lines = append(r.Lines, fmt.Sprintf("exports: %d", stats.Exports))
+	for _, status := range hookconnect.StatusAll() {
+		line := fmt.Sprintf("hook %s: %s", status.Agent, status.State)
+		if status.Path != "" {
+			line += " " + status.Path
+		}
+		if status.Command != "" {
+			line += " command=" + status.Command
+		}
+		if status.Detail != "" {
+			line += " (" + status.Detail + ")"
+		}
+		r.Lines = append(r.Lines, line)
+		if !status.OK {
+			r.OK = false
+		}
+	}
 	return r
 }
 

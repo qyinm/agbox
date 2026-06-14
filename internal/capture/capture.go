@@ -18,12 +18,16 @@ type Options struct {
 	Project   string
 	StoreRaw  bool
 	NoExcerpt bool
+	Redact    bool
 }
 
 func Capture(s *store.Store, text string, opts Options) (model.Event, error) {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return model.Event{}, fmt.Errorf("capture text is empty")
+	}
+	if opts.Redact {
+		text = privacy.Redact(text)
 	}
 	if len([]byte(text)) > privacy.MaxSignalBytes {
 		return model.Event{}, fmt.Errorf("capture text exceeds %d bytes", privacy.MaxSignalBytes)
