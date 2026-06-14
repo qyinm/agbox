@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	tea "charm.land/bubbletea/v2"
+
 	"github.com/hippoom/agbox/internal/audit"
 	"github.com/hippoom/agbox/internal/capture"
 	"github.com/hippoom/agbox/internal/compile"
@@ -23,6 +25,7 @@ import (
 	"github.com/hippoom/agbox/internal/model"
 	"github.com/hippoom/agbox/internal/scan"
 	"github.com/hippoom/agbox/internal/store"
+	"github.com/hippoom/agbox/internal/tui"
 )
 
 func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -64,6 +67,8 @@ func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return runDisconnect(args[1:], stdout)
 	case "discover":
 		return withStore(func(s *store.Store) error { return runDiscover(s, args[1:], stdout) })
+	case "review":
+		return runReview(args[1:], stdin, stdout)
 	case "demo":
 		return runDemo(stdout)
 	case "scan":
@@ -372,6 +377,63 @@ func runDiscover(s *store.Store, args []string, stdout io.Writer) error {
 		fmt.Fprintf(stdout, "         agbox export %s --target agents-md --dry-run\n", c.ID)
 	}
 	return nil
+}
+
+func runReview(args []string, stdin io.Reader, stdout io.Writer) error {
+	fs := flag.NewFlagSet("review", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	state := fs.String("state", string(model.CandidatePending), "candidate state filter, or all")
+	minRepeats := fs.Int("min-repeats", 2, "minimum repeated signals")
+	limit := fs.Int("limit", 20, "maximum candidates to show")
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"state": true, "min-repeats": true, "limit": true})); err != nil {
+		return err
+	}
+	if *limit < 0 {
+		return errors.New("--limit must be 0 or greater")
+	}
+	if !validReviewState(*state) {
+		return fmt.Errorf("--state must be pending, approved, rejected, exported, or all")
+	}
+	if !interactiveTerminal(stdin) || !interactiveTerminal(stdout) {
+		return errors.New("agbox review requires an interactive terminal; use agbox discover or agbox inbox instead")
+	}
+	s, err := store.Open("")
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	service := tui.NewReviewService(s, tui.ReviewOptions{
+		State:      *state,
+		MinRepeats: *minRepeats,
+		Limit:      *limit,
+	})
+	m := tui.NewReviewModel(service).Refresh()
+	_, err = tea.NewProgram(m, tea.WithInput(stdin), tea.WithOutput(stdout)).Run()
+	if errors.Is(err, tea.ErrInterrupted) {
+		return nil
+	}
+	return err
+}
+
+func validReviewState(state string) bool {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case string(model.CandidatePending), string(model.CandidateApproved), string(model.CandidateRejected), string(model.CandidateExported), "all":
+		return true
+	default:
+		return false
+	}
+}
+
+func interactiveTerminal(v any) bool {
+	f, ok := v.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 func runDemo(stdout io.Writer) error {
@@ -781,6 +843,7 @@ Usage:
   agbox connect <claude|codex|all> [--dry-run|--apply] [--command /path/to/agbox]
   agbox disconnect <claude|codex|all> [--dry-run|--apply]
   agbox discover [--min-repeats 2] [--state pending|all] [--limit 5]
+  agbox review [--state pending|approved|rejected|exported|all] [--min-repeats 2] [--limit 20]
   agbox demo
   agbox impact <candidate-id>
   agbox audit [--profile private|shareable|client] [--out audit.md]
@@ -849,6 +912,15 @@ Options:
   --min-repeats n  Minimum repeated signals. Default: 2
   --state state    Candidate state filter, or all. Default: pending
   --limit n        Maximum candidates to show. Default: 5`,
+	"review": `Usage:
+  agbox review [--state pending|approved|rejected|exported|all] [--min-repeats 2] [--limit 20]
+
+Open the interactive review UI for workflow candidates.
+
+Options:
+  --state state    Candidate state filter, or all. Default: pending
+  --min-repeats n  Minimum repeated signals. Default: 2
+  --limit n        Maximum candidates to show. Default: 20`,
 	"demo": `Usage:
   agbox demo
 

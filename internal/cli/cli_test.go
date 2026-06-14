@@ -116,6 +116,50 @@ func TestCommandHelpDoesNotOpenStore(t *testing.T) {
 	}
 }
 
+func TestReviewHelpDoesNotOpenStore(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "agbox.db")
+	t.Setenv("AGBOX_DB", dbPath)
+
+	var out bytes.Buffer
+	if err := Execute([]string{"review", "--help"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"agbox review",
+		"--state state",
+		"--min-repeats n",
+		"--limit n",
+		"interactive review UI",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("review help missing %q:\n%s", want, got)
+		}
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("review help opened store: %v", err)
+	}
+}
+
+func TestReviewNonInteractiveReturnsTerminalError(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "agbox.db")
+	t.Setenv("AGBOX_DB", dbPath)
+
+	err := Execute([]string{"review"}, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("review succeeded with non-interactive stdio")
+	}
+	want := "agbox review requires an interactive terminal; use agbox discover or agbox inbox instead"
+	if err.Error() != want {
+		t.Fatalf("review error = %q, want %q", err.Error(), want)
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("review noninteractive opened store: %v", err)
+	}
+}
+
 func TestHelpCommandShowsCommandHelp(t *testing.T) {
 	var out bytes.Buffer
 	if err := Execute([]string{"help", "connect"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
