@@ -224,6 +224,32 @@ func TestAgentStatusDetectsUnsupportedCodexTOML(t *testing.T) {
 	}
 }
 
+func TestResolveCommandFromGoTemporaryExecutableSuggestsInstall(t *testing.T) {
+	original := executablePath
+	executablePath = func() (string, error) {
+		return filepath.Join(os.TempDir(), "go-build123", "b001", "exe", "agbox"), nil
+	}
+	t.Cleanup(func() {
+		executablePath = original
+	})
+
+	_, err := resolveCommand("")
+	if err == nil {
+		t.Fatal("resolveCommand() succeeded for Go temporary executable")
+	}
+	got := err.Error()
+	for _, want := range []string{
+		"running from source with go run",
+		"go install ./cmd/agbox",
+		"npm install -g @agboxhq/cli",
+		"--command /absolute/path/to/agbox",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("resolveCommand error missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func fakeExecutable(t *testing.T, dir string) string {
 	t.Helper()
 	path := filepath.Join(dir, "agbox")

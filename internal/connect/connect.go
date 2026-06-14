@@ -23,6 +23,8 @@ const (
 	promptEvent   = "UserPromptSubmit"
 )
 
+var executablePath = os.Executable
+
 type Options struct {
 	Command string
 }
@@ -439,12 +441,12 @@ func ensureObject(parent map[string]any, key string) map[string]any {
 
 func resolveCommand(command string) (string, error) {
 	if strings.TrimSpace(command) == "" {
-		exe, err := os.Executable()
+		exe, err := executablePath()
 		if err != nil {
 			return "", err
 		}
 		if strings.Contains(exe, "go-build") {
-			return "", fmt.Errorf("cannot infer stable agbox path from Go temporary executable %s; pass --command /path/to/agbox", exe)
+			return "", fmt.Errorf("cannot infer stable agbox path from Go temporary executable %s. This usually happens when running from source with go run. Install agbox with `go install ./cmd/agbox` or `npm install -g @agboxhq/cli`, then rerun `agbox connect`, or pass --command /absolute/path/to/agbox", exe)
 		}
 		command = exe
 	}
