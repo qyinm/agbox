@@ -26,12 +26,13 @@ func Build(s *store.Store, candidateID string) (Meter, error) {
 	if err != nil && err != sql.ErrNoRows {
 		return Meter{}, err
 	}
+	applied := err == nil && exp.Status == model.ExportApplied && !exp.AppliedAt.IsZero()
 	events, err := s.EventsForCandidate(candidateID)
 	if err != nil {
 		return Meter{}, err
 	}
 	after := 0
-	if !exp.AppliedAt.IsZero() {
+	if applied {
 		for _, e := range events {
 			if e.CreatedAt.After(exp.AppliedAt) {
 				after++
@@ -40,15 +41,25 @@ func Build(s *store.Store, candidateID string) (Meter, error) {
 	}
 	before := c.EventCount - after
 	reduction := before - after
+	if !applied {
+		reduction = 0
+	}
 	if reduction < 0 {
 		reduction = 0
 	}
 	confidence := "low"
-	if exp.Status == model.ExportApplied && before >= 3 {
+	if !applied {
+		confidence = "unmeasured"
+	}
+	if applied && before >= 3 {
 		confidence = "medium"
 	}
-	if exp.Status == model.ExportApplied && before >= 5 && after == 0 {
+	if applied && before >= 5 && after == 0 {
 		confidence = "high"
+	}
+	window := "no applied export yet; impact starts measuring after export"
+	if applied {
+		window = "all-time before export vs after export as of " + time.Now().Format("2006-01-02")
 	}
 	return Meter{
 		CandidateID: candidateID,
@@ -56,6 +67,6 @@ func Build(s *store.Store, candidateID string) (Meter, error) {
 		After:       after,
 		Reduction:   reduction,
 		Confidence:  confidence,
-		Window:      "all-time before export vs after export as of " + time.Now().Format("2006-01-02"),
+		Window:      window,
 	}, nil
 }
