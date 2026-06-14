@@ -23,17 +23,18 @@ func Run(s *store.Store, minRepeats int) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	byHash := map[string][]model.Event{}
+	byFingerprint := map[string][]model.Event{}
 	for _, e := range events {
-		byHash[e.Hash] = append(byHash[e.Hash], e)
+		fingerprint := clusterFingerprint(e)
+		byFingerprint[fingerprint] = append(byFingerprint[fingerprint], e)
 	}
 	var result Result
 	result.Scanned = len(events)
-	for hash, group := range byHash {
+	for fingerprint, group := range byFingerprint {
 		if len(group) < minRepeats {
 			continue
 		}
-		c := buildCandidate(hash, group)
+		c := buildCandidate(fingerprint, group)
 		ids := make([]string, 0, len(group))
 		for _, e := range group {
 			ids = append(ids, e.ID)
@@ -52,7 +53,7 @@ func Run(s *store.Store, minRepeats int) (Result, error) {
 	return result, nil
 }
 
-func buildCandidate(hash string, events []model.Event) model.Candidate {
+func buildCandidate(fingerprint string, events []model.Event) model.Candidate {
 	first := events[0].CreatedAt
 	last := events[0].CreatedAt
 	projects := map[string]bool{}
@@ -73,9 +74,12 @@ func buildCandidate(hash string, events []model.Event) model.Candidate {
 	}
 	ruleText := excerpt
 	if ruleText == "" {
-		ruleText = "Workflow signal " + hash[:12]
+		ruleText = "Workflow signal " + fingerprint[:12]
 	}
 	name := privacy.Slug(ruleText)
+	if kind := workflowKind(events); kind != "" {
+		name = privacy.Slug(kind)
+	}
 	confidence := "medium"
 	if len(events) >= 5 || len(projects) >= 2 {
 		confidence = "high"
@@ -85,10 +89,10 @@ func buildCandidate(hash string, events []model.Event) model.Candidate {
 	}
 	now := time.Now()
 	return model.Candidate{
-		ID:           "cand_" + hash[:12],
-		Fingerprint:  hash,
+		ID:           "cand_" + fingerprint[:12],
+		Fingerprint:  fingerprint,
 		Name:         name,
-		Description:  "Use when this repeated workflow instruction appears in agent sessions.",
+		Description:  workflowDescription(events),
 		RuleText:     ruleText,
 		State:        model.CandidatePending,
 		EventCount:   len(events),
