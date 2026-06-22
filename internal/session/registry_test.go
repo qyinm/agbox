@@ -3,6 +3,7 @@ package session_test
 import (
 	"testing"
 
+	_ "github.com/hippoom/agbox/internal/session/claude"
 	"github.com/hippoom/agbox/internal/session"
 )
 

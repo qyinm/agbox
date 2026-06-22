@@ -1,0 +1,2 @@
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"run_terminal_cmd","input":{"command":"npm install"}}]}}
+{"type":"user","message":{"content":[{"type":"text","text":"use bun, not npm"}]}}

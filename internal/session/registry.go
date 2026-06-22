@@ -1,17 +1,10 @@
 package session
 
-type stubAdapter struct{}
+var adapters []Adapter
 
-func (stubAdapter) Agent() string { return "stub" }
-
-func (stubAdapter) DiscoverSources() ([]Source, error) { return nil, nil }
-
-func (stubAdapter) ParseDelta(_ Source, _ Cursor) (ParseResult, error) {
-	return ParseResult{}, nil
-}
-
-var adapters = []Adapter{
-	stubAdapter{},
+// Register adds an adapter. Adapter packages call this from init().
+func Register(a Adapter) {
+	adapters = append(adapters, a)
 }
 
 func All() []Adapter {
