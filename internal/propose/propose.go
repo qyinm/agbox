@@ -2,6 +2,7 @@ package propose
 
 import (
 	"encoding/json"
+	"io"
 	"path/filepath"
 	"sort"
 	"time"
@@ -15,24 +16,22 @@ type HookInput struct {
 	CWD string `json:"cwd"`
 }
 
-func Propose(s *store.Store, agent, project string) (string, error) {
+// SelectAndRender picks the top proposal_ready candidate and renders injection text
+// without mutating candidate state. Call MarkProposed after stdout write succeeds.
+func SelectAndRender(s *store.Store, agent, project string) (candidateID, payload string, err error) {
 	candidates, err := s.ListCandidatesByState(model.CandidateProposalReady)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	now := time.Now()
 	var eligible []model.Candidate
 	for _, c := range candidates {
-		if InCooldown(c, now) {
-			continue
-		}
 		if project != "" && !candidateMatchesProject(s, c.ID, project) {
 			continue
 		}
 		eligible = append(eligible, c)
 	}
 	if len(eligible) == 0 {
-		return "", nil
+		return "", "", nil
 	}
 	sort.Slice(eligible, func(i, j int) bool {
 		rank := func(c model.Candidate) int {
@@ -57,16 +56,38 @@ func Propose(s *store.Store, agent, project string) (string, error) {
 	top := eligible[0]
 	card, err := evidence.Build(s, top.ID)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	proposedAt := now
-	if err := s.UpdateCandidateMeta(top.ID, store.CandidateMetaUpdate{
+	return top.ID, RenderInjection(agent, card), nil
+}
+
+// DeliverProposed writes injection text to the hook stdout, then marks the candidate proposed.
+// If marking fails after stdout delivery, it logs a warning instead of returning an error so
+// hook retries do not duplicate the injection payload.
+func DeliverProposed(s *store.Store, candidateID, payload string, stdout, log io.Writer) error {
+	if _, err := io.WriteString(stdout, payload); err != nil {
+		return err
+	}
+	if err := MarkProposed(s, candidateID); err != nil && log != nil {
+		_, _ = io.WriteString(log, "agbox: warning: proposal "+candidateID+" delivered but state not updated: "+err.Error()+"\n")
+	}
+	return nil
+}
+
+// MarkProposed transitions a candidate to proposed after successful stdout delivery.
+func MarkProposed(s *store.Store, candidateID string) error {
+	c, err := s.GetCandidate(candidateID)
+	if err != nil {
+		return err
+	}
+	if c.State != model.CandidateProposalReady {
+		return nil
+	}
+	now := time.Now()
+	return s.UpdateCandidateMeta(candidateID, store.CandidateMetaUpdate{
 		State:      model.CandidateProposed,
-		ProposedAt: &proposedAt,
-	}); err != nil {
-		return "", err
-	}
-	return RenderInjection(agent, card), nil
+		ProposedAt: &now,
+	})
 }
 
 func ParseHookInput(data []byte) HookInput {
@@ -85,20 +106,22 @@ func ProjectFromHook(data []byte) string {
 
 func candidateMatchesProject(s *store.Store, candidateID, project string) bool {
 	corrections, err := s.CorrectionsForCandidate(candidateID)
-	if err == nil {
+	if err == nil && len(corrections) > 0 {
 		for _, cor := range corrections {
 			if cor.Project == project {
 				return true
 			}
 		}
+		return false
 	}
 	events, err := s.EventsForCandidate(candidateID)
-	if err == nil {
+	if err == nil && len(events) > 0 {
 		for _, e := range events {
 			if e.Project == project {
 				return true
 			}
 		}
+		return false
 	}
-	return false
+	return true
 }
