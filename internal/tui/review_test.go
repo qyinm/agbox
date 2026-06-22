@@ -1,14 +1,18 @@
 package tui
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hippoom/agbox/internal/capture"
 	"github.com/hippoom/agbox/internal/model"
+	"github.com/hippoom/agbox/internal/privacy"
+	"github.com/hippoom/agbox/internal/scan"
 	"github.com/hippoom/agbox/internal/store"
 )
 
@@ -40,7 +44,7 @@ func TestReviewModelRendersCandidateAndEvidence(t *testing.T) {
 		"repeats=2",
 		"Use bun, not npm.",
 		"Reason",
-		"Next: agbox export cand_",
+		"Excerpts",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("candidate render missing %q:\n%s", want, got)
@@ -142,6 +146,56 @@ func TestReviewModelRefreshRunsScanAndReloads(t *testing.T) {
 	}
 }
 
+func TestReviewModelDrillDownAndBack(t *testing.T) {
+	s := storeWithCorrectionOccurrences(t)
+	defer s.Close()
+	m := NewReviewModel(NewReviewService(s, ReviewOptions{})).Refresh()
+	if len(m.data.Candidates) == 0 {
+		t.Fatal("expected candidates")
+	}
+	card := m.data.Cards[m.data.Candidates[0].ID]
+	if len(card.Occurrences) == 0 {
+		t.Fatal("expected occurrences")
+	}
+	m = KeyForTest(m, "enter")
+	if m.view != viewDrillDown {
+		t.Fatalf("view = %d, want drill-down", m.view)
+	}
+	m = KeyForTest(m, "esc")
+	if m.view != viewList {
+		t.Fatalf("view = %d, want list", m.view)
+	}
+}
+
+func TestReviewModelProjectFilterToggle(t *testing.T) {
+	s := storeWithCandidates(t, "Use bun, not npm.", "Use bun, not npm.")
+	defer s.Close()
+	service := NewReviewService(s, ReviewOptions{Project: "repo"})
+	m := NewReviewModel(service).Refresh()
+	withFilter := len(m.data.Candidates)
+	m.showAllProjects = true
+	m = m.Refresh()
+	if len(m.data.Candidates) < withFilter {
+		t.Fatalf("all projects count = %d, want >= %d", len(m.data.Candidates), withFilter)
+	}
+}
+
+func TestReviewModelExportTargetPicker(t *testing.T) {
+	s := storeWithCandidates(t, "Use bun, not npm.", "Use bun, not npm.")
+	defer s.Close()
+	m := NewReviewModel(NewReviewService(s, ReviewOptions{})).Refresh()
+	m = KeyForTest(m, "a")
+	m = KeyForTest(m, "y")
+	m = KeyForTest(m, "e")
+	if m.view != viewExportTarget {
+		t.Fatalf("view = %d, want export target", m.view)
+	}
+	got := stripANSI(m.Render())
+	if !strings.Contains(got, "Export target") || !strings.Contains(got, "AGENTS.md") {
+		t.Fatalf("export picker missing labels:\n%s", got)
+	}
+}
+
 func TestReviewActionsDoNotExportOrWriteProjectFiles(t *testing.T) {
 	root := t.TempDir()
 	wd, err := os.Getwd()
@@ -178,6 +232,44 @@ func openTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	s, err := store.Open(filepath.Join(t.TempDir(), "agbox.db"))
 	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func storeWithCorrectionOccurrences(t *testing.T) *store.Store {
+	t.Helper()
+	s := openTestStore(t)
+	now := time.Now()
+	normalized := privacy.NormalizeSignal("Use bun, not npm.")
+	sess := model.Session{
+		ID: "sess_review", Agent: "claude", Project: "repo",
+		SourcePath: "/tmp/session.jsonl", SourceHash: "abc",
+		StartedAt: now, UpdatedAt: now,
+	}
+	if err := s.UpsertSession(sess); err != nil {
+		t.Fatal(err)
+	}
+	turnAgent := model.Turn{ID: "turn_a", SessionID: sess.ID, TurnIndex: 1, Role: "agent", EventType: "tool", CreatedAt: now}
+	turnUser := model.Turn{ID: "turn_u", SessionID: sess.ID, TurnIndex: 2, Role: "user", EventType: "message", CreatedAt: now}
+	if err := s.InsertTurns([]model.Turn{turnAgent, turnUser}); err != nil {
+		t.Fatal(err)
+	}
+	action := model.Action{ID: "act_1", TurnID: turnAgent.ID, ToolName: "run_terminal_cmd", Command: "npm install", Excerpt: "npm install"}
+	if err := s.InsertActions([]model.Action{action}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		correction := model.Correction{
+			ID: fmt.Sprintf("cor_%d", i), SessionID: sess.ID, TurnID: turnUser.ID, ActionID: action.ID,
+			Hash: privacy.HashSignal(normalized), Normalized: normalized, Excerpt: "Use bun, not npm.",
+			Agent: "claude", Project: "repo", CreatedAt: now,
+		}
+		if err := s.InsertCorrection(correction); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := scan.Run(s, 2); err != nil {
 		t.Fatal(err)
 	}
 	return s

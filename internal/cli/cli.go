@@ -385,6 +385,7 @@ func runReview(args []string, stdin io.Reader, stdout io.Writer) error {
 		State:      *state,
 		MinRepeats: *minRepeats,
 		Limit:      *limit,
+		Project:    defaultProject(),
 	})
 	m := tui.NewReviewModel(service).Refresh()
 	_, err = tea.NewProgram(m, tea.WithInput(stdin), tea.WithOutput(stdout)).Run()
