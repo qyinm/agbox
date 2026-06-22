@@ -15,7 +15,6 @@ import (
 	"github.com/hippoom/agbox/internal/audit"
 	"github.com/hippoom/agbox/internal/capture"
 	"github.com/hippoom/agbox/internal/compile"
-	hookconnect "github.com/hippoom/agbox/internal/connect"
 	"github.com/hippoom/agbox/internal/doctor"
 	"github.com/hippoom/agbox/internal/evidence"
 	agexport "github.com/hippoom/agbox/internal/export"
@@ -67,12 +66,6 @@ func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return withStore(func(s *store.Store) error { return runSync(s, args[1:], stdout) })
 	case "capture":
 		return withStore(func(s *store.Store) error { return runCapture(s, args[1:], stdin, stdout) })
-	case "hook":
-		return withStore(func(s *store.Store) error { return runHook(s, args[1:], stdin, stdout) })
-	case "connect":
-		return runConnect(args[1:], stdout)
-	case "disconnect":
-		return runDisconnect(args[1:], stdout)
 	case "discover":
 		return withStore(func(s *store.Store) error { return runDiscover(s, args[1:], stdout) })
 	case "review":
@@ -152,113 +145,6 @@ func runCapture(s *store.Store, args []string, stdin io.Reader, stdout io.Writer
 	return nil
 }
 
-func runHook(s *store.Store, args []string, stdin io.Reader, stdout io.Writer) error {
-	fs := flag.NewFlagSet("hook", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	verbose := fs.Bool("verbose", false, "print capture result")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{})); err != nil {
-		return err
-	}
-	if len(fs.Args()) == 0 {
-		return errors.New("usage: agbox hook <claude|codex>")
-	}
-	agent := fs.Args()[0]
-	data, err := io.ReadAll(stdin)
-	if err != nil {
-		return err
-	}
-	text := extractHookText(data)
-	e, err := capture.Capture(s, text, capture.Options{
-		Source: "hook", Agent: agent, Project: defaultProject(), Redact: true,
-	})
-	if err != nil {
-		return err
-	}
-	if *verbose {
-		fmt.Fprintf(stdout, "hook captured %s hash=%s\n", e.ID, e.Hash[:12])
-	}
-	return nil
-}
-
-func runConnect(args []string, stdout io.Writer) error {
-	return runHookConfig(hookconnect.ActionConnect, args, stdout)
-}
-
-func runDisconnect(args []string, stdout io.Writer) error {
-	return runHookConfig(hookconnect.ActionDisconnect, args, stdout)
-}
-
-func runHookConfig(action string, args []string, stdout io.Writer) error {
-	fs := flag.NewFlagSet(action, flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	apply := fs.Bool("apply", false, "apply the hook config change")
-	dryRun := fs.Bool("dry-run", false, "print the hook config plan without writing")
-	command := fs.String("command", "", "absolute agbox command path for installed hook")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{"command": true})); err != nil {
-		return err
-	}
-	if *apply && *dryRun {
-		return errors.New("--apply and --dry-run are mutually exclusive")
-	}
-	if len(fs.Args()) == 0 {
-		return fmt.Errorf("usage: agbox %s <claude|codex|all> [--dry-run|--apply]", action)
-	}
-	agents, err := hookConfigAgents(fs.Args()[0])
-	if err != nil {
-		return err
-	}
-	plans := make([]hookconnect.Plan, 0, len(agents))
-	for _, agent := range agents {
-		plan, err := hookconnect.BuildPlan(agent, action, hookconnect.Options{Command: *command})
-		if err != nil {
-			return err
-		}
-		plans = append(plans, plan)
-	}
-	var data []byte
-	if len(plans) == 1 {
-		data, _ = json.MarshalIndent(plans[0], "", "  ")
-	} else {
-		data, _ = json.MarshalIndent(plans, "", "  ")
-	}
-	fmt.Fprintln(stdout, string(data))
-	if !*apply {
-		return nil
-	}
-	for _, plan := range plans {
-		if err := hookconnect.ValidateApply(plan); err != nil {
-			return err
-		}
-	}
-	for _, plan := range plans {
-		result, err := hookconnect.Apply(plan)
-		if err != nil {
-			return err
-		}
-		printHookConfigResult(stdout, action, result)
-	}
-	return nil
-}
-
-func printHookConfigResult(stdout io.Writer, action string, result hookconnect.Result) {
-	fmt.Fprintf(stdout, "%s applied agent=%s path=%s changed=%t", action, result.Plan.Agent, result.Plan.Path, result.Changed)
-	if result.BackupPath != "" {
-		fmt.Fprintf(stdout, " backup=%s", result.BackupPath)
-	}
-	fmt.Fprintln(stdout)
-}
-
-func hookConfigAgents(agent string) ([]string, error) {
-	switch strings.ToLower(strings.TrimSpace(agent)) {
-	case "all":
-		return []string{hookconnect.AgentCodex, hookconnect.AgentClaude}, nil
-	case hookconnect.AgentCodex, hookconnect.AgentClaude:
-		return []string{strings.ToLower(strings.TrimSpace(agent))}, nil
-	default:
-		return nil, fmt.Errorf("unsupported agent %q", agent)
-	}
-}
-
 func runScan(s *store.Store, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -333,7 +219,6 @@ func runDiscover(s *store.Store, args []string, stdout io.Writer) error {
 		} else {
 			fmt.Fprintf(stdout, "Capture at least %d matching prompts before a candidate appears.\n", normalizedMinRepeats(*minRepeats))
 		}
-		printHookStatus(stdout)
 		printDiscoverNext(stdout)
 		return nil
 	}
@@ -472,8 +357,8 @@ func runDemo(stdout io.Writer) error {
 	fmt.Fprintln(stdout, strings.TrimSpace(artifact.Body))
 	fmt.Fprintln(stdout, "\nNo files were changed; this demo used a temporary local store.")
 	fmt.Fprintln(stdout, "Use this on your own agent sessions:")
-	fmt.Fprintln(stdout, "  agbox connect all --apply")
-	fmt.Fprintln(stdout, "  agbox discover")
+	fmt.Fprintln(stdout, "  agbox review")
+	fmt.Fprintln(stdout, "  agbox status")
 	return nil
 }
 
@@ -491,22 +376,11 @@ func displayState(state string) string {
 	return state
 }
 
-func printHookStatus(stdout io.Writer) {
-	fmt.Fprintln(stdout, "\nHook status")
-	for _, status := range hookconnect.StatusAll() {
-		line := fmt.Sprintf("- %s: %s", status.Agent, status.State)
-		if status.Detail != "" {
-			line += " (" + status.Detail + ")"
-		}
-		fmt.Fprintln(stdout, line)
-	}
-}
-
 func printDiscoverNext(stdout io.Writer) {
 	fmt.Fprintln(stdout, "\nNext")
-	fmt.Fprintln(stdout, "1. agbox connect all --apply")
-	fmt.Fprintln(stdout, "2. Work normally in Codex or Claude for a few prompts.")
-	fmt.Fprintln(stdout, "3. agbox discover")
+	fmt.Fprintln(stdout, "1. Work normally in Claude, Codex, or Cursor.")
+	fmt.Fprintln(stdout, "2. agbox status            # confirm watcher is collecting")
+	fmt.Fprintln(stdout, "3. agbox review            # review candidates with evidence")
 	fmt.Fprintln(stdout, "\nWant to see the loop without touching your data? Run `agbox demo`.")
 }
 
@@ -736,18 +610,6 @@ func exportCandidates(s *store.Store, ids []string) ([]model.Candidate, error) {
 	return candidates, nil
 }
 
-func extractHookText(data []byte) string {
-	var payload map[string]any
-	if err := json.Unmarshal(data, &payload); err == nil {
-		for _, key := range []string{"prompt", "message", "text", "content", "input"} {
-			if v, ok := payload[key].(string); ok && strings.TrimSpace(v) != "" {
-				return v
-			}
-		}
-	}
-	return string(data)
-}
-
 func reorderFlags(args []string, valueFlags map[string]bool) []string {
 	flags := make([]string, 0, len(args))
 	positionals := make([]string, 0, len(args))
@@ -819,9 +681,6 @@ Usage:
   agbox compile <candidate-id> [--target agents-md|claude|codex|cursor|cline]
   agbox export [candidate-id...] [--target agents-md] [--dry-run]
   agbox export rollback <export-id>
-  agbox hook <claude|codex> [--verbose]
-  agbox connect <claude|codex|all> [--dry-run|--apply] [--command /path/to/agbox]
-  agbox disconnect <claude|codex|all> [--dry-run|--apply]
   agbox discover [--min-repeats 2] [--state pending|all] [--limit 5]
   agbox review [--state pending|approved|rejected|exported|all] [--min-repeats 2] [--limit 20]
   agbox demo
@@ -881,30 +740,6 @@ Options:
   --project name   Project name. Default: current directory name
   --raw            Store redacted raw text
   --no-excerpt     Store hash and metadata only`,
-	"hook": `Usage:
-  agbox hook <claude|codex> [--verbose]
-
-Capture a workflow signal from an agent hook payload read from stdin.
-
-Options:
-  --verbose        Print the captured event ID and hash`,
-	"connect": `Usage:
-  agbox connect <claude|codex|all> [--dry-run|--apply] [--command /path/to/agbox]
-
-Install agbox-managed hook config for Claude Code, Codex, or both.
-
-Options:
-  --dry-run        Print the hook config plan without writing
-  --apply          Apply the hook config change
-  --command path   Absolute agbox command path for installed hooks`,
-	"disconnect": `Usage:
-  agbox disconnect <claude|codex|all> [--dry-run|--apply]
-
-Remove only agbox-managed hook config for Claude Code, Codex, or both.
-
-Options:
-  --dry-run        Print the hook config plan without writing
-  --apply          Apply the hook config change`,
 	"discover": `Usage:
   agbox discover [--min-repeats 2] [--state pending|all] [--limit 5]
 
@@ -995,7 +830,7 @@ Options:
 	"doctor": `Usage:
   agbox doctor
 
-Check agbox store and hook health.`,
+Check agbox store, watcher, and session source health.`,
 	"debug-bundle": `Usage:
   agbox debug-bundle [--out agbox-debug-bundle.txt]
 

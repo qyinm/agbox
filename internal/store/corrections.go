@@ -172,12 +172,15 @@ func (s *Store) ListCursors() ([]CursorRow, error) {
 }
 
 func (s *Store) LatestCursorSync() (time.Time, error) {
-	var synced string
+	var synced sql.NullString
 	err := s.db.QueryRow(`SELECT MAX(last_synced_at) FROM source_cursors`).Scan(&synced)
 	if err != nil {
 		return time.Time{}, err
 	}
-	return parseTime(synced), nil
+	if !synced.Valid || synced.String == "" {
+		return time.Time{}, nil
+	}
+	return parseTime(synced.String), nil
 }
 
 func (s *Store) GetTurn(id string) (model.Turn, error) {

@@ -64,9 +64,9 @@ project: .agbox/
 	printWatcherStatus(stdout, home)
 	fmt.Fprintf(stdout, "initial ingest: %d corrections\n\n", ingested)
 	fmt.Fprintln(stdout, `Next steps:
-  agbox demo              # See the workflow in action
-  agbox connect all --apply  # Connect to your AI agents
-  agbox capture --agent codex "Your workflow rule"`)
+  agbox review            # Review workflow candidates
+  agbox status            # Check watcher and sync status
+  agbox demo              # See the workflow in action`)
 	return nil
 }
 
