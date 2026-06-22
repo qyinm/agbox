@@ -1,6 +1,6 @@
 {
   "name": "@agboxhq/cli",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Local-first CLI for turning repeated AI-agent workflow signals into reusable skills.",
   "license": "MIT",
   "homepage": "https://github.com/qyinm/agbox#readme",

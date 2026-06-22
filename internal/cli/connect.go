@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -9,8 +8,6 @@ import (
 	"strings"
 
 	"github.com/hippoom/agbox/internal/connect"
-	"github.com/hippoom/agbox/internal/propose"
-	"github.com/hippoom/agbox/internal/store"
 )
 
 func runConnect(args []string, stdout io.Writer) error {
@@ -99,48 +96,4 @@ func connectAllAgents(stdout io.Writer) error {
 func isTruthyEnv(key string) bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
 	return v == "1" || v == "true" || v == "yes"
-}
-
-func runSnooze(s *store.Store, args []string, stdout io.Writer) error {
-	if len(args) == 0 {
-		return fmt.Errorf("usage: agbox snooze <candidate-id>")
-	}
-	if _, err := s.GetCandidate(args[0]); err != nil {
-		return err
-	}
-	if err := propose.Snooze(s, args[0]); err != nil {
-		return err
-	}
-	fmt.Fprintf(stdout, "%s -> snoozed (24h)\n", args[0])
-	return nil
-}
-
-func runAccept(s *store.Store, args []string, stdout io.Writer) error {
-	fs := flag.NewFlagSet("accept", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	skillPath := fs.String("skill-path", "", "path to created SKILL.md")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{"skill-path": true})); err != nil {
-		return err
-	}
-	if len(fs.Args()) == 0 {
-		return fmt.Errorf("usage: agbox accept <candidate-id> [--skill-path path]")
-	}
-	if _, err := s.GetCandidate(fs.Args()[0]); err != nil {
-		return err
-	}
-	if err := propose.Accept(s, fs.Args()[0], *skillPath); err != nil {
-		return err
-	}
-	fmt.Fprintf(stdout, "%s -> accepted\n", fs.Args()[0])
-	return nil
-}
-
-func printConnectPlan(agent string, opts connect.Options, stdout io.Writer) error {
-	plan, err := connect.BuildPlan(agent, connect.ActionConnect, opts)
-	if err != nil {
-		return err
-	}
-	data, _ := json.MarshalIndent(plan, "", "  ")
-	fmt.Fprintln(stdout, string(data))
-	return nil
 }

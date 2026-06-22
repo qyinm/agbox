@@ -22,6 +22,7 @@ func RenderInjection(agent string, card model.EvidenceCard) string {
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "<!-- agbox:proposal %s -->\n", c.ID)
+	fmt.Fprintf(&b, "<!-- agbox:candidate %s -->\n", c.ID)
 	fmt.Fprintln(&b, "## agbox sidecar — skill promotion candidate")
 	fmt.Fprintln(&b)
 	fmt.Fprintf(&b, "**Pattern:** %s\n", pattern)
@@ -50,7 +51,8 @@ func RenderInjection(agent string, card model.EvidenceCard) string {
 		fmt.Fprintf(&b, "   - %s\n", line)
 	}
 	fmt.Fprintln(&b, "3. Skill must follow best practices:")
-	fmt.Fprintln(&b, "   - YAML frontmatter with `name` and rich `description` (include trigger words from the pattern)")
+	fmt.Fprintln(&b, "   - YAML frontmatter with `name`, rich `description` (include trigger words from the pattern), and `agbox_candidate_id: "+c.ID+"`")
+	fmt.Fprintln(&b, "   - Also include `<!-- agbox:candidate "+c.ID+" -->` in the SKILL body")
 	fmt.Fprintln(&b, "   - Actionable body: what to do, what to avoid, examples")
 	fmt.Fprintln(&b, "   - Not a copy-paste of evidence excerpts — synthesize a clear rule")
 	fmt.Fprintf(&b, "4. If user says **no**: acknowledge, run `agbox reject %s` via Bash, do not ask again for 7 days.\n", c.ID)
@@ -90,6 +92,5 @@ func estimateWeeklyMinutes(eventCount int) int {
 	if eventCount <= 0 {
 		return 0
 	}
-	// Founder baseline: ~4 min per correction, ~3/day when uncorrected.
 	return eventCount * 4 * 3 / 7
 }

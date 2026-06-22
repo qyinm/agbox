@@ -8,7 +8,6 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
-	"github.com/hippoom/agbox/internal/pipeline"
 	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/store"
 )
@@ -19,7 +18,7 @@ func Run(ctx context.Context, s *store.Store, pollInterval time.Duration) error 
 	if pollInterval <= 0 {
 		pollInterval = DefaultPollInterval
 	}
-	if _, err := pipeline.SyncAll(s); err != nil {
+	if _, err := session.IngestAll(s); err != nil {
 		return err
 	}
 
@@ -48,7 +47,7 @@ func Run(ctx context.Context, s *store.Store, pollInterval time.Duration) error 
 			debounce.Stop()
 		}
 		debounce = time.AfterFunc(300*time.Millisecond, func() {
-			_, _ = pipeline.SyncAll(s)
+			_, _ = session.IngestAll(s)
 		})
 	}
 
