@@ -151,6 +151,21 @@ func (s *Store) CountCorrections() (int, error) {
 	return n, err
 }
 
+func (s *Store) GetTurn(id string) (model.Turn, error) {
+	row := s.db.QueryRow(`SELECT id, session_id, turn_index, role, event_type, created_at FROM turns WHERE id = ?`, id)
+	var t model.Turn
+	var created string
+	err := row.Scan(&t.ID, &t.SessionID, &t.TurnIndex, &t.Role, &t.EventType, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.Turn{}, errors.New("turn not found")
+	}
+	if err != nil {
+		return model.Turn{}, err
+	}
+	t.CreatedAt = parseTime(created)
+	return t, nil
+}
+
 func (s *Store) GetAction(id string) (model.Action, error) {
 	row := s.db.QueryRow(`SELECT id, turn_id, tool_name, command, file_path, excerpt FROM actions WHERE id = ?`, id)
 	var a model.Action

@@ -42,13 +42,14 @@ type Candidate struct {
 }
 
 type EvidenceCard struct {
-	Candidate Candidate
-	Sources   []string
-	Projects  []string
-	Agents    []string
-	Excerpts  []string
-	Reason    string
-	Privacy   string
+	Candidate   Candidate
+	Sources     []string
+	Projects    []string
+	Agents      []string
+	Excerpts    []string
+	Occurrences []Occurrence
+	Reason      string
+	Privacy     string
 }
 
 type ExportStatus string
