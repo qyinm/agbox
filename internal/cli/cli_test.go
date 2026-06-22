@@ -81,7 +81,7 @@ func TestInitShowsNextSteps(t *testing.T) {
 	for _, want := range []string{
 		"Initialized agbox",
 		"Next steps:",
-		"agbox review            # Review workflow candidates",
+		"agbox doctor            # Check watcher + hooks for claude, codex, grok",
 		"agbox status            # Check watcher and sync status",
 		"agbox demo              # See the workflow in action",
 	} {
@@ -177,12 +177,14 @@ func TestHelpCommandShowsCommandHelp(t *testing.T) {
 	}
 }
 
-func TestHookCommandRemoved(t *testing.T) {
-	err := Execute([]string{"hook", "codex"}, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
+func TestHookProposeRequiresAgent(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+	err := Execute([]string{"hook", "propose"}, strings.NewReader("{}"), &bytes.Buffer{}, &bytes.Buffer{})
 	if err == nil {
-		t.Fatal("hook command should be removed")
+		t.Fatal("hook propose without agent should fail")
 	}
-	if !strings.Contains(err.Error(), `unknown command "hook"`) {
+	if !strings.Contains(err.Error(), "usage: agbox hook propose") {
 		t.Fatalf("hook error = %q", err.Error())
 	}
 }

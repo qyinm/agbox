@@ -1,10 +1,10 @@
-package codex
+package grok
 
 import (
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/hippoom/agbox/internal/model"
@@ -23,7 +23,7 @@ func init() {
 }
 
 func (a *Adapter) Agent() string {
-	return "codex"
+	return "grok"
 }
 
 func (a *Adapter) DiscoverSources() ([]session.Source, error) {
@@ -31,7 +31,7 @@ func (a *Adapter) DiscoverSources() ([]session.Source, error) {
 	if err != nil {
 		return nil, nil
 	}
-	root := filepath.Join(home, ".codex")
+	root := filepath.Join(home, ".grok", "sessions")
 	info, err := os.Stat(root)
 	if err != nil || !info.IsDir() {
 		return nil, nil
@@ -42,17 +42,30 @@ func (a *Adapter) DiscoverSources() ([]session.Source, error) {
 		if walkErr != nil || fi.IsDir() {
 			return nil
 		}
-		if !strings.HasSuffix(strings.ToLower(fi.Name()), ".jsonl") {
+		if fi.Name() != "chat_history.jsonl" {
 			return nil
 		}
 		sources = append(sources, session.Source{
-			Agent:   "codex",
+			Agent:   "grok",
 			Path:    path,
-			Project: filepath.Base(filepath.Dir(path)),
+			Project: projectFromPath(path),
 		})
 		return nil
 	})
 	return sources, nil
+}
+
+func projectFromPath(path string) string {
+	sessionDir := filepath.Dir(path)
+	encodedCWD := filepath.Base(filepath.Dir(sessionDir))
+	decoded, err := url.PathUnescape(encodedCWD)
+	if err != nil {
+		decoded = encodedCWD
+	}
+	if base := filepath.Base(decoded); base != "" && base != "." && base != "/" {
+		return base
+	}
+	return encodedCWD
 }
 
 func (a *Adapter) ParseDelta(src session.Source, cur session.Cursor) (session.ParseResult, error) {
@@ -70,7 +83,7 @@ func (a *Adapter) ParseDelta(src session.Source, cur session.Cursor) (session.Pa
 	sessionID := jsonl.StableID("ses_", src.Agent, src.Path)
 	now := time.Now()
 
-	acc, newOffset, err := jsonl.ProcessDelta(data, cur.LastOffset, jsonl.AnthropicHandler{}, jsonl.Meta{
+	acc, newOffset, err := jsonl.ProcessDelta(data, cur.LastOffset, jsonl.GrokHandler{}, jsonl.Meta{
 		SessionID: sessionID,
 		Agent:     src.Agent,
 		Project:   src.Project,

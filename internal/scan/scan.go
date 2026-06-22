@@ -166,6 +166,13 @@ func buildCandidate(fingerprint string, events []model.Event) model.Candidate {
 	if len(events) == 2 && len(projects) == 1 {
 		confidence = "low"
 	}
+	semantic := ""
+	for _, e := range events {
+		if key := SemanticKey(e.Normalized); key != "" {
+			semantic = key
+			break
+		}
+	}
 	now := time.Now()
 	return model.Candidate{
 		ID:           "cand_" + fingerprint[:12],
@@ -173,6 +180,7 @@ func buildCandidate(fingerprint string, events []model.Event) model.Candidate {
 		Name:         name,
 		Description:  workflowDescription(events),
 		RuleText:     ruleText,
+		SemanticKey:  semantic,
 		State:        model.CandidatePending,
 		EventCount:   len(events),
 		ProjectCount: len(projects),
