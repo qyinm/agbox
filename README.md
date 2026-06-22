@@ -76,8 +76,11 @@ That's the whole product: **stop repeating yourself to your AI.**
 ```bash
 # Install (macOS arm64 today; Homebrew + Linux on the roadmap)
 npm install -g @agboxhq/cli
-agbox doctor
+agbox review
 ```
+
+`npm install` runs `agbox init --quiet` automatically — it creates `~/.agbox/`, installs the
+session watcher, and ingests existing agent sessions. Set `AGBOX_SKIP_WATCHER=1` to opt out.
 
 See the entire loop in a throwaway store, without touching anything real:
 
@@ -85,21 +88,19 @@ See the entire loop in a throwaway store, without touching anything real:
 agbox demo
 ```
 
-Then wire it into your agents and just work:
+Then just work:
 
 ```bash
-# 1. Connect agbox — installs a reversible capture hook (JSON only, preserves your other hooks)
-agbox connect all --dry-run     # preview the exact change
-agbox connect all --apply       # apply it
+# 1. Code like you always do. Correct your agent like you always do.
+#    agbox watches session files in the background — no hooks, no copy-paste.
 
-# 2. Code like you always do. Correct your agent like you always do.
-#    agbox listens in the background — no manual commits, no copy-paste.
+# 2. Review what it learned (primary interface)
+agbox review                    # interactive TUI: evidence, approve, export
 
-# 3. See what it learned
-agbox discover                  # scan + show evidence + next steps
+# 3. Check watcher health anytime
+agbox status                    # watcher state, last sync, correction counts
+agbox doctor                    # full health check
 ```
-
-Disconnect just as cleanly, anytime: `agbox disconnect all --apply`.
 
 ---
 
@@ -145,30 +146,33 @@ $ agbox impact use-bun-not-npm
 
 ## 🧩 How it works
 
-agbox keeps a tiny, local store next to your code — like `.git/`, but for the
+agbox keeps a tiny, local store in your home directory — like `.git/`, but for the
 workflows your agents keep forgetting.
 
 ```
-  capture    →    cluster    →    review      →    export
+  ingest     →    cluster    →    review      →    export
  ┌────────┐      ┌────────┐      ┌─────────┐      ┌──────────────┐
- │ hook   │      │ scan   │      │ inbox   │      │ CLAUDE.md    │
- │ every  │ ───▶ │ group  │ ───▶ │ approve │ ───▶ │ AGENTS.md    │
- │ turn   │      │ repeats│      │ /reject │      │ Cursor·Cline │
+ │watcher │      │ scan   │      │ review  │      │ CLAUDE.md    │
+ │ session│ ───▶ │ group  │ ───▶ │ approve │ ───▶ │ AGENTS.md    │
+ │ files  │      │ repeats│      │ /reject │      │ Cursor·Cline │
  └────────┘      └────────┘      └─────────┘      └──────────────┘
   automatic       confidence      you stay         written where
                   scored          in control       agents read
 ```
 
 ```
-.agbox/
-├── objects/          # content-addressed signal blobs
-├── index.db          # SQLite query index
-├── skill-pack.json   # manifest + integrity hashes
+~/.agbox/
+├── agbox.db          # global SQLite store (sessions, corrections, candidates)
+├── exports/          # reversible export backups
+└── watcher/          # LaunchAgent state
+
+<project>/.agbox/
+├── skill-pack.json   # manifest + integrity hashes (per project)
 └── config.toml
 ```
 
-Capture is automatic. Promotion is **always** a human decision. Export is **always**
-reversible.
+Ingest is automatic and quiet — no notifications. Promotion is **always** a human
+decision. Export is **always** reversible.
 
 Clustering is deterministic and review-first: exact normalized hashes plus a small
 workflow taxonomy (package-manager preferences, PR-format rules, API/OpenAPI-sync
@@ -180,12 +184,12 @@ rules). agbox never silently installs a detected workflow.
 
 | | |
 |---|---|
-| 📥 **Automatic capture** | A reversible hook into Claude Code & Codex records every correction. No manual commits, no copy-paste-into-a-fresh-chat. |
+| 📥 **Automatic ingest** | A background watcher reads Claude Code, Codex, and Cursor session files. No hooks, no manual commits, no copy-paste-into-a-fresh-chat. |
 | 🧮 **Smart clustering** | Repeated instructions get normalized, grouped, and confidence-scored — directional prefs like `bun-over-npm` included. |
-| 👀 **Promotion Inbox** | Nothing touches your config without you. Review each candidate as a readable Evidence Card. |
+| 👀 **Review TUI** | `agbox review` is the primary interface. Drill into causal evidence, approve, and export — all in one place. |
 | 📤 **Vendor-neutral export** | One skill → `CLAUDE.md`, `AGENTS.md`, Cursor, Cline. Promote once, every agent obeys. |
 | ↩️ **Always reversible** | Every export is backed up and wrapped in markers. `agbox export rollback` undoes it cleanly. |
-| 🔒 **Local-first & private** | Everything lives in `.agbox/`. Redacted excerpts + hashes by default — raw prompts never leave your machine. |
+| 🔒 **Local-first & private** | Everything lives in `~/.agbox/`. Redacted excerpts + hashes by default — raw prompts never leave your machine. |
 | 📊 **Impact tracking** | `agbox impact` shows repeat-correction counts before vs after. Proof, not vibes. |
 | 🧾 **Audit & doctor** | `agbox audit` produces a shareable report; `agbox doctor` checks your setup. |
 
@@ -193,12 +197,12 @@ rules). agbox never silently installs a detected workflow.
 
 ## 🔌 Works with
 
-agbox is **vendor-neutral by design.** It captures from the agents you already run and
+agbox is **vendor-neutral by design.** It ingests from the agents you already run and
 exports to the formats they already read.
 
-| Capture from | Export to |
+| Ingest from | Export to |
 |---|---|
-| Claude Code · Codex | `CLAUDE.md` |
+| Claude Code · Codex · Cursor | `CLAUDE.md` |
 | | `AGENTS.md` *(read by most modern agents, including OpenClaw)* |
 | | `.cursor/rules/*.mdc` *(Cursor)* |
 | | `.clinerules/*.md` *(Cline)* |
@@ -211,9 +215,9 @@ One correction, promoted once, lands everywhere your agents look.
 
 agbox touches your prompts and your config files. That trust is the product, so:
 
-- **Everything stays local.** The store is `.agbox/` in your project. Nothing is uploaded.
-- **Redacted by default.** Persisted signals are short redacted excerpts + a hash + metadata. Raw text is opt-in via `--raw`; hook capture never stores raw prompts or full transcripts.
-- **Reversible by default.** Every config write is backed up; `agbox export rollback <id>` restores it. `connect` is non-mutating unless you pass `--apply`, and only writes agbox-managed JSON hook entries.
+- **Everything stays local.** The global store is `~/.agbox/agbox.db`. Nothing is uploaded.
+- **Redacted by default.** Persisted signals are short redacted excerpts + a hash + metadata. Raw text is opt-in via `--raw`; session ingest never stores full transcripts.
+- **Reversible by default.** Every config write is backed up; `agbox export rollback <id>` restores it. The watcher only reads session files — it never modifies agent config.
 - **Inspectable.** Open source, with a deterministic compiler — read exactly what gets written before it's written.
 - **Auditable.** `agbox audit` supports `private`, `shareable`, and `client` profiles.
 
@@ -242,18 +246,19 @@ files shipped — corrections eliminated.
 ## 📟 Command reference
 
 ```text
-agbox init                          initialize the local .agbox/ store
+agbox init [--quiet]                initialize ~/.agbox/, install watcher, ingest sessions
 agbox demo                          run the full loop in a throwaway store
+agbox status                        watcher state, last sync, correction counts
+agbox sources                       list discovered session source paths
+agbox sync --once                   force a session ingestion pass
+agbox watch                         internal daemon (used by LaunchAgent)
 
-agbox connect <claude|codex|all>    install a reversible capture hook  [--dry-run|--apply]
-agbox disconnect <…>                remove only agbox-managed hook entries
-agbox hook <claude|codex>           capture from an agent hook payload
 agbox capture --agent <a> "text"    record a workflow signal manually
 
 agbox scan                          detect repeated normalized signals
 agbox inbox [--state pending]       show Promotion Inbox candidates
 agbox discover                      scan + evidence + next-step commands
-agbox review                        interactive TUI review
+agbox review                        interactive TUI review (primary interface)
 
 agbox evidence <id>                 explain why a candidate exists
 agbox approve <id> [--name …]       move a candidate to approved

@@ -250,7 +250,8 @@ func TestDemoShowsPreviewWithoutPersistentStore(t *testing.T) {
 	for _, want := range []string{
 		"agbox demo: repeated workflow signal detected",
 		"Skill preview:",
-		"Use bun, not npm.",
+		"use bun, not npm",
+		"evidence:",
 		"No files were changed",
 		"agbox review",
 		"agbox status",

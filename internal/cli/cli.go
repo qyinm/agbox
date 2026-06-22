@@ -23,6 +23,8 @@ import (
 	"github.com/hippoom/agbox/internal/manifest"
 	"github.com/hippoom/agbox/internal/model"
 	"github.com/hippoom/agbox/internal/scan"
+	"github.com/hippoom/agbox/internal/session"
+	"github.com/hippoom/agbox/internal/session/claude"
 	"github.com/hippoom/agbox/internal/store"
 	"github.com/hippoom/agbox/internal/tui"
 )
@@ -312,19 +314,19 @@ func runDemo(stdout io.Writer) error {
 		return err
 	}
 	defer s.Close()
-	for _, input := range []struct {
-		agent string
-		text  string
-	}{
-		{agent: "codex", text: "Use bun, not npm."},
-		{agent: "claude", text: "Use bun, not npm."},
-	} {
-		if _, err := capture.Capture(s, input.text, capture.Options{
-			Source: "demo", Agent: input.agent, Project: "agbox-demo", Redact: true,
-		}); err != nil {
+
+	adapter := claude.New()
+	for _, name := range []string{"session-a.jsonl", "session-b.jsonl"} {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, claude.DemoSample, 0o600); err != nil {
+			return err
+		}
+		src := session.Source{Agent: "claude", Path: path, Project: "agbox-demo"}
+		if err := session.IngestSource(s, adapter, src); err != nil {
 			return err
 		}
 	}
+
 	result, err := scan.Run(s, 2)
 	if err != nil {
 		return err
@@ -352,6 +354,9 @@ func runDemo(stdout io.Writer) error {
 	fmt.Fprintf(stdout, "%s  repeats=%d confidence=%s\n", c.ID, c.EventCount, c.Confidence)
 	if len(card.Excerpts) > 0 {
 		fmt.Fprintf(stdout, "excerpt: %s\n", card.Excerpts[0])
+	}
+	if len(card.Occurrences) > 0 {
+		fmt.Fprintf(stdout, "evidence: %s\n", card.Occurrences[0].SummaryLine())
 	}
 	fmt.Fprintln(stdout, "\nSkill preview:")
 	fmt.Fprintln(stdout, strings.TrimSpace(artifact.Body))
