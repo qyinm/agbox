@@ -130,7 +130,13 @@ func (s *Store) migrate() error {
 			return err
 		}
 	}
-	return nil
+	return migrateV2(s.db)
+}
+
+func (s *Store) TableExists(name string) bool {
+	var n int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&n)
+	return n == 1
 }
 
 func (s *Store) InsertEvent(e model.Event) error {
