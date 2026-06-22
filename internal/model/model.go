@@ -34,6 +34,7 @@ type Candidate struct {
 	Name         string
 	Description  string
 	RuleText     string
+	SemanticKey  string
 	State        CandidateState
 	EventCount   int
 	ProjectCount int

@@ -9,13 +9,14 @@ import (
 )
 
 func clusterFingerprint(e model.Event) string {
-	if key := semanticKey(e.Normalized); key != "" {
+	if key := SemanticKey(e.Normalized); key != "" {
 		return privacy.HashSignal("semantic:" + key)
 	}
 	return e.Hash
 }
 
-func semanticKey(normalized string) string {
+// SemanticKey derives a stable semantic clustering key from normalized signal text.
+func SemanticKey(normalized string) string {
 	tokens := strings.Fields(normalized)
 	if len(tokens) == 0 {
 		return ""
@@ -34,13 +35,13 @@ func semanticKey(normalized string) string {
 
 func workflowKind(events []model.Event) string {
 	for _, e := range events {
-		switch semanticKey(e.Normalized) {
+		switch SemanticKey(e.Normalized) {
 		case "pr-format:summary-tests-risk":
 			return "pr-format-workflow"
 		case "api-route-openapi-sync":
 			return "api-route-openapi-workflow"
 		}
-		if strings.HasPrefix(semanticKey(e.Normalized), "package-manager:") {
+		if strings.HasPrefix(SemanticKey(e.Normalized), "package-manager:") {
 			return "package-manager-workflow"
 		}
 	}

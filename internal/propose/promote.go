@@ -3,7 +3,7 @@ package propose
 import (
 	"time"
 
-	"github.com/hippoom/agbox/internal/model"
+	proposestate "github.com/hippoom/agbox/internal/propose/state"
 	"github.com/hippoom/agbox/internal/store"
 )
 
@@ -14,7 +14,7 @@ func PromoteAfterScan(s *store.Store) error {
 	}
 	now := time.Now()
 	for _, c := range candidates {
-		next, ok := nextStateAfterScan(c, now)
+		next, ok := proposestate.NextAfterScan(c, now)
 		if !ok || next == c.State {
 			continue
 		}
@@ -23,22 +23,4 @@ func PromoteAfterScan(s *store.Store) error {
 		}
 	}
 	return nil
-}
-
-func nextStateAfterScan(c model.Candidate, now time.Time) (model.CandidateState, bool) {
-	switch c.State {
-	case model.CandidatePending:
-		if MeetsThreshold(c) {
-			return model.CandidateProposalReady, true
-		}
-	case model.CandidateRejected, model.CandidateSnoozed:
-		if CooldownExpired(c, now) && MeetsThreshold(c) {
-			return model.CandidateProposalReady, true
-		}
-	case model.CandidateProposalReady:
-		if !MeetsThreshold(c) {
-			return model.CandidatePending, true
-		}
-	}
-	return c.State, false
 }
