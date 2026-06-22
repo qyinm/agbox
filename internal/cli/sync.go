@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/hippoom/agbox/internal/session"
+	"github.com/hippoom/agbox/internal/pipeline"
 	"github.com/hippoom/agbox/internal/store"
 )
 
@@ -22,7 +22,7 @@ func runSync(s *store.Store, args []string, stdout io.Writer) error {
 	if !*once {
 		*once = true
 	}
-	n, err := session.IngestAll(s)
+	n, err := pipeline.SyncAll(s)
 	if err != nil {
 		return err
 	}

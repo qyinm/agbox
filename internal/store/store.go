@@ -130,7 +130,10 @@ func (s *Store) migrate() error {
 			return err
 		}
 	}
-	return migrateV2(s.db)
+	if err := migrateV2(s.db); err != nil {
+		return err
+	}
+	return migrateV3(s.db)
 }
 
 func (s *Store) TableExists(name string) bool {
@@ -208,7 +211,7 @@ func (s *Store) UpsertCandidate(c model.Candidate, eventIDs, correctionIDs []str
 	if errors.Is(err, sql.ErrNoRows) {
 		state = string(model.CandidatePending)
 		version = 1
-	} else if state == string(model.CandidateRejected) || state == string(model.CandidateExported) {
+	} else if isFrozenCandidateState(model.CandidateState(state)) {
 		c.State = model.CandidateState(state)
 		c.Version = version
 	} else {
@@ -255,7 +258,7 @@ func (s *Store) UpsertCandidate(c model.Candidate, eventIDs, correctionIDs []str
 }
 
 func (s *Store) ListCandidates(state string) ([]model.Candidate, error) {
-	query := `SELECT id, fingerprint, name, description, rule_text, state, event_count, project_count, source_count, first_seen, last_seen, confidence, version, updated_at FROM candidates`
+	query := `SELECT id, fingerprint, name, description, rule_text, state, event_count, project_count, source_count, first_seen, last_seen, confidence, version, updated_at, proposed_at, snoozed_until, skill_path FROM candidates`
 	var args []any
 	if state != "" {
 		query += ` WHERE state = ?`
@@ -279,7 +282,7 @@ func (s *Store) ListCandidates(state string) ([]model.Candidate, error) {
 }
 
 func (s *Store) GetCandidate(id string) (model.Candidate, error) {
-	row := s.db.QueryRow(`SELECT id, fingerprint, name, description, rule_text, state, event_count, project_count, source_count, first_seen, last_seen, confidence, version, updated_at FROM candidates WHERE id = ?`, id)
+	row := s.db.QueryRow(`SELECT id, fingerprint, name, description, rule_text, state, event_count, project_count, source_count, first_seen, last_seen, confidence, version, updated_at, proposed_at, snoozed_until, skill_path FROM candidates WHERE id = ?`, id)
 	c, err := scanCandidate(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.Candidate{}, fmt.Errorf("candidate not found: %s", id)
@@ -288,12 +291,105 @@ func (s *Store) GetCandidate(id string) (model.Candidate, error) {
 }
 
 func (s *Store) SetCandidateState(id string, state model.CandidateState, name string) error {
-	if name != "" {
-		_, err := s.db.Exec(`UPDATE candidates SET state = ?, name = ?, version = version + 1, updated_at = ? WHERE id = ?`, state, name, formatTime(time.Now()), id)
-		return err
+	return s.UpdateCandidateMeta(id, CandidateMetaUpdate{State: state, Name: name})
+}
+
+type CandidateMetaUpdate struct {
+	State        model.CandidateState
+	Name         string
+	ProposedAt   *time.Time
+	SnoozedUntil *time.Time
+	SkillPath    string
+}
+
+func (s *Store) UpdateCandidateMeta(id string, upd CandidateMetaUpdate) error {
+	now := time.Now()
+	sets := []string{"version = version + 1", "updated_at = ?"}
+	args := []any{formatTime(now)}
+	if upd.State != "" {
+		sets = append(sets, "state = ?")
+		args = append(args, upd.State)
 	}
-	_, err := s.db.Exec(`UPDATE candidates SET state = ?, version = version + 1, updated_at = ? WHERE id = ?`, state, formatTime(time.Now()), id)
+	if upd.Name != "" {
+		sets = append(sets, "name = ?")
+		args = append(args, upd.Name)
+	}
+	if upd.ProposedAt != nil {
+		sets = append(sets, "proposed_at = ?")
+		args = append(args, formatTime(*upd.ProposedAt))
+	}
+	if upd.SnoozedUntil != nil {
+		sets = append(sets, "snoozed_until = ?")
+		args = append(args, formatTime(*upd.SnoozedUntil))
+	}
+	if upd.SkillPath != "" {
+		sets = append(sets, "skill_path = ?")
+		args = append(args, upd.SkillPath)
+	}
+	args = append(args, id)
+	_, err := s.db.Exec(`UPDATE candidates SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...)
 	return err
+}
+
+func (s *Store) ListCandidatesByState(states ...model.CandidateState) ([]model.Candidate, error) {
+	if len(states) == 0 {
+		return s.ListCandidates("")
+	}
+	placeholders := make([]string, len(states))
+	args := make([]any, len(states))
+	for i, st := range states {
+		placeholders[i] = "?"
+		args[i] = string(st)
+	}
+	query := `SELECT id, fingerprint, name, description, rule_text, state, event_count, project_count, source_count, first_seen, last_seen, confidence, version, updated_at, proposed_at, snoozed_until, skill_path FROM candidates WHERE state IN (` + strings.Join(placeholders, ",") + `) ORDER BY event_count DESC, last_seen DESC`
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Candidate
+	for rows.Next() {
+		c, err := scanCandidate(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) LatestProposedCandidate(project string) (model.Candidate, error) {
+	row := s.db.QueryRow(`SELECT id, fingerprint, name, description, rule_text, state, event_count, project_count, source_count, first_seen, last_seen, confidence, version, updated_at, proposed_at, snoozed_until, skill_path
+		FROM candidates WHERE state = ? AND proposed_at != '' ORDER BY proposed_at DESC LIMIT 1`, model.CandidateProposed)
+	c, err := scanCandidate(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.Candidate{}, fmt.Errorf("no proposed candidate")
+	}
+	if err != nil {
+		return model.Candidate{}, err
+	}
+	if project == "" {
+		return c, nil
+	}
+	corrections, err := s.CorrectionsForCandidate(c.ID)
+	if err != nil {
+		return c, err
+	}
+	for _, cor := range corrections {
+		if cor.Project == project {
+			return c, nil
+		}
+	}
+	events, err := s.EventsForCandidate(c.ID)
+	if err != nil {
+		return c, err
+	}
+	for _, e := range events {
+		if e.Project == project {
+			return c, nil
+		}
+	}
+	return model.Candidate{}, fmt.Errorf("no proposed candidate for project %s", project)
 }
 
 func (s *Store) CreateExport(e model.ExportRecord) error {
@@ -360,14 +456,28 @@ func (s *Store) Stats() (model.StoreStats, error) {
 
 func scanCandidate(scanner interface{ Scan(dest ...any) error }) (model.Candidate, error) {
 	var c model.Candidate
-	var first, last, updated string
+	var first, last, updated, proposed, snoozed, skillPath string
 	var state string
-	err := scanner.Scan(&c.ID, &c.Fingerprint, &c.Name, &c.Description, &c.RuleText, &state, &c.EventCount, &c.ProjectCount, &c.SourceCount, &first, &last, &c.Confidence, &c.Version, &updated)
+	err := scanner.Scan(&c.ID, &c.Fingerprint, &c.Name, &c.Description, &c.RuleText, &state, &c.EventCount, &c.ProjectCount, &c.SourceCount, &first, &last, &c.Confidence, &c.Version, &updated, &proposed, &snoozed, &skillPath)
 	c.State = model.CandidateState(state)
 	c.FirstSeen = parseTime(first)
 	c.LastSeen = parseTime(last)
 	c.UpdatedAt = parseTime(updated)
+	c.ProposedAt = parseTime(proposed)
+	c.SnoozedUntil = parseTime(snoozed)
+	c.SkillPath = skillPath
 	return c, err
+}
+
+func isFrozenCandidateState(state model.CandidateState) bool {
+	switch state {
+	case model.CandidateRejected, model.CandidateExported, model.CandidateAccepted,
+		model.CandidateApproved, model.CandidateProposed, model.CandidateProposalReady,
+		model.CandidateSnoozed:
+		return true
+	default:
+		return false
+	}
 }
 
 func scanExport(scanner interface{ Scan(dest ...any) error }) (model.ExportRecord, error) {

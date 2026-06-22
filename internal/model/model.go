@@ -18,10 +18,14 @@ type Event struct {
 type CandidateState string
 
 const (
-	CandidatePending  CandidateState = "pending"
-	CandidateApproved CandidateState = "approved"
-	CandidateRejected CandidateState = "rejected"
-	CandidateExported CandidateState = "exported"
+	CandidatePending       CandidateState = "pending"
+	CandidateProposalReady CandidateState = "proposal_ready"
+	CandidateProposed      CandidateState = "proposed"
+	CandidateAccepted      CandidateState = "accepted"
+	CandidateSnoozed       CandidateState = "snoozed"
+	CandidateApproved      CandidateState = "approved"
+	CandidateRejected      CandidateState = "rejected"
+	CandidateExported      CandidateState = "exported"
 )
 
 type Candidate struct {
@@ -39,6 +43,9 @@ type Candidate struct {
 	Confidence   string
 	Version      int
 	UpdatedAt    time.Time
+	ProposedAt   time.Time
+	SnoozedUntil time.Time
+	SkillPath    string
 }
 
 type EvidenceCard struct {

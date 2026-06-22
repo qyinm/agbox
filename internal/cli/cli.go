@@ -22,6 +22,7 @@ import (
 	"github.com/hippoom/agbox/internal/impact"
 	"github.com/hippoom/agbox/internal/manifest"
 	"github.com/hippoom/agbox/internal/model"
+	"github.com/hippoom/agbox/internal/propose"
 	"github.com/hippoom/agbox/internal/scan"
 	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/session/claude"
@@ -83,7 +84,17 @@ func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	case "approve":
 		return withStore(func(s *store.Store) error { return runState(s, args[1:], model.CandidateApproved, stdout) })
 	case "reject":
-		return withStore(func(s *store.Store) error { return runState(s, args[1:], model.CandidateRejected, stdout) })
+		return withStore(func(s *store.Store) error { return runReject(s, args[1:], stdout) })
+	case "snooze":
+		return withStore(func(s *store.Store) error { return runSnooze(s, args[1:], stdout) })
+	case "accept":
+		return withStore(func(s *store.Store) error { return runAccept(s, args[1:], stdout) })
+	case "connect":
+		return runConnect(args[1:], stdout)
+	case "disconnect":
+		return runDisconnect(args[1:], stdout)
+	case "hook":
+		return withStore(func(s *store.Store) error { return runHook(s, args[1:], stdin, stdout) })
 	case "compile":
 		return withStore(func(s *store.Store) error { return runCompile(s, args[1:], stdout) })
 	case "export":
@@ -406,6 +417,20 @@ func runEvidence(s *store.Store, args []string, stdout io.Writer) error {
 			fmt.Fprintf(stdout, "- %s\n", ex)
 		}
 	}
+	return nil
+}
+
+func runReject(s *store.Store, args []string, stdout io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: agbox reject <candidate-id>")
+	}
+	if _, err := s.GetCandidate(args[0]); err != nil {
+		return err
+	}
+	if err := propose.Reject(s, args[0]); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "%s -> rejected (7d cooldown)\n", args[0])
 	return nil
 }
 

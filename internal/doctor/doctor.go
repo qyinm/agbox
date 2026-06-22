@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/hippoom/agbox/internal/connect"
 	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/store"
 	"github.com/hippoom/agbox/internal/watcher"
@@ -58,6 +59,17 @@ func Run(s *store.Store) Report {
 		line := fmt.Sprintf("source %s: %d paths", adapter.Agent(), len(sources))
 		if err != nil {
 			line += " (" + err.Error() + ")"
+			r.OK = false
+		}
+		r.Lines = append(r.Lines, line)
+	}
+
+	for _, status := range connect.StatusAll() {
+		line := fmt.Sprintf("hook %s: %s (%s)", status.Agent, status.State, status.Path)
+		if status.Detail != "" && status.State != "connected" {
+			line += " — " + status.Detail
+		}
+		if !status.OK {
 			r.OK = false
 		}
 		r.Lines = append(r.Lines, line)

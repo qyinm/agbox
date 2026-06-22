@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/hippoom/agbox/internal/session"
+	"github.com/hippoom/agbox/internal/pipeline"
 	"github.com/hippoom/agbox/internal/store"
 	"github.com/hippoom/agbox/internal/watcher"
 )
@@ -47,8 +47,11 @@ func runInit(args []string, stdout io.Writer) error {
 		return err
 	}
 
-	ingested, err := session.IngestAll(s)
+	ingested, err := pipeline.SyncAll(s)
 	if err != nil {
+		return err
+	}
+	if err := connectAllAgents(stdout); err != nil {
 		return err
 	}
 
@@ -64,7 +67,7 @@ project: .agbox/
 	printWatcherStatus(stdout, home)
 	fmt.Fprintf(stdout, "initial ingest: %d corrections\n\n", ingested)
 	fmt.Fprintln(stdout, `Next steps:
-  agbox review            # Review workflow candidates
+  agbox doctor            # Check watcher + hooks for claude, codex, grok
   agbox status            # Check watcher and sync status
   agbox demo              # See the workflow in action`)
 	return nil
