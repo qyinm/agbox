@@ -151,6 +151,35 @@ func (s *Store) CountCorrections() (int, error) {
 	return n, err
 }
 
+func (s *Store) ListCursors() ([]CursorRow, error) {
+	rows, err := s.db.Query(`SELECT source_path, agent, last_offset, last_hash, last_synced_at
+		FROM source_cursors ORDER BY last_synced_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CursorRow
+	for rows.Next() {
+		var c CursorRow
+		var synced string
+		if err := rows.Scan(&c.SourcePath, &c.Agent, &c.LastOffset, &c.LastHash, &synced); err != nil {
+			return nil, err
+		}
+		c.LastSyncedAt = parseTime(synced)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) LatestCursorSync() (time.Time, error) {
+	var synced string
+	err := s.db.QueryRow(`SELECT MAX(last_synced_at) FROM source_cursors`).Scan(&synced)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return parseTime(synced), nil
+}
+
 func (s *Store) GetTurn(id string) (model.Turn, error) {
 	row := s.db.QueryRow(`SELECT id, session_id, turn_index, role, event_type, created_at FROM turns WHERE id = ?`, id)
 	var t model.Turn

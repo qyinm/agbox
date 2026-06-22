@@ -63,6 +63,7 @@ func TestExecuteEndToEndPromotionLoop(t *testing.T) {
 
 func TestInitShowsNextSteps(t *testing.T) {
 	root := t.TempDir()
+	t.Setenv("HOME", root)
 	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
 	wd, err := os.Getwd()
 	if err != nil {

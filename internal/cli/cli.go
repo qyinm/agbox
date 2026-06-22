@@ -57,6 +57,14 @@ func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	switch args[0] {
 	case "init":
 		return runInit(args[1:], stdout)
+	case "watch":
+		return runWatch()
+	case "status":
+		return withStore(func(s *store.Store) error { return runStatus(s, stdout) })
+	case "sources":
+		return runSources(stdout)
+	case "sync":
+		return withStore(func(s *store.Store) error { return runSync(s, args[1:], stdout) })
 	case "capture":
 		return withStore(func(s *store.Store) error { return runCapture(s, args[1:], stdin, stdout) })
 	case "hook":
@@ -113,35 +121,6 @@ func withStore(fn func(*store.Store) error) error {
 	}
 	defer s.Close()
 	return fn(s)
-}
-
-func runInit(args []string, stdout io.Writer) error {
-	fs := flag.NewFlagSet("init", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	if err := fs.Parse(reorderFlags(args, map[string]bool{})); err != nil {
-		return err
-	}
-	s, err := store.Open("")
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	if err := os.MkdirAll(".agbox", 0o755); err != nil {
-		return err
-	}
-	if err := ensureGitignore(".agbox/"); err != nil {
-		return err
-	}
-	fmt.Fprintf(stdout, `Initialized agbox
-store: %s
-project: .agbox/
-
-Next steps:
-  agbox demo              # See the workflow in action
-  agbox connect all --apply  # Connect to your AI agents
-  agbox capture --agent codex "Your workflow rule"
-`, s.Path())
-	return nil
 }
 
 func runCapture(s *store.Store, args []string, stdin io.Reader, stdout io.Writer) error {
@@ -850,6 +829,9 @@ Usage:
   agbox manifest verify
   agbox doctor
   agbox repair
+  agbox status
+  agbox sources
+  agbox sync --once
 
 Run agbox <command> --help for command-specific help.`)
 }
@@ -865,9 +847,28 @@ func printCommandHelp(w io.Writer, command string) bool {
 
 var commandHelp = map[string]string{
 	"init": `Usage:
-  agbox init
+  agbox init [--quiet]
 
-Initialize agbox in the current project, create .agbox/, and ensure .agbox/ is ignored by Git.`,
+Initialize agbox in the current project, install the session watcher, run initial ingest,
+create .agbox/, and ensure .agbox/ is ignored by Git.
+
+Options:
+  --quiet          Suppress status output`,
+	"status": `Usage:
+  agbox status
+
+Show watcher state, store path, last sync, and correction/candidate counts.`,
+	"sources": `Usage:
+  agbox sources
+
+List discovered session source paths per agent.`,
+	"sync": `Usage:
+  agbox sync [--once]
+
+Force a session ingestion pass for recovery.
+
+Options:
+  --once           Run one ingestion pass and exit (default behavior)`,
 	"capture": `Usage:
   agbox capture [--source manual] [--agent codex] [--project name] [--raw] [--no-excerpt] "Your workflow rule"
 
