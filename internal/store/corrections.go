@@ -151,6 +151,16 @@ func (s *Store) CountCorrections() (int, error) {
 	return n, err
 }
 
+func (s *Store) GetAction(id string) (model.Action, error) {
+	row := s.db.QueryRow(`SELECT id, turn_id, tool_name, command, file_path, excerpt FROM actions WHERE id = ?`, id)
+	var a model.Action
+	err := row.Scan(&a.ID, &a.TurnID, &a.ToolName, &a.Command, &a.FilePath, &a.Excerpt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.Action{}, errors.New("action not found")
+	}
+	return a, err
+}
+
 func scanCorrection(scanner interface{ Scan(dest ...any) error }) (model.Correction, error) {
 	var c model.Correction
 	var created string

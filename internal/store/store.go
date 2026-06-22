@@ -193,7 +193,7 @@ func (s *Store) EventsForCandidate(candidateID string) ([]model.Event, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) UpsertCandidate(c model.Candidate, eventIDs []string) error {
+func (s *Store) UpsertCandidate(c model.Candidate, eventIDs, correctionIDs []string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -243,6 +243,11 @@ func (s *Store) UpsertCandidate(c model.Candidate, eventIDs []string) error {
 	}
 	for _, eventID := range eventIDs {
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO candidate_events(candidate_id, event_id) VALUES (?, ?)`, c.ID, eventID); err != nil {
+			return err
+		}
+	}
+	for _, correctionID := range correctionIDs {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO candidate_corrections(candidate_id, correction_id) VALUES (?, ?)`, c.ID, correctionID); err != nil {
 			return err
 		}
 	}

@@ -19,6 +19,17 @@ func Run(s *store.Store, minRepeats int) (Result, error) {
 	if minRepeats <= 0 {
 		minRepeats = 2
 	}
+	count, err := s.CountCorrections()
+	if err != nil {
+		return Result{}, err
+	}
+	if count > 0 {
+		return runCorrections(s, minRepeats)
+	}
+	return runEvents(s, minRepeats)
+}
+
+func runEvents(s *store.Store, minRepeats int) (Result, error) {
 	events, err := s.ListEvents()
 	if err != nil {
 		return Result{}, err
@@ -39,18 +50,86 @@ func Run(s *store.Store, minRepeats int) (Result, error) {
 		for _, e := range group {
 			ids = append(ids, e.ID)
 		}
-		if err := s.UpsertCandidate(c, ids); err != nil {
+		if err := s.UpsertCandidate(c, ids, nil); err != nil {
 			return Result{}, err
 		}
 		result.Candidates = append(result.Candidates, c)
 	}
+	sortCandidates(&result)
+	return result, nil
+}
+
+func runCorrections(s *store.Store, minRepeats int) (Result, error) {
+	corrections, err := s.ListCorrections()
+	if err != nil {
+		return Result{}, err
+	}
+	actionCache := map[string]model.Action{}
+	byFingerprint := map[string][]model.Correction{}
+	for _, c := range corrections {
+		action, ok := actionCache[c.ActionID]
+		if !ok {
+			action, err = s.GetAction(c.ActionID)
+			if err != nil {
+				action = model.Action{Excerpt: c.Excerpt}
+			}
+			actionCache[c.ActionID] = action
+		}
+		fingerprint := correctionClusterFingerprint(c, action)
+		byFingerprint[fingerprint] = append(byFingerprint[fingerprint], c)
+	}
+	var result Result
+	result.Scanned = len(corrections)
+	for fingerprint, group := range byFingerprint {
+		if len(group) < minRepeats {
+			continue
+		}
+		c := buildCandidateFromCorrections(fingerprint, group)
+		ids := make([]string, 0, len(group))
+		for _, cor := range group {
+			ids = append(ids, cor.ID)
+		}
+		if err := s.UpsertCandidate(c, nil, ids); err != nil {
+			return Result{}, err
+		}
+		result.Candidates = append(result.Candidates, c)
+	}
+	sortCandidates(&result)
+	return result, nil
+}
+
+func correctionClusterFingerprint(c model.Correction, action model.Action) string {
+	return privacy.HashSignal(c.Normalized + "|" + actionFingerprint(action))
+}
+
+func actionFingerprint(action model.Action) string {
+	if norm := privacy.NormalizeSignal(action.Command); norm != "" {
+		return norm
+	}
+	return privacy.NormalizeSignal(action.Excerpt)
+}
+
+func buildCandidateFromCorrections(fingerprint string, corrections []model.Correction) model.Candidate {
+	events := make([]model.Event, len(corrections))
+	for i, c := range corrections {
+		events[i] = model.Event{
+			Normalized: c.Normalized,
+			Excerpt:    c.Excerpt,
+			Project:    c.Project,
+			Source:     c.Agent,
+			CreatedAt:  c.CreatedAt,
+		}
+	}
+	return buildCandidate(fingerprint, events)
+}
+
+func sortCandidates(result *Result) {
 	sort.Slice(result.Candidates, func(i, j int) bool {
 		if result.Candidates[i].EventCount == result.Candidates[j].EventCount {
 			return result.Candidates[i].LastSeen.After(result.Candidates[j].LastSeen)
 		}
 		return result.Candidates[i].EventCount > result.Candidates[j].EventCount
 	})
-	return result, nil
 }
 
 func buildCandidate(fingerprint string, events []model.Event) model.Candidate {
