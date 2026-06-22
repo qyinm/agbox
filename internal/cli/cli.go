@@ -22,7 +22,6 @@ import (
 	"github.com/hippoom/agbox/internal/impact"
 	"github.com/hippoom/agbox/internal/manifest"
 	"github.com/hippoom/agbox/internal/model"
-	"github.com/hippoom/agbox/internal/propose"
 	"github.com/hippoom/agbox/internal/scan"
 	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/session/claude"
@@ -420,20 +419,6 @@ func runEvidence(s *store.Store, args []string, stdout io.Writer) error {
 	return nil
 }
 
-func runReject(s *store.Store, args []string, stdout io.Writer) error {
-	if len(args) == 0 {
-		return errors.New("usage: agbox reject <candidate-id>")
-	}
-	if _, err := s.GetCandidate(args[0]); err != nil {
-		return err
-	}
-	if err := propose.Reject(s, args[0]); err != nil {
-		return err
-	}
-	fmt.Fprintf(stdout, "%s -> rejected (7d cooldown)\n", args[0])
-	return nil
-}
-
 func runState(s *store.Store, args []string, state model.CandidateState, stdout io.Writer) error {
 	fs := flag.NewFlagSet(string(state), flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -818,12 +803,40 @@ Approve a workflow candidate for export.
 Options:
   --name name      Candidate skill name`,
 	"reject": `Usage:
-  agbox reject <candidate-id> [--name workflow-name]
+  agbox reject <candidate-id>
 
-Reject a workflow candidate.
+Reject a skill promotion candidate (7-day cooldown).`,
+	"snooze": `Usage:
+  agbox snooze <candidate-id>
+
+Snooze a skill promotion candidate (24-hour cooldown).`,
+	"accept": `Usage:
+  agbox accept <candidate-id> [--skill-path path]
+
+Mark a candidate as accepted after SKILL.md creation.
 
 Options:
-  --name name      Candidate skill name`,
+  --skill-path path  Path to created SKILL.md`,
+	"connect": `Usage:
+  agbox connect <claude|codex|grok> [--command path] [--project]
+
+Install agbox managed hooks for an agent.
+
+Options:
+  --command path   Absolute path to agbox binary
+  --project        Install project-scoped hooks (grok only)`,
+	"disconnect": `Usage:
+  agbox disconnect <claude|codex|grok> [--project]
+
+Remove agbox managed hooks for an agent.
+
+Options:
+  --project        Remove project-scoped hooks (grok only)`,
+	"hook": `Usage:
+  agbox hook propose <claude|codex|grok>
+  agbox hook acknowledge <claude|codex|grok>
+
+Hook entrypoints used by agent hook configs. Reads JSON from stdin.`,
 	"compile": `Usage:
   agbox compile <candidate-id> [--target agents-md|claude|codex|cursor|cline]
 
