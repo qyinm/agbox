@@ -70,6 +70,7 @@ project: .agbox/
 `, s.Path())
 	printWatcherStatus(stdout, home)
 	fmt.Fprintf(stdout, "managed hooks: %s\n", managedHookSummary())
+	fmt.Fprintln(stdout, "telemetry: on by default (agbox telemetry off to opt out)")
 	if syncResult.Warning != nil {
 		fmt.Fprintf(stdout, "initial ingest: partial (%d corrections; run agbox doctor if candidates look wrong)\n\n", syncResult.Ingested)
 	} else {

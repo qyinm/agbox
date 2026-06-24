@@ -222,7 +222,20 @@ One correction, promoted once, lands everywhere your agents look.
 
 agbox touches your prompts and your config files. That trust is the product, so:
 
-- **Everything stays local.** The global store is `~/.agbox/agbox.db`. Nothing is uploaded.
+- **Sessions, prompts, and core workflow data stay local.** The global store is `~/.agbox/agbox.db`. Your corrections, candidates, exports, and session ingest never leave your machine unless you explicitly share them (e.g. `agbox audit`).
+- **Anonymous usage stats (on by default).** Telemetry is enabled unless you opt out with `agbox telemetry off` or `AGBOX_TELEMETRY=0`. agbox sends only:
+  - `agbox_install_completed` once (install/version signal)
+  - `agbox_daily_active` at most once per UTC day (includes `streak_days`)
+  
+  Events go to PostHog (maintainer analytics). Your distinct ID is a random UUID — not your hostname, username, or machine fingerprint. Payloads include `app` (`agbox`), `agbox_version`, `os_family`, and `arch` only.
+
+  **Turn off telemetry:**
+
+  ```bash
+  agbox telemetry off
+  ```
+
+  Or set `AGBOX_TELEMETRY=0` in your shell. Check status with `agbox telemetry status` or `agbox doctor`.
 - **Redacted by default.** Persisted signals are short redacted excerpts + a hash + metadata. Raw text is opt-in via `--raw`; session ingest never stores full transcripts.
 - **Reversible by default.** Every export write is backed up; `agbox export rollback <id>` restores it. Managed proposal hooks can be removed with `agbox disconnect <agent>`.
 - **Inspectable.** Open source, with a deterministic compiler — read exactly what gets written before it's written.
@@ -281,6 +294,10 @@ agbox impact <id>                   repeat counts before vs after export
 agbox audit  [--profile …]          generate a workflow audit pack
 agbox manifest verify               verify .agbox/skill-pack.json hashes
 agbox doctor                        local health check
+
+agbox telemetry off                 disable anonymous usage stats (default: on)
+agbox telemetry on                  re-enable after opt-out
+agbox telemetry status              show whether telemetry is on or off
 ```
 
 Run `agbox <command> --help` for command-specific options.

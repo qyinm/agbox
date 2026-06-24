@@ -9,6 +9,7 @@ import (
 	"github.com/hippoom/agbox/internal/connect"
 	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/store"
+	"github.com/hippoom/agbox/internal/telemetry"
 	"github.com/hippoom/agbox/internal/watcher"
 )
 
@@ -35,6 +36,7 @@ func Run(s *store.Store) Report {
 	}
 	r.Lines = append(r.Lines, fmt.Sprintf("candidates: %d", stats.Candidates))
 	r.Lines = append(r.Lines, fmt.Sprintf("exports: %d", stats.Exports))
+	r.Lines = append(r.Lines, telemetry.StatusLine())
 
 	home, err := os.UserHomeDir()
 	needsInit := false

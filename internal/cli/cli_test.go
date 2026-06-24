@@ -12,6 +12,7 @@ import (
 	"github.com/hippoom/agbox/internal/privacy"
 	"github.com/hippoom/agbox/internal/scan"
 	"github.com/hippoom/agbox/internal/store"
+	"github.com/hippoom/agbox/internal/telemetry"
 )
 
 func TestExecuteEndToEndPromotionLoop(t *testing.T) {
@@ -93,6 +94,7 @@ func TestInitShowsNextSteps(t *testing.T) {
 		"Initialized agbox",
 		"Next steps:",
 		"managed hooks:",
+		"telemetry: on by default",
 		"agbox beta              # See setup + candidates in one terminal summary",
 		"agbox doctor            # Check watcher + managed proposal hooks",
 		"agbox disconnect <agent>",
@@ -442,6 +444,190 @@ func TestDemoShowsPreviewWithoutPersistentStore(t *testing.T) {
 	}
 	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
 		t.Fatalf("demo touched persistent AGBOX_DB: %v", err)
+	}
+}
+
+func setupTelemetryHome(t *testing.T) string {
+	t.Helper()
+	home := filepath.Join(t.TempDir(), ".agbox")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGBOX_HOME", home)
+	t.Setenv("AGBOX_TELEMETRY", "")
+	return home
+}
+
+func TestTelemetryStatusDefaultOn(t *testing.T) {
+	setupTelemetryHome(t)
+
+	var out bytes.Buffer
+	if err := Execute([]string{"telemetry", "status"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"telemetry: on (not configured",
+		"agbox telemetry off",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("telemetry status output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestTelemetryOnEnablesAfterOptOut(t *testing.T) {
+	setupTelemetryHome(t)
+	t.Setenv("POSTHOG_API_KEY", "phc_test")
+	if err := telemetry.OptOut(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := Execute([]string{"telemetry", "on"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"agbox_install_completed",
+		"agbox_daily_active",
+		"PostHog",
+		"random UUID",
+		"telemetry enabled",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("telemetry on output missing %q:\n%s", want, got)
+		}
+	}
+	st, err := telemetry.LoadState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Enabled {
+		t.Fatal("telemetry should be enabled after telemetry on")
+	}
+	if st.AnonymousID == "" {
+		t.Fatal("expected anonymous_id after re-enable")
+	}
+	if !telemetry.Enabled() {
+		t.Fatal("telemetry.Enabled() should be true after re-enable")
+	}
+}
+
+func TestShouldRecordDailyActive(t *testing.T) {
+	tests := []struct {
+		args []string
+		want bool
+	}{
+		{args: nil, want: false},
+		{args: []string{}, want: false},
+		{args: []string{"telemetry", "status"}, want: false},
+		{args: []string{"help"}, want: false},
+		{args: []string{"help", "status"}, want: false},
+		{args: []string{"-h"}, want: false},
+		{args: []string{"--help"}, want: false},
+		{args: []string{"-v"}, want: false},
+		{args: []string{"--version"}, want: false},
+		{args: []string{"version"}, want: false},
+		{args: []string{"capture", "--help"}, want: false},
+		{args: []string{"init"}, want: false},
+		{args: []string{"status"}, want: true},
+		{args: []string{"doctor"}, want: true},
+		{args: []string{"demo"}, want: true},
+	}
+	for _, tc := range tests {
+		got := shouldRecordDailyActive(tc.args)
+		if got != tc.want {
+			t.Fatalf("shouldRecordDailyActive(%v) = %v, want %v", tc.args, got, tc.want)
+		}
+	}
+}
+
+func TestExecuteSkipsDailyActiveForTelemetry(t *testing.T) {
+	setupTelemetryHome(t)
+
+	var calls int
+	old := maybeRecordDailyActiveHook
+	maybeRecordDailyActiveHook = func() { calls++ }
+	t.Cleanup(func() { maybeRecordDailyActiveHook = old })
+
+	if err := Execute([]string{"telemetry", "status"}, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("telemetry status hook calls = %d, want 0", calls)
+	}
+}
+
+func TestExecuteRecordsDailyActiveOnSuccess(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+
+	var calls int
+	old := maybeRecordDailyActiveHook
+	maybeRecordDailyActiveHook = func() { calls++ }
+	t.Cleanup(func() { maybeRecordDailyActiveHook = old })
+
+	if err := Execute([]string{"status"}, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("status hook calls = %d, want 1", calls)
+	}
+}
+
+func TestExecuteSkipsDailyActiveOnError(t *testing.T) {
+	var calls int
+	old := maybeRecordDailyActiveHook
+	maybeRecordDailyActiveHook = func() { calls++ }
+	t.Cleanup(func() { maybeRecordDailyActiveHook = old })
+
+	err := Execute([]string{"unknown-cmd"}, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("expected error for unknown command")
+	}
+	if calls != 0 {
+		t.Fatalf("failed command hook calls = %d, want 0", calls)
+	}
+}
+
+func TestExecuteOptedOutDoesNotPanic(t *testing.T) {
+	setupTelemetryHome(t)
+	root := t.TempDir()
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+
+	if err := Execute([]string{"status"}, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTelemetryOffDisables(t *testing.T) {
+	setupTelemetryHome(t)
+	t.Setenv("POSTHOG_API_KEY", "phc_test")
+	if _, err := telemetry.OptIn(); err != nil {
+		t.Fatal(err)
+	}
+	if !telemetry.Enabled() {
+		t.Fatal("telemetry should be enabled before off")
+	}
+
+	var out bytes.Buffer
+	if err := Execute([]string{"telemetry", "off"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "telemetry disabled") {
+		t.Fatalf("telemetry off output = %q", out.String())
+	}
+	st, err := telemetry.LoadState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Enabled {
+		t.Fatal("telemetry should be disabled after off")
+	}
+	if telemetry.Enabled() {
+		t.Fatal("telemetry.Enabled() should be false after off")
 	}
 }
 
