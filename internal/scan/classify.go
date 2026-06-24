@@ -9,10 +9,38 @@ import (
 )
 
 func clusterFingerprint(e model.Event) string {
+	return privacy.HashSignal(string(model.CandidateSourcePromptPattern) + ":" + clusterKey(e))
+}
+
+func clusterKey(e model.Event) string {
 	if key := SemanticKey(e.Normalized); key != "" {
-		return privacy.HashSignal("semantic:" + key)
+		return "semantic:" + key
 	}
-	return e.Hash
+	return "exact:" + e.Hash
+}
+
+func eligiblePromptEvent(e model.Event) bool {
+	normalized := strings.TrimSpace(e.Normalized)
+	if normalized == "" {
+		return false
+	}
+	if isGeneratedProposalText(e.Excerpt) || isGeneratedProposalText(e.Raw) || isGeneratedProposalText(normalized) {
+		return false
+	}
+	if looksLikeStructuredContext(e.Excerpt) || looksLikeStructuredContext(e.Raw) {
+		return false
+	}
+	if looksLikeNormalizedStructuredContext(normalized) {
+		return false
+	}
+	if isAcknowledgement(normalized) || isNumericOnly(normalized) {
+		return false
+	}
+	tokens := strings.Fields(normalized)
+	if len(tokens) < 3 && SemanticKey(normalized) == "" {
+		return false
+	}
+	return true
 }
 
 // SemanticKey derives a stable semantic clustering key from normalized signal text.
@@ -143,6 +171,68 @@ func hasAny(tokens []string, values ...string) bool {
 }
 
 var packageManagers = []string{"bun", "npm", "pnpm", "yarn"}
+
+func isGeneratedProposalText(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return false
+	}
+	markers := []string{
+		"agbox skill proposal instructions",
+		"agbox proposal",
+		"agbox candidate",
+		"should i create a reusable skill",
+		"reply yes no or later",
+	}
+	for _, marker := range markers {
+		if strings.Contains(value, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeStructuredContext(value string) bool {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return false
+	}
+	if strings.HasPrefix(value, "<environment_context") ||
+		strings.HasPrefix(value, "<system") ||
+		strings.HasPrefix(value, "<developer") ||
+		strings.HasPrefix(value, "<user") {
+		return true
+	}
+	return strings.HasPrefix(value, "<") && strings.Contains(value, "</")
+}
+
+func looksLikeNormalizedStructuredContext(normalized string) bool {
+	return strings.HasPrefix(normalized, "environment context") ||
+		(strings.HasPrefix(normalized, "system") && strings.HasSuffix(normalized, " system")) ||
+		(strings.HasPrefix(normalized, "developer") && strings.HasSuffix(normalized, " developer"))
+}
+
+func isAcknowledgement(normalized string) bool {
+	switch normalized {
+	case "ok", "okay", "yes", "no", "thanks", "thank you", "sure", "done", "got it",
+		"네", "예", "아니", "응", "ㅇㅇ", "좋아", "확인", "감사합니다", "고마워":
+		return true
+	default:
+		return false
+	}
+}
+
+func isNumericOnly(normalized string) bool {
+	for _, r := range normalized {
+		if r == ' ' {
+			continue
+		}
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return normalized != ""
+}
 
 var stopWords = map[string]bool{
 	"a": true, "an": true, "and": true, "are": true, "as": true, "at": true,
