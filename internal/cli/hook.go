@@ -33,8 +33,12 @@ func runHookPropose(s *store.Store, args []string, stdin io.Reader, stdout io.Wr
 	if err != nil {
 		return err
 	}
-	if err := pipeline.SyncIfStale(s); err != nil {
+	syncResult, err := pipeline.SyncBestEffortIfStale(s)
+	if err != nil {
 		return err
+	}
+	if syncResult.Warning != nil {
+		fmt.Fprintf(os.Stderr, "agbox: warning: partial sync before proposal: %s\n", syncResult.Warning)
 	}
 	project := propose.ProjectFromHook(hookData)
 	if project == "" {

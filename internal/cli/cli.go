@@ -72,6 +72,8 @@ func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return withStore(func(s *store.Store) error { return runDiscover(s, args[1:], stdout) })
 	case "review":
 		return runReview(args[1:], stdin, stdout)
+	case "beta":
+		return withStore(func(s *store.Store) error { return runBeta(s, args[1:], stdout) })
 	case "demo":
 		return runDemo(stdout)
 	case "scan":
@@ -97,7 +99,7 @@ func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	case "compile":
 		return withStore(func(s *store.Store) error { return runCompile(s, args[1:], stdout) })
 	case "export":
-		return withStore(func(s *store.Store) error { return runExport(s, args[1:], stdout) })
+		return withStore(func(s *store.Store) error { return runExport(s, args[1:], stdout, stderr) })
 	case "manifest":
 		return withStore(func(s *store.Store) error { return runManifest(args[1:], stdout) })
 	case "impact":
@@ -227,7 +229,7 @@ func runDiscover(s *store.Store, args []string, stdout io.Writer) error {
 	if len(candidates) == 0 {
 		fmt.Fprintf(stdout, "No workflow candidates yet.\nscanned %d events, found %d repeated signals\n", result.Scanned, len(result.Candidates))
 		if result.Scanned == 0 {
-			fmt.Fprintln(stdout, "agbox has not captured any prompts in this store.")
+			fmt.Fprintln(stdout, "agbox has not ingested any repeated corrections in this store.")
 		} else {
 			fmt.Fprintf(stdout, "Capture at least %d matching prompts before a candidate appears.\n", normalizedMinRepeats(*minRepeats))
 		}
@@ -268,7 +270,7 @@ func runReview(args []string, stdin io.Reader, stdout io.Writer) error {
 		return errors.New("--limit must be 0 or greater")
 	}
 	if !validReviewState(*state) {
-		return fmt.Errorf("--state must be pending, approved, rejected, exported, or all")
+		return fmt.Errorf("--state must be %s", reviewStateHelp)
 	}
 	if !interactiveTerminal(stdin) || !interactiveTerminal(stdout) {
 		return errors.New("agbox review requires an interactive terminal; use agbox discover or agbox inbox instead")
@@ -294,12 +296,22 @@ func runReview(args []string, stdin io.Reader, stdout io.Writer) error {
 
 func validReviewState(state string) bool {
 	switch strings.ToLower(strings.TrimSpace(state)) {
-	case string(model.CandidatePending), string(model.CandidateApproved), string(model.CandidateRejected), string(model.CandidateExported), "all":
+	case string(model.CandidatePending),
+		string(model.CandidateProposalReady),
+		string(model.CandidateProposed),
+		string(model.CandidateAccepted),
+		string(model.CandidateSnoozed),
+		string(model.CandidateApproved),
+		string(model.CandidateRejected),
+		string(model.CandidateExported),
+		"all":
 		return true
 	default:
 		return false
 	}
 }
+
+const reviewStateHelp = "pending, proposal_ready, proposed, accepted, snoozed, approved, rejected, exported, or all"
 
 func interactiveTerminal(v any) bool {
 	f, ok := v.(*os.File)
@@ -372,6 +384,7 @@ func runDemo(stdout io.Writer) error {
 	fmt.Fprintln(stdout, strings.TrimSpace(artifact.Body))
 	fmt.Fprintln(stdout, "\nNo files were changed; this demo used a temporary local store.")
 	fmt.Fprintln(stdout, "Use this on your own agent sessions:")
+	fmt.Fprintln(stdout, "  agbox beta")
 	fmt.Fprintln(stdout, "  agbox review")
 	fmt.Fprintln(stdout, "  agbox status")
 	return nil
@@ -393,9 +406,10 @@ func displayState(state string) string {
 
 func printDiscoverNext(stdout io.Writer) {
 	fmt.Fprintln(stdout, "\nNext")
-	fmt.Fprintln(stdout, "1. Work normally in Claude, Codex, or Cursor.")
-	fmt.Fprintln(stdout, "2. agbox status            # confirm watcher is collecting")
-	fmt.Fprintln(stdout, "3. agbox review            # review candidates with evidence")
+	fmt.Fprintln(stdout, "1. Work normally in Claude, Codex, Cursor, or Grok.")
+	fmt.Fprintln(stdout, "2. agbox beta              # see setup + candidates in one terminal summary")
+	fmt.Fprintln(stdout, "3. agbox status            # confirm watcher is collecting")
+	fmt.Fprintln(stdout, "4. agbox review            # review candidates with evidence")
 	fmt.Fprintln(stdout, "\nWant to see the loop without touching your data? Run `agbox demo`.")
 }
 
@@ -462,7 +476,7 @@ func runCompile(s *store.Store, args []string, stdout io.Writer) error {
 	return nil
 }
 
-func runExport(s *store.Store, args []string, stdout io.Writer) error {
+func runExport(s *store.Store, args []string, stdout, stderr io.Writer) error {
 	if len(args) > 0 && args[0] == "rollback" {
 		if len(args) < 2 {
 			return errors.New("usage: agbox export rollback <export-id>")
@@ -513,6 +527,7 @@ func runExport(s *store.Store, args []string, stdout io.Writer) error {
 			return err
 		}
 		fmt.Fprintf(stdout, "exported %s candidate=%s target=%s path=%s\n", rec.ID, c.ID, rec.Target, rec.Path)
+		fmt.Fprintf(stderr, "undo: agbox export rollback %s\n", rec.ID)
 	}
 	return nil
 }
@@ -696,8 +711,9 @@ Usage:
   agbox compile <candidate-id> [--target agents-md|claude|codex|cursor|cline]
   agbox export [candidate-id...] [--target agents-md] [--dry-run]
   agbox export rollback <export-id>
-  agbox discover [--min-repeats 2] [--state pending|all] [--limit 5]
-  agbox review [--state pending|approved|rejected|exported|all] [--min-repeats 2] [--limit 20]
+  agbox discover [--min-repeats 2] [--state pending|proposal_ready|proposed|accepted|snoozed|approved|rejected|exported|all] [--limit 5]
+  agbox review [--state pending|proposal_ready|proposed|accepted|snoozed|approved|rejected|exported|all] [--min-repeats 2] [--limit 20]
+  agbox beta [--limit 5]
   agbox demo
   agbox impact <candidate-id>
   agbox audit [--profile private|shareable|client] [--out audit.md]
@@ -756,7 +772,7 @@ Options:
   --raw            Store redacted raw text
   --no-excerpt     Store hash and metadata only`,
 	"discover": `Usage:
-  agbox discover [--min-repeats 2] [--state pending|all] [--limit 5]
+  agbox discover [--min-repeats 2] [--state pending|proposal_ready|proposed|accepted|snoozed|approved|rejected|exported|all] [--limit 5]
 
 Scan captured events and show reviewable workflow candidates with next actions.
 
@@ -765,7 +781,7 @@ Options:
   --state state    Candidate state filter, or all. Default: pending
   --limit n        Maximum candidates to show. Default: 5`,
 	"review": `Usage:
-  agbox review [--state pending|approved|rejected|exported|all] [--min-repeats 2] [--limit 20]
+  agbox review [--state pending|proposal_ready|proposed|accepted|snoozed|approved|rejected|exported|all] [--min-repeats 2] [--limit 20]
 
 Open the interactive review UI for workflow candidates.
 
@@ -773,6 +789,13 @@ Options:
   --state state    Candidate state filter, or all. Default: pending
   --min-repeats n  Minimum repeated signals. Default: 2
   --limit n        Maximum candidates to show. Default: 20`,
+	"beta": `Usage:
+  agbox beta [--limit 5]
+
+Show setup health and the best repeated-correction candidates in a terminal-safe beta summary.
+
+Options:
+  --limit n        Maximum candidates to show. Default: 5`,
 	"demo": `Usage:
   agbox demo
 

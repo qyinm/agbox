@@ -4,6 +4,12 @@
 **Status:** Approved  
 **Scope:** agbox CLI pivot from hook-based prompt capture to automatic session-level ingestion
 
+> 2026-06-23 update: the current beta keeps the session watcher pivot, but managed
+> proposal hooks are back in scope for in-agent skill suggestions and skill-file
+> acknowledgement. Hook-based prompt capture remains out of scope. Sections below
+> that say hook commands are removed are superseded by the beta aha loop plan in
+> `docs/plans/2026-06-23-001-feat-beta-aha-loop-plan.md`.
+
 ---
 
 ## Problem

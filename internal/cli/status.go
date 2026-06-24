@@ -39,6 +39,7 @@ func runStatus(s *store.Store, stdout io.Writer) error {
 	}
 
 	fmt.Fprintf(stdout, "watcher: %s\n", state)
+	fmt.Fprintf(stdout, "managed hooks: %s\n", managedHookSummary())
 	fmt.Fprintf(stdout, "store: %s\n", stats.Path)
 	fmt.Fprintf(stdout, "last sync: %s\n", formatLastSync(lastSync))
 	fmt.Fprintf(stdout, "corrections: %d\n", corrections)

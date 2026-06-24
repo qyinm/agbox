@@ -23,8 +23,8 @@ func TestReviewModelEmptyCandidates(t *testing.T) {
 	got := stripANSI(m.Render())
 	for _, want := range []string{
 		"No workflow candidates to review.",
-		"agbox discover",
-		"agbox capture",
+		"agbox beta",
+		"agbox demo",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("empty render missing %q:\n%s", want, got)
@@ -48,6 +48,46 @@ func TestReviewModelRendersCandidateAndEvidence(t *testing.T) {
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("candidate render missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestReviewModelRendersProposalStateBadges(t *testing.T) {
+	s := openTestStore(t)
+	defer s.Close()
+	now := time.Now()
+	states := []model.CandidateState{
+		model.CandidateProposalReady,
+		model.CandidateProposed,
+		model.CandidateAccepted,
+		model.CandidateSnoozed,
+	}
+	for i, state := range states {
+		c := model.Candidate{
+			ID:           fmt.Sprintf("cand_state_%d", i),
+			Fingerprint:  fmt.Sprintf("fp_state_%d", i),
+			Name:         fmt.Sprintf("state-%d", i),
+			Description:  "state badge test",
+			RuleText:     "state badge test",
+			State:        state,
+			EventCount:   2,
+			ProjectCount: 1,
+			SourceCount:  1,
+			FirstSeen:    now,
+			LastSeen:     now,
+			Confidence:   "medium",
+			UpdatedAt:    now,
+		}
+		if err := s.UpsertCandidate(c, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m := NewReviewModel(NewReviewService(s, ReviewOptions{State: "all"})).Refresh()
+	got := stripANSI(m.Render())
+	for _, want := range []string{"proposal_ready", "proposed", "accepted", "snoozed"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("review render missing state badge %q:\n%s", want, got)
 		}
 	}
 }
@@ -193,6 +233,36 @@ func TestReviewModelExportTargetPicker(t *testing.T) {
 	got := stripANSI(m.Render())
 	if !strings.Contains(got, "Export target") || !strings.Contains(got, "AGENTS.md") {
 		t.Fatalf("export picker missing labels:\n%s", got)
+	}
+}
+
+func TestReviewModelExportShowsRollbackCommand(t *testing.T) {
+	root := t.TempDir()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(wd)
+
+	s := storeWithCandidates(t, "Use bun, not npm.", "Use bun, not npm.")
+	defer s.Close()
+	m := NewReviewModel(NewReviewService(s, ReviewOptions{})).Refresh()
+	m = KeyForTest(m, "a")
+	m = KeyForTest(m, "y")
+	m = KeyForTest(m, "e")
+	m = KeyForTest(m, "1")
+	got := stripANSI(m.Render())
+	for _, want := range []string{
+		"exported exp_",
+		"path=AGENTS.md",
+		"undo: agbox export rollback exp_",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("export render missing %q:\n%s", want, got)
+		}
 	}
 }
 

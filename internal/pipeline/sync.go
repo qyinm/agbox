@@ -9,6 +9,11 @@ import (
 	"github.com/hippoom/agbox/internal/store"
 )
 
+type BestEffortSyncResult struct {
+	Ingested int
+	Warning  error
+}
+
 func SyncAll(s *store.Store) (int, error) {
 	n, err := session.IngestAll(s)
 	if err != nil {
@@ -23,6 +28,18 @@ func SyncAll(s *store.Store) (int, error) {
 	return n, nil
 }
 
+func SyncBestEffort(s *store.Store) (BestEffortSyncResult, error) {
+	n, warning := session.IngestAllBestEffort(s)
+	result := BestEffortSyncResult{Ingested: n, Warning: warning}
+	if _, err := scan.Run(s, 2); err != nil {
+		return result, err
+	}
+	if err := propose.PromoteAfterScan(s); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
 func SyncIfStale(s *store.Store) error {
 	lastSync, err := s.LatestCursorSync()
 	if err != nil {
@@ -33,4 +50,15 @@ func SyncIfStale(s *store.Store) error {
 	}
 	_, err = SyncAll(s)
 	return err
+}
+
+func SyncBestEffortIfStale(s *store.Store) (BestEffortSyncResult, error) {
+	lastSync, err := s.LatestCursorSync()
+	if err != nil {
+		return BestEffortSyncResult{}, err
+	}
+	if !lastSync.IsZero() && time.Since(lastSync) < 5*time.Minute {
+		return BestEffortSyncResult{}, nil
+	}
+	return SyncBestEffort(s)
 }

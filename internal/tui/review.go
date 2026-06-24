@@ -116,7 +116,7 @@ func (s ReviewService) Export(candidateID, target string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("exported %s path=%s target=%s", rec.ID, rec.Path, rec.Target), nil
+	return fmt.Sprintf("exported %s path=%s target=%s; undo: agbox export rollback %s", rec.ID, rec.Path, rec.Target, rec.ID), nil
 }
 
 type pendingAction string
@@ -211,7 +211,7 @@ func (m ReviewModel) Render() string {
 	if len(m.data.Candidates) == 0 {
 		fmt.Fprintln(&b, sectionTitleStyle.Render("No candidates"))
 		fmt.Fprintln(&b, bodyStyle.Render("No workflow candidates to review."))
-		fmt.Fprintln(&b, mutedStyle.Render("Run agbox discover after a few agent sessions, or capture repeated prompts with agbox capture and agbox scan."))
+		fmt.Fprintln(&b, mutedStyle.Render("Run agbox beta after a few agent sessions, or use agbox demo to see the loop without touching your data."))
 		return b.String()
 	}
 	fmt.Fprintln(&b, sectionTitleStyle.Render("Candidates"))
@@ -526,6 +526,14 @@ func truncate(s string, width int) string {
 
 func stateBadge(state model.CandidateState) string {
 	switch state {
+	case model.CandidateProposalReady:
+		return badgeBase.Copy().Foreground(lipgloss.Color("#DDD6FE")).Background(lipgloss.Color("#4C1D95")).Render(" proposal_ready ")
+	case model.CandidateProposed:
+		return badgeBase.Copy().Foreground(lipgloss.Color("#BAE6FD")).Background(lipgloss.Color("#075985")).Render(" proposed ")
+	case model.CandidateAccepted:
+		return badgeBase.Copy().Foreground(lipgloss.Color("#A7F3D0")).Background(lipgloss.Color("#065F46")).Render(" accepted ")
+	case model.CandidateSnoozed:
+		return badgeBase.Copy().Foreground(lipgloss.Color("#FDE68A")).Background(lipgloss.Color("#713F12")).Render(" snoozed ")
 	case model.CandidateApproved:
 		return badgeBase.Copy().Foreground(lipgloss.Color("#34D399")).Background(lipgloss.Color("#064E3B")).Render(" approved ")
 	case model.CandidateRejected:

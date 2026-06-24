@@ -64,6 +64,10 @@ func applyConnect(agent, action string, opts connect.Options, stdout io.Writer) 
 }
 
 func connectAllAgents(stdout io.Writer) error {
+	if skipConnectKey := skipConnectEnvKey(); skipConnectKey != "" {
+		fmt.Fprintf(stdout, "agbox: managed hooks skipped (%s=1)\n", skipConnectKey)
+		return nil
+	}
 	agents := []struct {
 		agent string
 		skip  string
@@ -91,6 +95,16 @@ func connectAllAgents(stdout io.Writer) error {
 		fmt.Fprintf(stdout, "agbox: hooks installed for %s\n", strings.Join(connected, ", "))
 	}
 	return nil
+}
+
+func skipConnectEnvKey() string {
+	if isTruthyEnv("AGBOX_SKIP_CONNECT") {
+		return "AGBOX_SKIP_CONNECT"
+	}
+	if isTruthyEnv("AGBOX_SKIP_HOOKS") {
+		return "AGBOX_SKIP_HOOKS"
+	}
+	return ""
 }
 
 func isTruthyEnv(key string) bool {

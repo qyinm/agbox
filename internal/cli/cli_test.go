@@ -6,8 +6,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/hippoom/agbox/internal/model"
 	"github.com/hippoom/agbox/internal/privacy"
+	"github.com/hippoom/agbox/internal/scan"
+	"github.com/hippoom/agbox/internal/store"
 )
 
 func TestExecuteEndToEndPromotionLoop(t *testing.T) {
@@ -46,8 +50,15 @@ func TestExecuteEndToEndPromotionLoop(t *testing.T) {
 		t.Fatalf("dry-run output = %s", out.String())
 	}
 	out.Reset()
-	if err := Execute([]string{"export", candidateID}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+	var stderr bytes.Buffer
+	if err := Execute([]string{"export", candidateID}, strings.NewReader(""), &out, &stderr); err != nil {
 		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "undo: agbox export rollback exp_") {
+		t.Fatalf("export stdout included rollback command:\n%s", out.String())
+	}
+	if !strings.Contains(stderr.String(), "undo: agbox export rollback exp_") {
+		t.Fatalf("export stderr missing rollback command:\n%s", stderr.String())
 	}
 	if _, err := os.Stat(filepath.Join(root, "AGENTS.md")); err != nil {
 		t.Fatal(err)
@@ -81,13 +92,43 @@ func TestInitShowsNextSteps(t *testing.T) {
 	for _, want := range []string{
 		"Initialized agbox",
 		"Next steps:",
-		"agbox doctor            # Check watcher + hooks for claude, codex, grok",
+		"managed hooks:",
+		"agbox beta              # See setup + candidates in one terminal summary",
+		"agbox doctor            # Check watcher + managed proposal hooks",
+		"agbox disconnect <agent>",
 		"agbox status            # Check watcher and sync status",
 		"agbox demo              # See the workflow in action",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("init output missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestInitCanSkipManagedHooks(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+	t.Setenv("AGBOX_SKIP_CONNECT", "1")
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(wd)
+
+	var out bytes.Buffer
+	if err := Execute([]string{"init"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "managed hooks skipped") {
+		t.Fatalf("init skip output missing hook opt-out:\n%s", got)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".claude", "settings.json")); !os.IsNotExist(err) {
+		t.Fatalf("managed hooks were written despite AGBOX_SKIP_CONNECT=1: %v", err)
 	}
 }
 
@@ -129,6 +170,7 @@ func TestReviewHelpDoesNotOpenStore(t *testing.T) {
 	for _, want := range []string{
 		"agbox review",
 		"--state state",
+		"proposal_ready",
 		"--min-repeats n",
 		"--limit n",
 		"interactive review UI",
@@ -139,6 +181,26 @@ func TestReviewHelpDoesNotOpenStore(t *testing.T) {
 	}
 	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
 		t.Fatalf("review help opened store: %v", err)
+	}
+}
+
+func TestReviewProposalStateIsValidBeforeTerminalCheck(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "agbox.db")
+	t.Setenv("AGBOX_DB", dbPath)
+
+	err := Execute([]string{"review", "--state", "proposal_ready"}, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("review succeeded with non-interactive stdio")
+	}
+	if strings.Contains(err.Error(), "--state must be") {
+		t.Fatalf("proposal_ready rejected as invalid state: %v", err)
+	}
+	if !strings.Contains(err.Error(), "requires an interactive terminal") {
+		t.Fatalf("review error = %q, want terminal error", err.Error())
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("review noninteractive opened store: %v", err)
 	}
 }
 
@@ -157,6 +219,50 @@ func TestReviewNonInteractiveReturnsTerminalError(t *testing.T) {
 	}
 	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
 		t.Fatalf("review noninteractive opened store: %v", err)
+	}
+}
+
+func TestStatusFreshHomeShowsZeroCounts(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+
+	var out bytes.Buffer
+	if err := Execute([]string{"status"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"watcher: stopped",
+		"last sync: never",
+		"corrections: 0",
+		"candidates: 0",
+		"managed hooks:",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("status output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestDoctorFreshHomeShowsRepairGuidance(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+
+	var out bytes.Buffer
+	if err := Execute([]string{"doctor"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"watcher: not installed",
+		"hook claude:",
+		"next: agbox init",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("doctor output missing %q:\n%s", want, got)
+		}
 	}
 }
 
@@ -186,6 +292,75 @@ func TestHookProposeRequiresAgent(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "usage: agbox hook propose") {
 		t.Fatalf("hook error = %q", err.Error())
+	}
+}
+
+func TestBetaEmptyStoreShowsSetupAndDemo(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+
+	var out bytes.Buffer
+	if err := Execute([]string{"beta"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"agbox beta",
+		"watcher:",
+		"managed hooks:",
+		"No repeated corrections yet.",
+		"agbox demo",
+		"agbox doctor",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("beta empty output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestBetaShowsCandidateCausalEvidenceAndNextAction(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+	seedBetaCorrectionCandidate(t, filepath.Join(root, "agbox.db"))
+
+	var out bytes.Buffer
+	if err := Execute([]string{"beta"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"Workflow candidates",
+		"package-manager-workflow",
+		"state=proposal_ready",
+		"repeats=2",
+		"example: ran `npm install` -> Use bun, not npm.",
+		"agbox evidence cand_",
+		"ready to propose inside your agent",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("beta candidate output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestBetaLimitZeroDoesNotClaimNoCorrections(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+	seedBetaCorrectionCandidate(t, filepath.Join(root, "agbox.db"))
+
+	var out bytes.Buffer
+	if err := Execute([]string{"beta", "--limit", "0"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "Candidate display disabled by --limit 0.") {
+		t.Fatalf("beta limit 0 output missing setup-only copy:\n%s", got)
+	}
+	if strings.Contains(got, "No repeated corrections yet.") {
+		t.Fatalf("beta limit 0 falsely claimed no corrections:\n%s", got)
 	}
 }
 
@@ -229,6 +404,8 @@ func TestDiscoverEmptyShowsHookSetupNextStep(t *testing.T) {
 	got := out.String()
 	for _, want := range []string{
 		"No workflow candidates yet.",
+		"Claude, Codex, Cursor, or Grok",
+		"agbox beta",
 		"agbox status",
 		"agbox review",
 		"agbox demo",
@@ -255,6 +432,7 @@ func TestDemoShowsPreviewWithoutPersistentStore(t *testing.T) {
 		"use bun, not npm",
 		"evidence:",
 		"No files were changed",
+		"agbox beta",
 		"agbox review",
 		"agbox status",
 	} {
@@ -264,5 +442,68 @@ func TestDemoShowsPreviewWithoutPersistentStore(t *testing.T) {
 	}
 	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
 		t.Fatalf("demo touched persistent AGBOX_DB: %v", err)
+	}
+}
+
+func seedBetaCorrectionCandidate(t *testing.T, dbPath string) {
+	t.Helper()
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now()
+	sess := model.Session{
+		ID:         "sess_beta",
+		Agent:      "claude",
+		Project:    "repo",
+		SourcePath: filepath.Join(filepath.Dir(dbPath), "session.jsonl"),
+		SourceHash: "hash",
+		StartedAt:  now,
+		UpdatedAt:  now,
+	}
+	if err := s.UpsertSession(sess); err != nil {
+		t.Fatal(err)
+	}
+	agentTurn := model.Turn{ID: "turn_agent", SessionID: sess.ID, TurnIndex: 1, Role: "agent", EventType: "tool", CreatedAt: now}
+	userTurn := model.Turn{ID: "turn_user", SessionID: sess.ID, TurnIndex: 2, Role: "user", EventType: "message", CreatedAt: now}
+	if err := s.InsertTurns([]model.Turn{agentTurn, userTurn}); err != nil {
+		t.Fatal(err)
+	}
+	action := model.Action{ID: "act_beta", TurnID: agentTurn.ID, ToolName: "shell", Command: "npm install", Excerpt: "npm install"}
+	if err := s.InsertActions([]model.Action{action}); err != nil {
+		t.Fatal(err)
+	}
+	normalized := privacy.NormalizeSignal("Use bun, not npm.")
+	for i := 0; i < 2; i++ {
+		correction := model.Correction{
+			ID:         "cor_beta_" + string(rune('a'+i)),
+			SessionID:  sess.ID,
+			TurnID:     userTurn.ID,
+			ActionID:   action.ID,
+			Hash:       privacy.HashSignal(normalized),
+			Normalized: normalized,
+			Excerpt:    "Use bun, not npm.",
+			Agent:      "claude",
+			Project:    "repo",
+			CreatedAt:  now.Add(time.Duration(i) * time.Minute),
+		}
+		if err := s.InsertCorrection(correction); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := scan.Run(s, 2); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := s.ListCandidates("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidates = %d, want 1", len(candidates))
+	}
+	if err := s.UpdateCandidateMeta(candidates[0].ID, store.CandidateMetaUpdate{State: model.CandidateProposalReady}); err != nil {
+		t.Fatal(err)
 	}
 }
