@@ -15,6 +15,7 @@
     "bin/",
     "dist/",
     "scripts/",
+    "telemetry.env",
     "README.md"
   ],
   "os": [
