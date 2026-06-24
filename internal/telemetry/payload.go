@@ -6,11 +6,13 @@ import (
 )
 
 const (
+	AppName               = "agbox"
 	EventInstallCompleted = "agbox_install_completed"
 	EventDailyActive      = "agbox_daily_active"
 )
 
 type InstallCompletedProps struct {
+	App          string `json:"app"`
 	AgboxVersion string `json:"agbox_version"`
 	OSFamily     string `json:"os_family"`
 	Arch         string `json:"arch"`
@@ -18,6 +20,7 @@ type InstallCompletedProps struct {
 }
 
 type DailyActiveProps struct {
+	App          string `json:"app"`
 	AgboxVersion string `json:"agbox_version"`
 	OSFamily     string `json:"os_family"`
 	Arch         string `json:"arch"`
@@ -32,6 +35,7 @@ func baseProps(anonymousID string) (string, string, string) {
 func installCompletedProps(anonymousID string) InstallCompletedProps {
 	version, osFamily, arch := baseProps(anonymousID)
 	return InstallCompletedProps{
+		App:          AppName,
 		AgboxVersion: version,
 		OSFamily:     osFamily,
 		Arch:         arch,
@@ -42,6 +46,7 @@ func installCompletedProps(anonymousID string) InstallCompletedProps {
 func dailyActiveProps(anonymousID string, streakDays int) DailyActiveProps {
 	version, osFamily, arch := baseProps(anonymousID)
 	return DailyActiveProps{
+		App:          AppName,
 		AgboxVersion: version,
 		OSFamily:     osFamily,
 		Arch:         arch,

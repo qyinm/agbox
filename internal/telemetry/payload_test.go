@@ -53,9 +53,16 @@ func TestVersionDefaultNonEmpty(t *testing.T) {
 	}
 }
 
+func TestInstallCompletedPayloadApp(t *testing.T) {
+	props := installCompletedProps("test-id")
+	if props.App != AppName {
+		t.Fatalf("App = %q, want %q", props.App, AppName)
+	}
+}
+
 func TestInstallCompletedPayloadKeys(t *testing.T) {
 	got := keys(installCompletedProps("test-id"))
-	want := []string{"agbox_version", "anonymous_id", "arch", "os_family"}
+	want := []string{"agbox_version", "anonymous_id", "app", "arch", "os_family"}
 	if len(got) != len(want) {
 		t.Fatalf("keys = %v, want %v", got, want)
 	}
@@ -68,7 +75,7 @@ func TestInstallCompletedPayloadKeys(t *testing.T) {
 
 func TestDailyActivePayloadKeys(t *testing.T) {
 	got := keys(dailyActiveProps("test-id", 7))
-	want := []string{"agbox_version", "anonymous_id", "arch", "os_family", "streak_days"}
+	want := []string{"agbox_version", "anonymous_id", "app", "arch", "os_family", "streak_days"}
 	if len(got) != len(want) {
 		t.Fatalf("keys = %v, want %v", got, want)
 	}

@@ -22,6 +22,7 @@
 
 | Property | `agbox_install_completed` | `agbox_daily_active` | Notes |
 |----------|:-------------------------:|:--------------------:|-------|
+| `app` | ✓ | ✓ | Product identifier (`agbox`); filter per app in a shared PostHog project |
 | `agbox_version` | ✓ | ✓ | Build version string |
 | `os_family` | ✓ | ✓ | e.g. `darwin`, `linux`, `windows` |
 | `arch` | ✓ | ✓ | e.g. `amd64`, `arm64` |
@@ -56,7 +57,7 @@ Resolution order: existing process env wins; `~/.agbox/.env` fills in only keys 
 
 ## Insights to create
 
-Create a PostHog dashboard (e.g. **agbox — opted-in usage**) with the following insights.
+Create a PostHog dashboard (e.g. **agbox — usage**) with the following insights. When multiple apps share one PostHog project, add filter **`app = agbox`** on every insight.
 
 ### 1. Total opted-in users (all time)
 

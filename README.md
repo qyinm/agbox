@@ -227,7 +227,7 @@ agbox touches your prompts and your config files. That trust is the product, so:
   - `agbox_install_completed` once (install/version signal)
   - `agbox_daily_active` at most once per UTC day (includes `streak_days`)
   
-  Events go to PostHog (maintainer analytics). Your distinct ID is a random UUID — not your hostname, username, or machine fingerprint. Payloads include `agbox_version`, `os_family`, and `arch` only.
+  Events go to PostHog (maintainer analytics). Your distinct ID is a random UUID — not your hostname, username, or machine fingerprint. Payloads include `app` (`agbox`), `agbox_version`, `os_family`, and `arch` only.
 
   **Turn off telemetry:**
 
