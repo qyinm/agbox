@@ -236,9 +236,10 @@ func (m ReviewModel) Render() string {
 		fmt.Fprintf(&b, "%s  %s  %s  %s\n",
 			kv("id", c.ID),
 			kv("state", string(c.State)),
+			kv("source", string(c.SourceKind)),
 			kv("confidence", c.Confidence),
-			kv("repeats", fmt.Sprintf("%d", c.EventCount)),
 		)
+		fmt.Fprintf(&b, "%s\n", kv("repeats", fmt.Sprintf("%d", c.EventCount)))
 		fmt.Fprintf(&b, "%s  %s\n", kv("projects", join(card.Projects)), kv("sources", join(card.Sources)))
 		fmt.Fprintf(&b, "\n%s\n%s\n", labelStyle.Render("Reason"), bodyStyle.Render(card.Reason))
 		fmt.Fprintf(&b, "\n%s\n%s\n", labelStyle.Render("Rule"), bodyStyle.Render(c.RuleText))

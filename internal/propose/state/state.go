@@ -49,6 +49,15 @@ func MergeOnScan(existing, incoming model.Candidate) MergeResult {
 }
 
 func MeetsThreshold(c model.Candidate) bool {
+	if c.SourceKind == model.CandidateSourcePromptPattern {
+		if c.EventCount >= 5 {
+			return true
+		}
+		if c.EventCount >= 3 && (c.Confidence == "medium" || c.Confidence == "high") {
+			return true
+		}
+		return c.EventCount >= 2 && c.ProjectCount > 1 && c.SemanticKey != ""
+	}
 	if c.EventCount >= 5 {
 		return true
 	}

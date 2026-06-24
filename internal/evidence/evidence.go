@@ -20,7 +20,10 @@ func Build(s *store.Store, candidateID string) (model.EvidenceCard, error) {
 	if err != nil {
 		return model.EvidenceCard{}, err
 	}
-	if len(corrections) > 0 {
+	if c.SourceKind == model.CandidateSourceCorrection && len(corrections) > 0 {
+		return buildFromCorrections(s, c, corrections)
+	}
+	if c.SourceKind == "" && len(corrections) > 0 {
 		return buildFromCorrections(s, c, corrections)
 	}
 	return buildFromEvents(s, c, candidateID)
@@ -172,6 +175,15 @@ func buildFromEvents(s *store.Store, c model.Candidate, candidateID string) (mod
 }
 
 func reason(c model.Candidate) string {
+	if c.SourceKind == model.CandidateSourcePromptPattern {
+		if c.ProjectCount > 1 {
+			return "Repeated prompt pattern across multiple projects; likely a durable workflow request."
+		}
+		if c.EventCount >= 5 {
+			return "Repeated prompt pattern in this project; likely worth turning into reusable guidance."
+		}
+		return "Repeated prompt pattern; review before promoting."
+	}
 	if c.ProjectCount > 1 {
 		return "Repeated across multiple projects; likely a durable workflow preference."
 	}
