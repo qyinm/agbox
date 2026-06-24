@@ -35,8 +35,27 @@ jobs:
 
       - name: Build macOS arm64 binary
         run: |
-          GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o npm/cli/dist/agbox-darwin-arm64 ./cmd/agbox
+          VERSION="${GITHUB_REF#refs/tags/}"
+          if [[ "$VERSION" == "$GITHUB_REF" ]]; then
+            VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+          fi
+          VERSION="${VERSION#v}"
+          GOOS=darwin GOARCH=arm64 go build -trimpath \
+            -ldflags "-s -w -X github.com/hippoom/agbox/internal/telemetry.Version=${VERSION}" \
+            -o npm/cli/dist/agbox-darwin-arm64 ./cmd/agbox
           chmod +x npm/cli/bin/agbox npm/cli/dist/agbox-darwin-arm64
+          strings npm/cli/dist/agbox-darwin-arm64 | grep -q "${VERSION}"
+
+      - name: Bundle telemetry env
+        env:
+          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+        run: |
+          if [[ -n "${POSTHOG_API_KEY}" ]]; then
+            umask 077
+            printf 'POSTHOG_API_KEY=%s\nPOSTHOG_HOST=https://us.i.posthog.com\n' "${POSTHOG_API_KEY}" > npm/cli/telemetry.env
+          else
+            echo "POSTHOG_API_KEY secret not set; npm publish will ship without bundled telemetry credentials"
+          fi
 
       - name: Verify npm package
         working-directory: npm/cli
