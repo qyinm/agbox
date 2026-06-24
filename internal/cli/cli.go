@@ -26,10 +26,21 @@ import (
 	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/session/claude"
 	"github.com/hippoom/agbox/internal/store"
+	"github.com/hippoom/agbox/internal/telemetry"
 	"github.com/hippoom/agbox/internal/tui"
 )
 
+var maybeRecordDailyActiveHook = telemetry.MaybeRecordDailyActive
+
 func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	err := runCommand(args, stdin, stdout, stderr)
+	if err == nil && shouldRecordDailyActive(args) {
+		maybeRecordDailyActiveHook()
+	}
+	return err
+}
+
+func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		printUsage(stdout)
 		return nil
@@ -112,9 +123,46 @@ func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return withStore(func(s *store.Store) error { return runDebugBundle(s, args[1:], stdout) })
 	case "repair":
 		return withStore(func(s *store.Store) error { return runRepair(s, stdout) })
+	case "telemetry":
+		return runTelemetry(args[1:], stdin, stdout)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func shouldRecordDailyActive(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "telemetry", "help", "init", "-h", "--help":
+		return false
+	}
+	if isVersionOnly(args) {
+		return false
+	}
+	if hasHelpFlag(args[1:]) {
+		return false
+	}
+	return true
+}
+
+func isVersionOnly(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		switch arg {
+		case "-v", "--version", "version":
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func PrintError(w io.Writer, err error) {
@@ -723,6 +771,7 @@ Usage:
   agbox status
   agbox sources
   agbox sync --once
+  agbox telemetry on|off|status
 
 Run agbox <command> --help for command-specific help.`)
 }
@@ -908,4 +957,13 @@ Options:
   agbox repair
 
 Repair exported files from agbox manifest state.`,
+	"telemetry": `Usage:
+  agbox telemetry on|off|status
+
+Manage anonymous usage telemetry (on by default).
+
+Subcommands:
+  status           Show whether telemetry is enabled
+  on               Opt in after disclosure and terminal confirmation
+  off              Disable telemetry immediately`,
 }
