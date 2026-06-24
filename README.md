@@ -24,10 +24,11 @@
   </p>
 
   <p>
-    <img src="https://img.shields.io/badge/Claude%20Code-compatible-6366F1?style=for-the-badge&logo=anthropic&logoColor=white" alt="Claude Code" />
-    <img src="https://img.shields.io/badge/Codex-compatible-10B981?style=for-the-badge&logo=openai&logoColor=white" alt="Codex" />
-    <img src="https://img.shields.io/badge/Cursor-compatible-111111?style=for-the-badge" alt="Cursor" />
-    <img src="https://img.shields.io/badge/Cline-compatible-2563EB?style=for-the-badge" alt="Cline" />
+    <img src="https://img.shields.io/badge/Claude%20Code-ingest-6366F1?style=for-the-badge&logo=anthropic&logoColor=white" alt="Claude Code ingest" />
+    <img src="https://img.shields.io/badge/Codex-ingest-10B981?style=for-the-badge&logo=openai&logoColor=white" alt="Codex ingest" />
+    <img src="https://img.shields.io/badge/Cursor-ingest-111111?style=for-the-badge" alt="Cursor ingest" />
+    <img src="https://img.shields.io/badge/Grok-ingest-000000?style=for-the-badge" alt="Grok ingest" />
+    <img src="https://img.shields.io/badge/Cline-export-2563EB?style=for-the-badge" alt="Cline export" />
   </p>
 
   <p><em>Correct your agent once. agbox makes sure you never have to again.</em></p>
@@ -41,6 +42,11 @@
 You've typed `use bun, not npm` to your agent all week.
 
 agbox noticed.
+
+```bash
+npm install -g @agboxhq/cli   # macOS Apple Silicon (arm64) only today
+agbox beta                    # setup health + best candidates (or: agbox inbox)
+```
 
 ```console
 $ agbox inbox
@@ -62,7 +68,7 @@ agents already read — so the correction sticks, across every agent.
 $ agbox approve use-bun-not-npm --name package-manager
 ✓ promoted → approved
 
-$ agbox export package-manager --target claude
+$ agbox export use-bun-not-npm --target claude
 ✓ wrote CLAUDE.md  (wrapped in an agbox:start/end block, backup saved)
   undo anytime:  agbox export rollback <export-id>
 ```
@@ -73,8 +79,10 @@ That's the whole product: **stop repeating yourself to your AI.**
 
 ## 🚀 Quick start
 
+> **Platform:** `@agboxhq/cli` on npm is **macOS Apple Silicon (arm64) only** today.
+> Intel Mac, Linux, and Homebrew are on the roadmap. Other platforms: clone and `go install` from source.
+
 ```bash
-# Install (macOS arm64 today; Homebrew + Linux on the roadmap)
 npm install -g @agboxhq/cli
 agbox beta
 ```
@@ -196,7 +204,7 @@ rules). agbox never silently installs a detected workflow.
 | 👀 **Beta summary + Review TUI** | `agbox beta` gives a terminal-safe summary; `agbox review` drills into evidence, approval, and export. |
 | 📤 **Vendor-neutral export** | One skill → `CLAUDE.md`, `AGENTS.md`, Cursor, Cline. Promote once, every agent obeys. |
 | ↩️ **Always reversible** | Every export is backed up and wrapped in markers. `agbox export rollback` undoes it cleanly. |
-| 🔒 **Local-first & private** | Everything lives in `~/.agbox/`. Redacted excerpts + hashes by default — raw prompts never leave your machine. |
+| 🔒 **Local-first & private** | Sessions and workflow data stay in `~/.agbox/`. Redacted excerpts + hashes by default — raw prompts stay local. Anonymous usage counters only (opt-out: `agbox telemetry off`). |
 | 📊 **Impact tracking** | `agbox impact` shows repeat-correction counts before vs after. Proof, not vibes. |
 | 🧾 **Audit & doctor** | `agbox audit` produces a shareable report; `agbox doctor` checks your setup. |
 
@@ -209,10 +217,10 @@ exports to the formats they already read.
 
 | Ingest from | Export to |
 |---|---|
-| Claude Code · Codex · Cursor | `CLAUDE.md` |
-| | `AGENTS.md` *(read by most modern agents, including OpenClaw)* |
+| Claude Code · Codex · Cursor · Grok | `CLAUDE.md` |
+| Managed proposal hooks: Claude · Codex · Grok | `AGENTS.md` *(read by most modern agents, including OpenClaw)* |
 | | `.cursor/rules/*.mdc` *(Cursor)* |
-| | `.clinerules/*.md` *(Cline)* |
+| | `.clinerules/*.md` *(Cline — export only)* |
 
 One correction, promoted once, lands everywhere your agents look.
 
@@ -284,16 +292,21 @@ agbox review                        interactive TUI review (primary interface)
 agbox evidence <id>                 explain why a candidate exists
 agbox approve <id> [--name …]       move a candidate to approved
 agbox reject  <id>                  reject a candidate
+agbox snooze  <id>                  snooze a promotion candidate (24h)
+agbox accept  <id> [--skill-path …] mark accepted after SKILL.md creation
 agbox compile <id> [--target …]     render an approved skill (no write)
-agbox export  [id…] [--target …]    dry-run or apply an export plan
+agbox export  <id>… [--target …]    dry-run or apply an export plan (by candidate id)
 agbox export rollback <export-id>   restore the file backup for an export
-agbox connect <agent>               install managed proposal hooks
+agbox connect <agent>               install managed proposal hooks (claude|codex|grok)
 agbox disconnect <agent>            remove managed proposal hooks
+agbox hook propose|acknowledge …    hook entrypoints (used by agent hook configs)
 
 agbox impact <id>                   repeat counts before vs after export
 agbox audit  [--profile …]          generate a workflow audit pack
 agbox manifest verify               verify .agbox/skill-pack.json hashes
 agbox doctor                        local health check
+agbox repair                        repair exported files from manifest state
+agbox debug-bundle [--out …]        write a local debug bundle for troubleshooting
 
 agbox telemetry off                 disable anonymous usage stats (default: on)
 agbox telemetry on                  re-enable after opt-out
