@@ -20,7 +20,7 @@ type Store struct {
 	path string
 }
 
-const candidateSelectCols = `id, fingerprint, name, description, rule_text, semantic_key, state, event_count, project_count, source_count, first_seen, last_seen, confidence, version, updated_at, proposed_at, snoozed_until, skill_path`
+const candidateSelectCols = `id, fingerprint, name, description, rule_text, semantic_key, source_kind, state, event_count, project_count, source_count, first_seen, last_seen, confidence, version, updated_at, proposed_at, snoozed_until, skill_path`
 
 func DefaultPath() (string, error) {
 	if p := os.Getenv("AGBOX_DB"); p != "" {
@@ -139,7 +139,10 @@ func (s *Store) migrate() error {
 	if err := migrateV3(s.db); err != nil {
 		return err
 	}
-	return migrateV4(s.db)
+	if err := migrateV4(s.db); err != nil {
+		return err
+	}
+	return migrateV5(s.db)
 }
 
 func (s *Store) TableExists(name string) bool {
@@ -218,9 +221,27 @@ func (s *Store) UpsertCandidate(c model.Candidate, eventIDs, correctionIDs []str
 	} else if !errors.Is(scanErr, sql.ErrNoRows) {
 		return scanErr
 	}
+	if !hasExisting {
+		linked, found, linkErr := candidateLinkedToScanInputs(tx, eventIDs, correctionIDs)
+		if linkErr != nil {
+			return linkErr
+		}
+		if found {
+			existing = linked
+			hasExisting = true
+			c.Fingerprint = existing.Fingerprint
+		}
+	}
 
 	now := time.Now()
 	c.UpdatedAt = now
+	if c.SourceKind == "" {
+		if len(correctionIDs) > 0 {
+			c.SourceKind = model.CandidateSourceCorrection
+		} else {
+			c.SourceKind = model.CandidateSourcePromptPattern
+		}
+	}
 	if hasExisting {
 		merged := proposestate.MergeOnScan(existing, c)
 		c.State = merged.State
@@ -236,13 +257,14 @@ func (s *Store) UpsertCandidate(c model.Candidate, eventIDs, correctionIDs []str
 	}
 
 	_, err = tx.Exec(`INSERT INTO candidates
-		(id, fingerprint, name, description, rule_text, semantic_key, state, event_count, project_count, source_count, first_seen, last_seen, confidence, version, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, fingerprint, name, description, rule_text, semantic_key, source_kind, state, event_count, project_count, source_count, first_seen, last_seen, confidence, version, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(fingerprint) DO UPDATE SET
 			name=excluded.name,
 			description=excluded.description,
 			rule_text=excluded.rule_text,
 			semantic_key=excluded.semantic_key,
+			source_kind=excluded.source_kind,
 			event_count=excluded.event_count,
 			project_count=excluded.project_count,
 			source_count=excluded.source_count,
@@ -251,7 +273,7 @@ func (s *Store) UpsertCandidate(c model.Candidate, eventIDs, correctionIDs []str
 			confidence=excluded.confidence,
 			version=excluded.version,
 			updated_at=excluded.updated_at`,
-		c.ID, c.Fingerprint, c.Name, c.Description, c.RuleText, c.SemanticKey, c.State, c.EventCount, c.ProjectCount, c.SourceCount,
+		c.ID, c.Fingerprint, c.Name, c.Description, c.RuleText, c.SemanticKey, c.SourceKind, c.State, c.EventCount, c.ProjectCount, c.SourceCount,
 		formatTime(c.FirstSeen), formatTime(c.LastSeen), c.Confidence, c.Version, formatTime(c.UpdatedAt))
 	if err != nil {
 		return err
@@ -267,6 +289,42 @@ func (s *Store) UpsertCandidate(c model.Candidate, eventIDs, correctionIDs []str
 		}
 	}
 	return tx.Commit()
+}
+
+func candidateLinkedToScanInputs(tx *sql.Tx, eventIDs, correctionIDs []string) (model.Candidate, bool, error) {
+	if len(correctionIDs) > 0 {
+		c, found, err := candidateLinkedByIDs(tx, "candidate_corrections", "correction_id", correctionIDs)
+		if err != nil || found {
+			return c, found, err
+		}
+	}
+	if len(eventIDs) > 0 {
+		return candidateLinkedByIDs(tx, "candidate_events", "event_id", eventIDs)
+	}
+	return model.Candidate{}, false, nil
+}
+
+func candidateLinkedByIDs(tx *sql.Tx, table, idColumn string, ids []string) (model.Candidate, bool, error) {
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	query := `SELECT ` + candidateSelectCols + `
+		FROM candidates c
+		JOIN ` + table + ` link ON link.candidate_id = c.id
+		WHERE link.` + idColumn + ` IN (` + strings.Join(placeholders, ",") + `)
+		ORDER BY c.updated_at DESC
+		LIMIT 1`
+	c, err := scanCandidate(tx.QueryRow(query, args...))
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.Candidate{}, false, nil
+	}
+	if err != nil {
+		return model.Candidate{}, false, err
+	}
+	return c, true, nil
 }
 
 func (s *Store) ListCandidates(state string) ([]model.Candidate, error) {
@@ -444,8 +502,12 @@ func (s *Store) Stats() (model.StoreStats, error) {
 func scanCandidate(scanner interface{ Scan(dest ...any) error }) (model.Candidate, error) {
 	var c model.Candidate
 	var first, last, updated, proposed, snoozed, skillPath string
-	var state string
-	err := scanner.Scan(&c.ID, &c.Fingerprint, &c.Name, &c.Description, &c.RuleText, &c.SemanticKey, &state, &c.EventCount, &c.ProjectCount, &c.SourceCount, &first, &last, &c.Confidence, &c.Version, &updated, &proposed, &snoozed, &skillPath)
+	var sourceKind, state string
+	err := scanner.Scan(&c.ID, &c.Fingerprint, &c.Name, &c.Description, &c.RuleText, &c.SemanticKey, &sourceKind, &state, &c.EventCount, &c.ProjectCount, &c.SourceCount, &first, &last, &c.Confidence, &c.Version, &updated, &proposed, &snoozed, &skillPath)
+	c.SourceKind = model.CandidateSourceKind(sourceKind)
+	if c.SourceKind == "" {
+		c.SourceKind = model.CandidateSourcePromptPattern
+	}
 	c.State = model.CandidateState(state)
 	c.FirstSeen = parseTime(first)
 	c.LastSeen = parseTime(last)
