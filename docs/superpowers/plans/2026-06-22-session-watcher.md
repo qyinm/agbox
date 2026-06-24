@@ -31,7 +31,7 @@
 | `internal/session/ingest.go` | Orchestrates adapter parse + store write |
 | `internal/store/migrate_v2.go` | v2 schema tables |
 | `internal/store/corrections.go` | CRUD for sessions/turns/actions/corrections/cursors |
-| `internal/scan/scan.go` | Cluster corrections (not flat events) |
+| `internal/scan/scan.go` | Cluster corrections and recurring prompt events |
 | `internal/evidence/evidence.go` | Build Occurrence causal chains |
 | `internal/watcher/watcher.go` | fswatch loop + polling fallback |
 | `internal/watcher/install.go` | LaunchAgent plist install/start/stop |
@@ -426,7 +426,7 @@ Seed DB with 3 corrections same normalized text + same action fingerprint. Run `
 
 - [ ] **Step 2: Update scan to read `corrections` table**
 
-Fingerprint: `sha256(normalized + "|" + actionFingerprint(action))`. Link via `candidate_corrections` table. Fall back to legacy `events` if no corrections exist (keeps demo working).
+Fingerprint correction candidates with a source-kind namespace plus `normalized + "|" + actionFingerprint(action)`. Link via `candidate_corrections` table. Scan eligible `events` in the same run for recurring prompt patterns instead of falling back only when corrections are absent.
 
 - [ ] **Step 3: Run all tests**
 
@@ -726,7 +726,7 @@ Task 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 
 
 - Cursor adapter may parse zero corrections until format is confirmed — doctor shows `pending`.
 - `agbox sync --once` — add in Task 9 alongside `status`/`sources` (thin wrapper over `IngestAll`).
-- Legacy `events` table kept for demo backward compat until Task 15 updates demo seed.
+- `events` table remains part of the learning model for manual capture and recurring prompt-pattern candidates.
 
 ---
 
