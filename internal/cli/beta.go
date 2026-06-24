@@ -33,7 +33,12 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 		return fmt.Errorf("--limit must be 0 or greater")
 	}
 
-	ingested, syncErr := pipeline.SyncAll(s)
+	syncResult, syncFatalErr := pipeline.SyncBestEffort(s)
+	if syncFatalErr != nil {
+		return syncFatalErr
+	}
+	ingested := syncResult.Ingested
+	syncErr := syncResult.Warning
 	stats, statsErr := s.Stats()
 	if statsErr != nil {
 		return statsErr
@@ -61,6 +66,12 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 		fmt.Fprintf(stdout, "  sync: partial (%s)\n", betaSyncIssue(syncErr))
 	} else {
 		fmt.Fprintf(stdout, "  sync: ok (%d new corrections)\n", ingested)
+	}
+	if *limit == 0 {
+		fmt.Fprintln(stdout)
+		fmt.Fprintln(stdout, "Candidate display disabled by --limit 0.")
+		fmt.Fprintln(stdout, "Run agbox beta --limit 5 to show candidates.")
+		return nil
 	}
 
 	candidates, err := betaCandidates(s, *limit)

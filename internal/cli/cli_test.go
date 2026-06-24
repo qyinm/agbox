@@ -50,11 +50,15 @@ func TestExecuteEndToEndPromotionLoop(t *testing.T) {
 		t.Fatalf("dry-run output = %s", out.String())
 	}
 	out.Reset()
-	if err := Execute([]string{"export", candidateID}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+	var stderr bytes.Buffer
+	if err := Execute([]string{"export", candidateID}, strings.NewReader(""), &out, &stderr); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "undo: agbox export rollback exp_") {
-		t.Fatalf("export output missing rollback command:\n%s", out.String())
+	if strings.Contains(out.String(), "undo: agbox export rollback exp_") {
+		t.Fatalf("export stdout included rollback command:\n%s", out.String())
+	}
+	if !strings.Contains(stderr.String(), "undo: agbox export rollback exp_") {
+		t.Fatalf("export stderr missing rollback command:\n%s", stderr.String())
 	}
 	if _, err := os.Stat(filepath.Join(root, "AGENTS.md")); err != nil {
 		t.Fatal(err)
@@ -338,6 +342,25 @@ func TestBetaShowsCandidateCausalEvidenceAndNextAction(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("beta candidate output missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestBetaLimitZeroDoesNotClaimNoCorrections(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+	seedBetaCorrectionCandidate(t, filepath.Join(root, "agbox.db"))
+
+	var out bytes.Buffer
+	if err := Execute([]string{"beta", "--limit", "0"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "Candidate display disabled by --limit 0.") {
+		t.Fatalf("beta limit 0 output missing setup-only copy:\n%s", got)
+	}
+	if strings.Contains(got, "No repeated corrections yet.") {
+		t.Fatalf("beta limit 0 falsely claimed no corrections:\n%s", got)
 	}
 }
 

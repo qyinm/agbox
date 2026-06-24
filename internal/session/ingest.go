@@ -1,6 +1,7 @@
 package session
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -8,6 +9,14 @@ import (
 )
 
 func IngestOnce(s *store.Store, agent string) (int, error) {
+	return ingestOnce(s, agent, false)
+}
+
+func IngestOnceBestEffort(s *store.Store, agent string) (int, error) {
+	return ingestOnce(s, agent, true)
+}
+
+func ingestOnce(s *store.Store, agent string, bestEffort bool) (int, error) {
 	adapter, ok := ByAgent(agent)
 	if !ok {
 		return 0, fmt.Errorf("unknown agent: %s", agent)
@@ -17,14 +26,19 @@ func IngestOnce(s *store.Store, agent string) (int, error) {
 		return 0, err
 	}
 	var total int
+	var errs []error
 	for _, src := range sources {
 		n, err := ingestSource(s, adapter, src)
 		if err != nil {
-			return total, err
+			if !bestEffort {
+				return total, err
+			}
+			errs = append(errs, fmt.Errorf("%s: %w", src.Path, err))
+			continue
 		}
 		total += n
 	}
-	return total, nil
+	return total, errors.Join(errs...)
 }
 
 func IngestAll(s *store.Store) (int, error) {
@@ -37,6 +51,21 @@ func IngestAll(s *store.Store) (int, error) {
 		total += n
 	}
 	return total, nil
+}
+
+func IngestAllBestEffort(s *store.Store) (int, error) {
+	var total int
+	var errs []error
+	for _, adapter := range All() {
+		n, err := IngestOnceBestEffort(s, adapter.Agent())
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", adapter.Agent(), err))
+			total += n
+			continue
+		}
+		total += n
+	}
+	return total, errors.Join(errs...)
 }
 
 func IngestSource(s *store.Store, adapter Adapter, src Source) error {

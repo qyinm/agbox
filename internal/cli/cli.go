@@ -99,7 +99,7 @@ func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	case "compile":
 		return withStore(func(s *store.Store) error { return runCompile(s, args[1:], stdout) })
 	case "export":
-		return withStore(func(s *store.Store) error { return runExport(s, args[1:], stdout) })
+		return withStore(func(s *store.Store) error { return runExport(s, args[1:], stdout, stderr) })
 	case "manifest":
 		return withStore(func(s *store.Store) error { return runManifest(args[1:], stdout) })
 	case "impact":
@@ -476,7 +476,7 @@ func runCompile(s *store.Store, args []string, stdout io.Writer) error {
 	return nil
 }
 
-func runExport(s *store.Store, args []string, stdout io.Writer) error {
+func runExport(s *store.Store, args []string, stdout, stderr io.Writer) error {
 	if len(args) > 0 && args[0] == "rollback" {
 		if len(args) < 2 {
 			return errors.New("usage: agbox export rollback <export-id>")
@@ -527,7 +527,7 @@ func runExport(s *store.Store, args []string, stdout io.Writer) error {
 			return err
 		}
 		fmt.Fprintf(stdout, "exported %s candidate=%s target=%s path=%s\n", rec.ID, c.ID, rec.Target, rec.Path)
-		fmt.Fprintf(stdout, "undo: agbox export rollback %s\n", rec.ID)
+		fmt.Fprintf(stderr, "undo: agbox export rollback %s\n", rec.ID)
 	}
 	return nil
 }

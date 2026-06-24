@@ -3,6 +3,7 @@ package propose
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ type postToolInput struct {
 		Path     string `json:"path"`
 	} `json:"tool_input"`
 	ToolName string `json:"tool_name"`
+	CWD      string `json:"cwd"`
 }
 
 var (
@@ -26,7 +28,7 @@ var (
 )
 
 func Acknowledge(s *store.Store, agent string, hookData []byte) error {
-	path := extractSkillPath(hookData)
+	path := resolveSkillPath(hookData)
 	if path == "" || !MatchesSkillPath(agent, path) {
 		return nil
 	}
@@ -75,6 +77,27 @@ func extractSkillPath(data []byte) string {
 		return p
 	}
 	return strings.TrimSpace(in.ToolInput.Path)
+}
+
+func resolveSkillPath(data []byte) string {
+	var in postToolInput
+	if err := json.Unmarshal(data, &in); err != nil {
+		return ""
+	}
+	path := strings.TrimSpace(in.ToolInput.FilePath)
+	if path == "" {
+		path = strings.TrimSpace(in.ToolInput.Path)
+	}
+	if path == "" {
+		return ""
+	}
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path)
+	}
+	if cwd := strings.TrimSpace(in.CWD); cwd != "" {
+		return filepath.Clean(filepath.Join(cwd, path))
+	}
+	return filepath.Clean(path)
 }
 
 func Accept(s *store.Store, candidateID, skillPath string) error {

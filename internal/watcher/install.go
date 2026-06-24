@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -92,12 +93,14 @@ func Status(home string) WatcherStatus {
 	if info, err := os.Stat(status.PlistPath); err == nil && !info.IsDir() {
 		status.Installed = true
 	}
-	if running, err := IsRunning(); err == nil {
-		status.Running = running
-	}
-	if status.Running {
-		if pid, err := launchdPID(); err == nil {
-			status.PID = pid
+	if shouldManageLaunchd(home) {
+		if running, err := IsRunning(); err == nil {
+			status.Running = running
+		}
+		if status.Running {
+			if pid, err := launchdPID(); err == nil {
+				status.PID = pid
+			}
 		}
 	}
 	return status
@@ -107,11 +110,22 @@ func shouldManageLaunchd(home string) bool {
 	if runtime.GOOS != "darwin" {
 		return false
 	}
-	real, err := os.UserHomeDir()
-	if err != nil {
+	real := loginHomeDir()
+	if real == "" {
 		return false
 	}
 	return filepath.Clean(home) == filepath.Clean(real)
+}
+
+func loginHomeDir() string {
+	if current, err := user.Current(); err == nil && current.HomeDir != "" {
+		return current.HomeDir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return home
 }
 
 func renderPlist(agboxBin, logPath string) string {

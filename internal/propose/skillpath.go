@@ -15,14 +15,18 @@ func MatchesSkillPath(agent, path string) bool {
 	home, _ := os.UserHomeDir()
 	switch agent {
 	case "claude":
-		return strings.Contains(slash, "/.claude/skills/")
+		return hasSkillPathSegment(slash, ".claude/skills")
 	case "codex":
-		return strings.Contains(slash, "/.agents/skills/") ||
+		return hasSkillPathSegment(slash, ".agents/skills") ||
 			strings.HasPrefix(path, filepath.Join(home, ".codex", "skills"))
 	case "grok":
-		return strings.Contains(slash, "/.grok/skills/") ||
+		return hasSkillPathSegment(slash, ".grok/skills") ||
 			strings.HasPrefix(path, filepath.Join(home, ".grok", "skills"))
 	default:
 		return false
 	}
+}
+
+func hasSkillPathSegment(path, segment string) bool {
+	return strings.Contains(path, "/"+segment+"/") || strings.HasPrefix(path, segment+"/")
 }

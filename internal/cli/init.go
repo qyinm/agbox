@@ -47,9 +47,9 @@ func runInit(args []string, stdout io.Writer) error {
 		return err
 	}
 
-	ingested, err := pipeline.SyncAll(s)
-	if err != nil {
-		return err
+	syncResult, syncFatalErr := pipeline.SyncBestEffort(s)
+	if syncFatalErr != nil {
+		return syncFatalErr
 	}
 	connectOut := stdout
 	if *quiet {
@@ -70,7 +70,11 @@ project: .agbox/
 `, s.Path())
 	printWatcherStatus(stdout, home)
 	fmt.Fprintf(stdout, "managed hooks: %s\n", managedHookSummary())
-	fmt.Fprintf(stdout, "initial ingest: %d corrections\n\n", ingested)
+	if syncResult.Warning != nil {
+		fmt.Fprintf(stdout, "initial ingest: partial (%d corrections; run agbox doctor if candidates look wrong)\n\n", syncResult.Ingested)
+	} else {
+		fmt.Fprintf(stdout, "initial ingest: %d corrections\n\n", syncResult.Ingested)
+	}
 	fmt.Fprintln(stdout, `Next steps:
   agbox beta              # See setup + candidates in one terminal summary
   agbox doctor            # Check watcher + managed proposal hooks
