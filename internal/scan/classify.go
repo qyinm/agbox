@@ -177,6 +177,10 @@ func isGeneratedProposalText(value string) bool {
 	if value == "" {
 		return false
 	}
+	if strings.Contains(value, "generate") &&
+		(strings.Contains(value, "hyperpersonalized suggestions") || strings.Contains(value, "hyper personalized suggestions")) {
+		return true
+	}
 	markers := []string{
 		"agbox skill proposal instructions",
 		"agbox proposal",

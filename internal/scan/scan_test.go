@@ -280,6 +280,7 @@ func TestRunSkipsPromptNoise(t *testing.T) {
 		"12345",
 		"<environment_context><cwd>/tmp/repo</cwd></environment_context>",
 		"## agbox skill proposal instructions\nReply yes no or later.",
+		"Generate 0 to 3 hyperpersonalized suggestions for the user based on their recent prompts.",
 	}
 	for _, input := range cases {
 		t.Run(input, func(t *testing.T) {
