@@ -51,7 +51,11 @@ func runInit(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := connectAllAgents(stdout); err != nil {
+	connectOut := stdout
+	if *quiet {
+		connectOut = io.Discard
+	}
+	if err := connectAllAgents(connectOut); err != nil {
 		return err
 	}
 
@@ -65,11 +69,14 @@ project: .agbox/
 
 `, s.Path())
 	printWatcherStatus(stdout, home)
+	fmt.Fprintf(stdout, "managed hooks: %s\n", managedHookSummary())
 	fmt.Fprintf(stdout, "initial ingest: %d corrections\n\n", ingested)
 	fmt.Fprintln(stdout, `Next steps:
-  agbox doctor            # Check watcher + hooks for claude, codex, grok
+  agbox beta              # See setup + candidates in one terminal summary
+  agbox doctor            # Check watcher + managed proposal hooks
   agbox status            # Check watcher and sync status
-  agbox demo              # See the workflow in action`)
+  agbox demo              # See the workflow in action
+  agbox disconnect <agent> # Remove managed proposal hooks`)
 	return nil
 }
 

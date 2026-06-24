@@ -37,11 +37,15 @@ func Run(s *store.Store) Report {
 	r.Lines = append(r.Lines, fmt.Sprintf("exports: %d", stats.Exports))
 
 	home, err := os.UserHomeDir()
+	needsInit := false
 	if err != nil {
 		r.Lines = append(r.Lines, "watcher: unknown ("+err.Error()+")")
 	} else {
 		ws := watcher.Status(home)
 		r.Lines = append(r.Lines, "watcher: "+watcherState(ws))
+		if !ws.Installed {
+			needsInit = true
+		}
 	}
 
 	lastSync, err := s.LatestCursorSync()
@@ -72,7 +76,13 @@ func Run(s *store.Store) Report {
 		if !status.OK {
 			r.OK = false
 		}
+		if status.State != "connected" {
+			needsInit = true
+		}
 		r.Lines = append(r.Lines, line)
+	}
+	if needsInit {
+		r.Lines = append(r.Lines, "next: agbox init # install or repair watcher and managed proposal hooks")
 	}
 	return r
 }

@@ -4,6 +4,11 @@
 
 **Goal:** Replace hook-based prompt capture with automatic session ingestion from Claude/Codex/Cursor, centered on an enhanced `agbox review` TUI.
 
+> 2026-06-23 update: session ingestion remains the base, but the current beta
+> implementation keeps managed proposal hooks for in-agent skill suggestions and
+> acknowledgement. The old "remove hook/connect" tasks below are superseded by
+> `docs/plans/2026-06-23-001-feat-beta-aha-loop-plan.md`.
+
 **Architecture:** macOS LaunchAgent runs `agbox watch`, which fswatches known session directories. Per-agent adapters parse file deltas into canonical turns/actions/corrections stored in global `~/.agbox/agbox.db`. Scan clusters corrections into candidates; review TUI shows causal evidence with drill-down and inline export.
 
 **Tech Stack:** Go 1.22+, SQLite (mattn/go-sqlite3), Bubble Tea v2, macOS LaunchAgent, Node postinstall script.

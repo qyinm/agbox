@@ -76,11 +76,13 @@ That's the whole product: **stop repeating yourself to your AI.**
 ```bash
 # Install (macOS arm64 today; Homebrew + Linux on the roadmap)
 npm install -g @agboxhq/cli
-agbox review
+agbox beta
 ```
 
 `npm install` runs `agbox init --quiet` automatically — it creates `~/.agbox/`, installs the
-session watcher, and ingests existing agent sessions. Set `AGBOX_SKIP_WATCHER=1` to opt out.
+session watcher, installs managed proposal hooks, and ingests existing agent sessions.
+Set `AGBOX_SKIP_WATCHER=1` to skip all setup, or `AGBOX_SKIP_CONNECT=1` to keep the
+watcher but skip managed proposal hooks.
 
 See the entire loop in a throwaway store, without touching anything real:
 
@@ -92,12 +94,16 @@ Then just work:
 
 ```bash
 # 1. Code like you always do. Correct your agent like you always do.
-#    agbox watches session files in the background — no hooks, no copy-paste.
+#    agbox watches session files in the background.
+#    Managed hooks only propose skills and acknowledge created skill files.
 
-# 2. Review what it learned (primary interface)
+# 2. See setup + candidates in one terminal-safe summary
+agbox beta                      # best first beta command
+
+# 3. Review what it learned
 agbox review                    # interactive TUI: evidence, approve, export
 
-# 3. Check watcher health anytime
+# 4. Check watcher and managed hook health anytime
 agbox status                    # watcher state, last sync, correction counts
 agbox doctor                    # full health check
 ```
@@ -184,9 +190,10 @@ rules). agbox never silently installs a detected workflow.
 
 | | |
 |---|---|
-| 📥 **Automatic ingest** | A background watcher reads Claude Code, Codex, and Cursor session files. No hooks, no manual commits, no copy-paste-into-a-fresh-chat. |
+| 📥 **Automatic ingest** | A background watcher reads Claude Code, Codex, Cursor, and Grok session files. No manual commits, no copy-paste-into-a-fresh-chat. |
+| 💬 **In-context proposals** | Managed hooks can ask before creating a skill when agbox finds a repeated correction. Remove them with `agbox disconnect <agent>`. |
 | 🧮 **Smart clustering** | Repeated instructions get normalized, grouped, and confidence-scored — directional prefs like `bun-over-npm` included. |
-| 👀 **Review TUI** | `agbox review` is the primary interface. Drill into causal evidence, approve, and export — all in one place. |
+| 👀 **Beta summary + Review TUI** | `agbox beta` gives a terminal-safe summary; `agbox review` drills into evidence, approval, and export. |
 | 📤 **Vendor-neutral export** | One skill → `CLAUDE.md`, `AGENTS.md`, Cursor, Cline. Promote once, every agent obeys. |
 | ↩️ **Always reversible** | Every export is backed up and wrapped in markers. `agbox export rollback` undoes it cleanly. |
 | 🔒 **Local-first & private** | Everything lives in `~/.agbox/`. Redacted excerpts + hashes by default — raw prompts never leave your machine. |
@@ -217,7 +224,7 @@ agbox touches your prompts and your config files. That trust is the product, so:
 
 - **Everything stays local.** The global store is `~/.agbox/agbox.db`. Nothing is uploaded.
 - **Redacted by default.** Persisted signals are short redacted excerpts + a hash + metadata. Raw text is opt-in via `--raw`; session ingest never stores full transcripts.
-- **Reversible by default.** Every config write is backed up; `agbox export rollback <id>` restores it. The watcher only reads session files — it never modifies agent config.
+- **Reversible by default.** Every export write is backed up; `agbox export rollback <id>` restores it. Managed proposal hooks can be removed with `agbox disconnect <agent>`.
 - **Inspectable.** Open source, with a deterministic compiler — read exactly what gets written before it's written.
 - **Auditable.** `agbox audit` supports `private`, `shareable`, and `client` profiles.
 
@@ -246,7 +253,8 @@ files shipped — corrections eliminated.
 ## 📟 Command reference
 
 ```text
-agbox init [--quiet]                initialize ~/.agbox/, install watcher, ingest sessions
+agbox init [--quiet]                initialize ~/.agbox/, install watcher + managed hooks, ingest sessions
+agbox beta [--limit 5]              setup health + best candidate summary
 agbox demo                          run the full loop in a throwaway store
 agbox status                        watcher state, last sync, correction counts
 agbox sources                       list discovered session source paths
@@ -266,6 +274,8 @@ agbox reject  <id>                  reject a candidate
 agbox compile <id> [--target …]     render an approved skill (no write)
 agbox export  [id…] [--target …]    dry-run or apply an export plan
 agbox export rollback <export-id>   restore the file backup for an export
+agbox connect <agent>               install managed proposal hooks
+agbox disconnect <agent>            remove managed proposal hooks
 
 agbox impact <id>                   repeat counts before vs after export
 agbox audit  [--profile …]          generate a workflow audit pack

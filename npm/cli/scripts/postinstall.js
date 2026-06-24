@@ -17,7 +17,11 @@ if (process.env.AGBOX_SKIP_WATCHER === "1") {
 
 try {
   execFileSync(executable, ["init", "--quiet"], { stdio: "pipe" });
-  console.log("agbox: watcher installed · run `agbox doctor` to verify");
+  if (process.env.AGBOX_SKIP_CONNECT === "1" || process.env.AGBOX_SKIP_HOOKS === "1") {
+    console.log("agbox: watcher installed · managed hooks skipped · run `agbox doctor` to verify");
+  } else {
+    console.log("agbox: watcher and managed proposal hooks installed · run `agbox doctor` to verify");
+  }
 } catch (err) {
   console.error("agbox: watcher install failed — run `agbox init` manually");
 }

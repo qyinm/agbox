@@ -40,6 +40,9 @@ func TestRenderInjectionIncludesCandidateID(t *testing.T) {
 			RuleText:   "use bun, not npm",
 		},
 		Excerpts: []string{"use bun, not npm"},
+		Occurrences: []model.Occurrence{
+			{AgentAction: "ran `npm install`", UserCorrection: "use bun, not npm"},
+		},
 	}
 	out := propose.RenderInjection("grok", card)
 	if !strings.Contains(out, "cand_abc123") {
@@ -50,6 +53,22 @@ func TestRenderInjectionIncludesCandidateID(t *testing.T) {
 	}
 	if !strings.Contains(out, ".grok/skills/") {
 		t.Fatalf("injection missing grok skill path: %s", out)
+	}
+	for _, want := range []string{
+		"Ask the user this question",
+		"yes",
+		"no",
+		"later",
+		"ran `npm install`",
+		"agbox snooze cand_abc123",
+		"agbox reject cand_abc123",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("injection missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(strings.ToLower(out), "sidecar") {
+		t.Fatalf("injection still uses sidecar framing:\n%s", out)
 	}
 }
 
