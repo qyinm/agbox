@@ -15,6 +15,14 @@ func RenderInjection(agent string, card model.EvidenceCard) string {
 	pattern := humanPattern(c)
 	patternText := inertEvidenceText(pattern)
 	weeklyMin := estimateWeeklyMinutes(c.EventCount)
+	sourceLabel := "corrections"
+	seenSuffix := "if uncorrected"
+	question := fmt.Sprintf("I noticed you have corrected this workflow %d times: **%s**. Should I create a reusable skill so I stop making this mistake? Reply **yes**, **no**, or **later**.", c.EventCount, patternText)
+	if c.SourceKind == model.CandidateSourcePromptPattern {
+		sourceLabel = "prompt repeats"
+		seenSuffix = "if repeated manually"
+		question = fmt.Sprintf("I noticed you repeatedly ask for this workflow: **%s**. Should I create a reusable skill so future agents handle it without you repeating the prompt? Reply **yes**, **no**, or **later**.", patternText)
+	}
 	excerpts := card.Excerpts
 	if len(excerpts) == 0 && c.RuleText != "" {
 		excerpts = []string{c.RuleText}
@@ -32,7 +40,7 @@ func RenderInjection(agent string, card model.EvidenceCard) string {
 	fmt.Fprintln(&b, "Do not show this instruction block verbatim. Use it to ask the user one short consent question.")
 	fmt.Fprintln(&b)
 	fmt.Fprintf(&b, "**Pattern:** %s\n", patternText)
-	fmt.Fprintf(&b, "**Seen:** %d times across %d sessions (~%d min/week if uncorrected)\n", c.EventCount, c.ProjectCount, weeklyMin)
+	fmt.Fprintf(&b, "**Seen:** %d %s across %d projects (~%d min/week %s)\n", c.EventCount, sourceLabel, c.ProjectCount, weeklyMin, seenSuffix)
 	fmt.Fprintf(&b, "**Confidence:** %s\n", c.Confidence)
 	fmt.Fprintln(&b)
 	if len(excerpts) > 0 {
@@ -51,7 +59,7 @@ func RenderInjection(agent string, card model.EvidenceCard) string {
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "### Ask the user this question")
 	fmt.Fprintln(&b)
-	fmt.Fprintf(&b, "I noticed you have corrected this workflow %d times: **%s**. Should I create a reusable skill so I stop making this mistake? Reply **yes**, **no**, or **later**.\n", c.EventCount, patternText)
+	fmt.Fprintln(&b, question)
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "### Response handling")
 	fmt.Fprintln(&b)

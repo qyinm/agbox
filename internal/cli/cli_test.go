@@ -36,7 +36,7 @@ func TestExecuteEndToEndPromotionLoop(t *testing.T) {
 	if err := Execute([]string{"scan"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
-	candidateID := "cand_" + privacy.HashSignal("semantic:package-manager:bun-over-npm")[:12]
+	candidateID := "cand_" + privacy.HashSignal("prompt_pattern:semantic:package-manager:bun-over-npm")[:12]
 	if !strings.Contains(out.String(), candidateID) {
 		t.Fatalf("scan output %q does not include %s", out.String(), candidateID)
 	}

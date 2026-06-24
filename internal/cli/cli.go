@@ -218,7 +218,7 @@ func runScan(s *store.Store, args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "scanned %d events, found %d candidates\n", result.Scanned, len(result.Candidates))
+	fmt.Fprintf(stdout, "scanned %d signals, found %d candidates\n", result.Scanned, len(result.Candidates))
 	for _, c := range result.Candidates {
 		fmt.Fprintf(stdout, "%s  %s  repeats=%d confidence=%s state=%s\n", c.ID, c.Name, c.EventCount, c.Confidence, c.State)
 	}
@@ -275,16 +275,16 @@ func runDiscover(s *store.Store, args []string, stdout io.Writer) error {
 		candidates = candidates[:*limit]
 	}
 	if len(candidates) == 0 {
-		fmt.Fprintf(stdout, "No workflow candidates yet.\nscanned %d events, found %d repeated signals\n", result.Scanned, len(result.Candidates))
+		fmt.Fprintf(stdout, "No workflow candidates yet.\nscanned %d signals, found %d repeated signals\n", result.Scanned, len(result.Candidates))
 		if result.Scanned == 0 {
-			fmt.Fprintln(stdout, "agbox has not ingested any repeated corrections in this store.")
+			fmt.Fprintln(stdout, "agbox has not ingested any workflow signals in this store.")
 		} else {
 			fmt.Fprintf(stdout, "Capture at least %d matching prompts before a candidate appears.\n", normalizedMinRepeats(*minRepeats))
 		}
 		printDiscoverNext(stdout)
 		return nil
 	}
-	fmt.Fprintf(stdout, "Workflow candidates\nscanned %d events, found %d repeated signals, showing %d %s candidates\n",
+	fmt.Fprintf(stdout, "Workflow candidates\nscanned %d signals, found %d repeated signals, showing %d %s candidates\n",
 		result.Scanned, len(result.Candidates), len(candidates), displayState(stateFilter))
 	for i, c := range candidates {
 		card, err := evidence.Build(s, c.ID)
@@ -292,8 +292,8 @@ func runDiscover(s *store.Store, args []string, stdout io.Writer) error {
 			return err
 		}
 		fmt.Fprintf(stdout, "\n%d. %s (%s)\n", i+1, c.Name, c.ID)
-		fmt.Fprintf(stdout, "   repeats=%d projects=%d sources=%d confidence=%s state=%s\n",
-			c.EventCount, c.ProjectCount, c.SourceCount, c.Confidence, c.State)
+		fmt.Fprintf(stdout, "   repeats=%d projects=%d sources=%d source=%s confidence=%s state=%s\n",
+			c.EventCount, c.ProjectCount, c.SourceCount, c.SourceKind, c.Confidence, c.State)
 		fmt.Fprintf(stdout, "   why: %s\n", card.Reason)
 		if len(card.Excerpts) > 0 {
 			fmt.Fprintf(stdout, "   excerpt: %s\n", card.Excerpts[0])
@@ -470,8 +470,8 @@ func runEvidence(s *store.Store, args []string, stdout io.Writer) error {
 		return err
 	}
 	c := card.Candidate
-	fmt.Fprintf(stdout, "%s\nstate: %s\nrepeats: %d\nprojects: %d\nsources: %d\nconfidence: %s\nprivacy: %s\nreason: %s\n",
-		c.Name, c.State, c.EventCount, c.ProjectCount, c.SourceCount, c.Confidence, card.Privacy, card.Reason)
+	fmt.Fprintf(stdout, "%s\nstate: %s\nsource: %s\nrepeats: %d\nprojects: %d\nsources: %d\nconfidence: %s\nprivacy: %s\nreason: %s\n",
+		c.Name, c.State, c.SourceKind, c.EventCount, c.ProjectCount, c.SourceCount, c.Confidence, card.Privacy, card.Reason)
 	if len(card.Excerpts) > 0 {
 		fmt.Fprintln(stdout, "excerpts:")
 		for _, ex := range card.Excerpts {
@@ -841,7 +841,7 @@ Options:
 	"beta": `Usage:
   agbox beta [--limit 5]
 
-Show setup health and the best repeated-correction candidates in a terminal-safe beta summary.
+Show setup health and the best repeated workflow candidates in a terminal-safe beta summary.
 
 Options:
   --limit n        Maximum candidates to show. Default: 5`,

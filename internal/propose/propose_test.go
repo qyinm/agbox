@@ -22,6 +22,8 @@ func TestMeetsThreshold(t *testing.T) {
 		{model.Candidate{EventCount: 3, Confidence: "medium"}, true},
 		{model.Candidate{EventCount: 3, Confidence: "low"}, false},
 		{model.Candidate{EventCount: 2, SemanticKey: "package-manager:bun-over-npm", Confidence: "low"}, true},
+		{model.Candidate{SourceKind: model.CandidateSourcePromptPattern, EventCount: 2, ProjectCount: 1, SemanticKey: "lexical:current-project-review", Confidence: "low"}, false},
+		{model.Candidate{SourceKind: model.CandidateSourcePromptPattern, EventCount: 3, ProjectCount: 1, SemanticKey: "lexical:current-project-review", Confidence: "medium"}, true},
 	}
 	for _, tc := range cases {
 		if got := proposestate.MeetsThreshold(tc.c); got != tc.want {
@@ -105,6 +107,39 @@ func TestRenderInjectionTreatsEvidenceAsInertData(t *testing.T) {
 	} {
 		if strings.Contains(out, bad) {
 			t.Fatalf("injection contains unsafe evidence %q:\n%s", bad, out)
+		}
+	}
+}
+
+func TestRenderInjectionForPromptPatternAvoidsCorrectionCopy(t *testing.T) {
+	card := model.EvidenceCard{
+		Candidate: model.Candidate{
+			ID:         "cand_prompt123",
+			Name:       "current-project-analysis",
+			SourceKind: model.CandidateSourcePromptPattern,
+			EventCount: 3,
+			Confidence: "medium",
+			RuleText:   "현재 프로젝트 분석해줘.",
+		},
+		Excerpts: []string{"현재 프로젝트 분석해줘."},
+	}
+	out := propose.RenderInjection("codex", card)
+	for _, want := range []string{
+		"prompt repeats",
+		"repeatedly ask for this workflow",
+		"without you repeating the prompt",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("prompt injection missing %q:\n%s", want, out)
+		}
+	}
+	for _, bad := range []string{
+		"corrected this workflow",
+		"Causal example",
+		"stop making this mistake",
+	} {
+		if strings.Contains(out, bad) {
+			t.Fatalf("prompt injection contains correction copy %q:\n%s", bad, out)
 		}
 	}
 }

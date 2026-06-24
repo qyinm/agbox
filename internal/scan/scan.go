@@ -19,14 +19,20 @@ func Run(s *store.Store, minRepeats int) (Result, error) {
 	if minRepeats <= 0 {
 		minRepeats = 2
 	}
-	count, err := s.CountCorrections()
+	correctionResult, err := runCorrections(s, minRepeats)
 	if err != nil {
 		return Result{}, err
 	}
-	if count > 0 {
-		return runCorrections(s, minRepeats)
+	eventResult, err := runEvents(s, minRepeats)
+	if err != nil {
+		return Result{}, err
 	}
-	return runEvents(s, minRepeats)
+	result := Result{
+		Candidates: append(correctionResult.Candidates, eventResult.Candidates...),
+		Scanned:    correctionResult.Scanned + eventResult.Scanned,
+	}
+	sortCandidates(&result)
+	return result, nil
 }
 
 func runEvents(s *store.Store, minRepeats int) (Result, error) {
@@ -36,6 +42,9 @@ func runEvents(s *store.Store, minRepeats int) (Result, error) {
 	}
 	byFingerprint := map[string][]model.Event{}
 	for _, e := range events {
+		if !eligiblePromptEvent(e) {
+			continue
+		}
 		fingerprint := clusterFingerprint(e)
 		byFingerprint[fingerprint] = append(byFingerprint[fingerprint], e)
 	}
@@ -45,7 +54,7 @@ func runEvents(s *store.Store, minRepeats int) (Result, error) {
 		if len(group) < minRepeats {
 			continue
 		}
-		c := buildCandidate(fingerprint, group)
+		c := buildCandidate(fingerprint, group, model.CandidateSourcePromptPattern)
 		ids := make([]string, 0, len(group))
 		for _, e := range group {
 			ids = append(ids, e.ID)
@@ -99,7 +108,7 @@ func runCorrections(s *store.Store, minRepeats int) (Result, error) {
 }
 
 func correctionClusterFingerprint(c model.Correction, action model.Action) string {
-	return privacy.HashSignal(c.Normalized + "|" + actionFingerprint(action))
+	return privacy.HashSignal(string(model.CandidateSourceCorrection) + ":" + c.Normalized + "|" + actionFingerprint(action))
 }
 
 func actionFingerprint(action model.Action) string {
@@ -120,7 +129,7 @@ func buildCandidateFromCorrections(fingerprint string, corrections []model.Corre
 			CreatedAt:  c.CreatedAt,
 		}
 	}
-	return buildCandidate(fingerprint, events)
+	return buildCandidate(fingerprint, events, model.CandidateSourceCorrection)
 }
 
 func sortCandidates(result *Result) {
@@ -132,7 +141,7 @@ func sortCandidates(result *Result) {
 	})
 }
 
-func buildCandidate(fingerprint string, events []model.Event) model.Candidate {
+func buildCandidate(fingerprint string, events []model.Event, sourceKind model.CandidateSourceKind) model.Candidate {
 	first := events[0].CreatedAt
 	last := events[0].CreatedAt
 	projects := map[string]bool{}
@@ -181,6 +190,7 @@ func buildCandidate(fingerprint string, events []model.Event) model.Candidate {
 		Description:  workflowDescription(events),
 		RuleText:     ruleText,
 		SemanticKey:  semantic,
+		SourceKind:   sourceKind,
 		State:        model.CandidatePending,
 		EventCount:   len(events),
 		ProjectCount: len(projects),

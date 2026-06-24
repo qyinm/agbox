@@ -28,6 +28,13 @@ const (
 	CandidateExported      CandidateState = "exported"
 )
 
+type CandidateSourceKind string
+
+const (
+	CandidateSourceCorrection    CandidateSourceKind = "correction"
+	CandidateSourcePromptPattern CandidateSourceKind = "prompt_pattern"
+)
+
 type Candidate struct {
 	ID           string
 	Fingerprint  string
@@ -35,6 +42,7 @@ type Candidate struct {
 	Description  string
 	RuleText     string
 	SemanticKey  string
+	SourceKind   CandidateSourceKind
 	State        CandidateState
 	EventCount   int
 	ProjectCount int

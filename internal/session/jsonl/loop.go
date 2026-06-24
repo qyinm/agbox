@@ -2,6 +2,9 @@ package jsonl
 
 import (
 	"bufio"
+	"bytes"
+	"errors"
+	"io"
 	"strings"
 	"time"
 
@@ -40,23 +43,32 @@ func ProcessDelta(data []byte, lastOffset int64, handler LineHandler, meta Meta)
 	var acc Accum
 	ctx := &Context{}
 	var offset int64
-	scanner := bufio.NewScanner(strings.NewReader(string(data)))
-	for scanner.Scan() {
+	reader := bufio.NewReader(bytes.NewReader(data))
+	for {
+		raw, err := reader.ReadString('\n')
+		if err != nil && len(raw) == 0 {
+			if errors.Is(err, io.EOF) {
+				return acc, offset, nil
+			}
+			return acc, offset, err
+		}
 		lineStart := offset
-		line := scanner.Text()
-		offset = int64(len(line)) + 1 + lineStart
+		offset += int64(len(raw))
+		line := strings.TrimSuffix(strings.TrimSuffix(raw, "\n"), "\r")
 		if lineStart < lastOffset {
 			handler.ApplyContext(line, ctx)
-			continue
+		} else if strings.TrimSpace(line) != "" {
+			if err := handler.ProcessLine(line, ctx, &acc, meta); err != nil {
+				return acc, offset, err
+			}
 		}
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		if err := handler.ProcessLine(line, ctx, &acc, meta); err != nil {
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return acc, offset, nil
+			}
 			return acc, offset, err
 		}
 	}
-	return acc, offset, scanner.Err()
 }
 
 // PairCorrection links a user correction to the most recent agent action.

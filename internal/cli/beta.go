@@ -61,6 +61,7 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 	fmt.Fprintf(stdout, "  store: %s\n", stats.Path)
 	fmt.Fprintf(stdout, "  last sync: %s\n", formatLastSync(lastSync))
 	fmt.Fprintf(stdout, "  corrections: %d\n", corrections)
+	fmt.Fprintf(stdout, "  prompt events: %d\n", stats.Events)
 	fmt.Fprintf(stdout, "  candidates: %d\n", stats.Candidates)
 	if syncErr != nil {
 		fmt.Fprintf(stdout, "  sync: partial (%s)\n", betaSyncIssue(syncErr))
@@ -81,7 +82,8 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 	if len(candidates) == 0 {
 		fmt.Fprintln(stdout)
 		fmt.Fprintln(stdout, "No repeated corrections yet.")
-		fmt.Fprintln(stdout, "Keep working in Claude, Codex, Cursor, or Grok; agbox will watch for repeated corrections.")
+		fmt.Fprintln(stdout, "No repeated prompt patterns yet.")
+		fmt.Fprintln(stdout, "Keep working in Claude, Codex, Cursor, or Grok; agbox will watch for repeated workflow signals.")
 		fmt.Fprintln(stdout, "Try the loop without touching your data: agbox demo")
 		fmt.Fprintln(stdout, "Check setup anytime: agbox doctor")
 		return nil
@@ -95,7 +97,7 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 			return err
 		}
 		fmt.Fprintf(stdout, "\n%d. %s (%s)\n", i+1, c.Name, c.ID)
-		fmt.Fprintf(stdout, "   state=%s confidence=%s repeats=%d projects=%d\n", c.State, c.Confidence, c.EventCount, c.ProjectCount)
+		fmt.Fprintf(stdout, "   state=%s source=%s confidence=%s repeats=%d projects=%d\n", c.State, c.SourceKind, c.Confidence, c.EventCount, c.ProjectCount)
 		if example := betaEvidenceExample(card); example != "" {
 			fmt.Fprintf(stdout, "   example: %s\n", example)
 		}
@@ -143,6 +145,9 @@ func betaEvidenceExample(card model.EvidenceCard) string {
 func betaNextAction(c model.Candidate) string {
 	switch c.State {
 	case model.CandidateProposalReady:
+		if c.SourceKind == model.CandidateSourcePromptPattern {
+			return "ready to propose a recurring-prompt skill inside your agent; keep working or run agbox review --state proposal_ready"
+		}
 		return "ready to propose inside your agent; keep working or run agbox review --state proposal_ready"
 	case model.CandidateProposed:
 		return "answer the in-agent proposal, or run agbox snooze " + c.ID

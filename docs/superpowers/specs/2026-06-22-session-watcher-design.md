@@ -223,9 +223,9 @@ CREATE TABLE candidate_corrections (
 );
 ```
 
-### Legacy `events` Table
+### `events` Table
 
-Keep `events` table for backward compatibility during migration. New ingestion writes to `corrections`. `scan` reads from `corrections` first, falls back to `events` if empty. Remove `events` ingestion path once session pipeline is stable.
+Keep `events` table for manual capture and recurring prompt-pattern detection. New correction ingestion writes to `corrections`, while `scan` reads both correction rows and eligible event rows in the same run. Candidates carry a source kind (`correction` or `prompt_pattern`) so evidence and proposal copy can describe the signal honestly.
 
 ---
 

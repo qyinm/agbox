@@ -13,7 +13,7 @@
   <p><strong>Workflow memory for AI coding agents.</strong></p>
   <p>
     Your agents keep making the same mistakes.<br/>
-    agbox captures the corrections you repeat — and promotes them into reusable skills your agents actually follow.
+    agbox captures repeated corrections and recurring workflow prompts — then promotes them into reusable skills your agents actually follow.
   </p>
 
   <p>
@@ -31,7 +31,7 @@
     <img src="https://img.shields.io/badge/Cline-export-2563EB?style=for-the-badge" alt="Cline export" />
   </p>
 
-  <p><em>Correct your agent once. agbox makes sure you never have to again.</em></p>
+  <p><em>Repeat a workflow once too often. agbox makes sure you never have to again.</em></p>
 
 </div>
 
@@ -39,7 +39,7 @@
 
 ## ⚡ The 30-second aha
 
-You've typed `use bun, not npm` to your agent all week.
+You've typed `use bun, not npm` or `analyze the current project first` to your agent all week.
 
 agbox noticed.
 
@@ -62,7 +62,7 @@ $ agbox inbox
 ```
 
 You review the evidence, approve it, and agbox writes the rule into the files your
-agents already read — so the correction sticks, across every agent.
+agents already read — so the workflow sticks, across every agent.
 
 ```console
 $ agbox approve use-bun-not-npm --name package-manager
@@ -101,7 +101,7 @@ agbox demo
 Then just work:
 
 ```bash
-# 1. Code like you always do. Correct your agent like you always do.
+# 1. Code like you always do. Correct your agent or repeat workflow prompts like you always do.
 #    agbox watches session files in the background.
 #    Managed hooks only propose skills and acknowledge created skill files.
 
@@ -112,7 +112,7 @@ agbox beta                      # best first beta command
 agbox review                    # interactive TUI: evidence, approve, export
 
 # 4. Check watcher and managed hook health anytime
-agbox status                    # watcher state, last sync, correction counts
+agbox status                    # watcher state, last sync, correction/event counts
 agbox doctor                    # full health check
 ```
 
@@ -120,7 +120,7 @@ agbox doctor                    # full health check
 
 ## 🎁 What you get
 
-### See *why* a correction became a candidate — before anything touches your config
+### See *why* a correction or prompt became a candidate — before anything touches your config
 
 ```console
 $ agbox evidence use-bun-not-npm
@@ -176,7 +176,7 @@ workflows your agents keep forgetting.
 
 ```
 ~/.agbox/
-├── agbox.db          # global SQLite store (sessions, corrections, candidates)
+├── agbox.db          # global SQLite store (sessions, corrections, prompt events, candidates)
 ├── exports/          # reversible export backups
 └── watcher/          # LaunchAgent state
 
@@ -199,7 +199,7 @@ rules). agbox never silently installs a detected workflow.
 | | |
 |---|---|
 | 📥 **Automatic ingest** | A background watcher reads Claude Code, Codex, Cursor, and Grok session files. No manual commits, no copy-paste-into-a-fresh-chat. |
-| 💬 **In-context proposals** | Managed hooks can ask before creating a skill when agbox finds a repeated correction. Remove them with `agbox disconnect <agent>`. |
+| 💬 **In-context proposals** | Managed hooks can ask before creating a skill when agbox finds a repeated correction or recurring prompt pattern. Remove them with `agbox disconnect <agent>`. |
 | 🧮 **Smart clustering** | Repeated instructions get normalized, grouped, and confidence-scored — directional prefs like `bun-over-npm` included. |
 | 👀 **Beta summary + Review TUI** | `agbox beta` gives a terminal-safe summary; `agbox review` drills into evidence, approval, and export. |
 | 📤 **Vendor-neutral export** | One skill → `CLAUDE.md`, `AGENTS.md`, Cursor, Cline. Promote once, every agent obeys. |
@@ -222,7 +222,7 @@ exports to the formats they already read.
 | | `.cursor/rules/*.mdc` *(Cursor)* |
 | | `.clinerules/*.md` *(Cline — export only)* |
 
-One correction, promoted once, lands everywhere your agents look.
+One workflow signal, promoted once, lands everywhere your agents look.
 
 ---
 
@@ -230,7 +230,7 @@ One correction, promoted once, lands everywhere your agents look.
 
 agbox touches your prompts and your config files. That trust is the product, so:
 
-- **Sessions, prompts, and core workflow data stay local.** The global store is `~/.agbox/agbox.db`. Your corrections, candidates, exports, and session ingest never leave your machine unless you explicitly share them (e.g. `agbox audit`).
+- **Sessions, prompts, and core workflow data stay local.** The global store is `~/.agbox/agbox.db`. Your corrections, prompt events, candidates, exports, and session ingest never leave your machine unless you explicitly share them (e.g. `agbox audit`).
 - **Anonymous usage stats (on by default).** Telemetry is enabled unless you opt out with `agbox telemetry off` or `AGBOX_TELEMETRY=0`. agbox sends only:
   - `agbox_install_completed` once (install/version signal)
   - `agbox_daily_active` at most once per UTC day (includes `streak_days`)
@@ -258,16 +258,17 @@ AI agents are brilliant and forgetful. You correct the same thing every session:
 - *"use bun, not npm"*
 - *"tests go in `__tests__`, not next to the file"*
 - *"summary → tests → risk, in that order, in every PR"*
+- *"analyze the current project before recommending changes"*
 
 Today that knowledge lives in your head and your patience. You either re-type it forever,
 or you hand-maintain a sprawling `CLAUDE.md` you forget to update. Both are friction, and
 friction is why most people just… don't.
 
-agbox closes the loop. The corrections you already make become the memory your agents
-already follow — captured automatically, reviewed by you, written where it counts.
+agbox closes the loop. The corrections you make and workflow prompts you repeat become
+the memory your agents already follow — captured locally, reviewed by you, written where it counts.
 
-**North star:** fewer repeated corrections per repo-week after a skill is exported. Not
-files shipped — corrections eliminated.
+**North star:** fewer repeated corrections and recurring workflow prompts per repo-week after a skill is exported. Not
+files shipped — repetition eliminated.
 
 ---
 
@@ -277,7 +278,7 @@ files shipped — corrections eliminated.
 agbox init [--quiet]                initialize ~/.agbox/, install watcher + managed hooks, ingest sessions
 agbox beta [--limit 5]              setup health + best candidate summary
 agbox demo                          run the full loop in a throwaway store
-agbox status                        watcher state, last sync, correction counts
+agbox status                        watcher state, last sync, correction/event counts
 agbox sources                       list discovered session source paths
 agbox sync --once                   force a session ingestion pass
 agbox watch                         internal daemon (used by LaunchAgent)
