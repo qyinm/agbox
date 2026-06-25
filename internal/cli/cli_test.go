@@ -612,6 +612,86 @@ func TestBetaShowsCandidateCausalEvidenceAndNextAction(t *testing.T) {
 	}
 }
 
+func TestHookReplayUsesPromptMatchAndMarksProposed(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+
+	s, err := store.Open(filepath.Join(root, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := seedBetaCandidate(t, s, model.Candidate{
+		Name:         "current-project-analysis-workflow",
+		RuleText:     "현재 프로젝트 분석해줘.",
+		SemanticKey:  "current-project-analysis",
+		SourceKind:   model.CandidateSourcePromptPattern,
+		State:        model.CandidateProposalReady,
+		EventCount:   3,
+		ProjectCount: 1,
+		SourceCount:  1,
+		Confidence:   "high",
+	})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	hookData := `{"cwd":"` + filepath.Join(root, "agbox") + `","prompt":"현재 프로젝트 분석해줘"}`
+	if err := Execute([]string{"hook", "replay", "codex"}, strings.NewReader(hookData), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, c.ID) {
+		t.Fatalf("replay output missing candidate id %s:\n%s", c.ID, got)
+	}
+	s, err = store.Open(filepath.Join(root, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	stored, err := s.GetCandidate(c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != model.CandidateProposed {
+		t.Fatalf("state = %s, want proposed", stored.State)
+	}
+}
+
+func TestHookReplayWithoutPromptEmitsNothing(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+
+	s, err := store.Open(filepath.Join(root, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedBetaCandidate(t, s, model.Candidate{
+		Name:         "current-project-analysis-workflow",
+		RuleText:     "현재 프로젝트 분석해줘.",
+		SemanticKey:  "current-project-analysis",
+		SourceKind:   model.CandidateSourcePromptPattern,
+		State:        model.CandidateProposalReady,
+		EventCount:   3,
+		ProjectCount: 1,
+		SourceCount:  1,
+		Confidence:   "high",
+	})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := Execute([]string{"hook", "replay", "codex"}, strings.NewReader(`{"cwd":"`+root+`"}`), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "" {
+		t.Fatalf("expected no replay output without prompt, got:\n%s", out.String())
+	}
+}
+
 func TestBetaLimitZeroDoesNotClaimNoCorrections(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)

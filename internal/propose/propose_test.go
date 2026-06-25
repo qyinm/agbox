@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/hippoom/agbox/internal/model"
+	"github.com/hippoom/agbox/internal/privacy"
 	"github.com/hippoom/agbox/internal/propose"
 	proposestate "github.com/hippoom/agbox/internal/propose/state"
 	"github.com/hippoom/agbox/internal/store"
@@ -234,6 +235,117 @@ func TestSelectAndRenderThenMarkProposed(t *testing.T) {
 	}
 }
 
+func TestSelectForPromptUsesCurrentPromptSemanticMatch(t *testing.T) {
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now()
+	current := seedPromptCandidate(t, s, model.Candidate{
+		ID:           "cand_currentprompt",
+		Fingerprint:  privacy.HashSignal("prompt_pattern:semantic:current-project-analysis"),
+		Name:         "current-project-analysis-workflow",
+		SemanticKey:  "current-project-analysis",
+		State:        model.CandidateProposalReady,
+		EventCount:   3,
+		ProjectCount: 1,
+		SourceCount:  1,
+		Confidence:   "high",
+		FirstSeen:    now,
+		LastSeen:     now,
+		UpdatedAt:    now,
+	})
+	seedPromptCandidate(t, s, model.Candidate{
+		ID:           "cand_unrelatedprompt",
+		Fingerprint:  privacy.HashSignal("prompt_pattern:semantic:pr-format:summary-tests-risk"),
+		Name:         "pr-format-workflow",
+		SemanticKey:  "pr-format:summary-tests-risk",
+		State:        model.CandidateProposalReady,
+		EventCount:   10,
+		ProjectCount: 1,
+		SourceCount:  1,
+		Confidence:   "high",
+		FirstSeen:    now,
+		LastSeen:     now.Add(time.Minute),
+		UpdatedAt:    now,
+	})
+
+	got, err := propose.SelectForPrompt(s, "agbox", "현재 프로젝트 분석해줘")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != current.ID {
+		t.Fatalf("selected = %s, want %s", got.ID, current.ID)
+	}
+}
+
+func TestSelectForPromptRejectsUnrelatedAndLowConfidenceWorkflows(t *testing.T) {
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now()
+	seedPromptCandidate(t, s, model.Candidate{
+		ID:           "cand_lowprompt",
+		Fingerprint:  privacy.HashSignal("prompt_pattern:semantic:current-project-analysis"),
+		Name:         "current-project-analysis-workflow",
+		SemanticKey:  "current-project-analysis",
+		State:        model.CandidateProposalReady,
+		EventCount:   2,
+		ProjectCount: 1,
+		SourceCount:  1,
+		Confidence:   "low",
+		FirstSeen:    now,
+		LastSeen:     now,
+		UpdatedAt:    now,
+	})
+	seedPromptCandidate(t, s, model.Candidate{
+		ID:           "cand_savedprompt",
+		Fingerprint:  privacy.HashSignal("prompt_pattern:semantic:pr-format:summary-tests-risk"),
+		Name:         "pr-format-workflow",
+		SemanticKey:  "pr-format:summary-tests-risk",
+		State:        model.CandidateAccepted,
+		EventCount:   10,
+		ProjectCount: 1,
+		SourceCount:  1,
+		Confidence:   "high",
+		FirstSeen:    now,
+		LastSeen:     now,
+		UpdatedAt:    now,
+	})
+
+	got, err := propose.SelectForPrompt(s, "agbox", "현재 프로젝트 분석해줘")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "" {
+		t.Fatalf("selected low/saved workflow = %+v, want none", got)
+	}
+	got, err = propose.SelectForPrompt(s, "agbox", "write a release note")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "" {
+		t.Fatalf("selected unrelated workflow = %+v, want none", got)
+	}
+}
+
+func TestPromptFromHookParsesNestedPromptAndIgnoresMalformedJSON(t *testing.T) {
+	got := propose.PromptFromHook([]byte(`{"payload":{"userPrompt":"  현재   프로젝트 분석해줘  "}}`))
+	if got != "현재 프로젝트 분석해줘" {
+		t.Fatalf("prompt = %q", got)
+	}
+	if got := propose.PromptFromHook([]byte(`not json`)); got != "" {
+		t.Fatalf("malformed prompt = %q, want empty", got)
+	}
+}
+
 func TestAcknowledgeReadsCandidateIDFromFrontmatter(t *testing.T) {
 	dir := t.TempDir()
 	s, err := store.Open(filepath.Join(dir, "agbox.db"))
@@ -279,6 +391,26 @@ func TestAcknowledgeReadsCandidateIDFromFrontmatter(t *testing.T) {
 	if got.State != model.CandidateAccepted {
 		t.Fatalf("state = %s, want accepted", got.State)
 	}
+}
+
+func seedPromptCandidate(t *testing.T, s *store.Store, c model.Candidate) model.Candidate {
+	t.Helper()
+	if c.SourceKind == "" {
+		c.SourceKind = model.CandidateSourcePromptPattern
+	}
+	if c.Description == "" {
+		c.Description = "test prompt workflow"
+	}
+	if c.RuleText == "" {
+		c.RuleText = c.Name
+	}
+	if c.Version == 0 {
+		c.Version = 1
+	}
+	if err := s.UpsertCandidate(c, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	return c
 }
 
 func TestAcknowledgeResolvesRelativeRepoSkillPath(t *testing.T) {
