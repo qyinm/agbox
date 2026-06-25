@@ -605,10 +605,118 @@ func TestBetaShowsCandidateCausalEvidenceAndNextAction(t *testing.T) {
 		"example: ran `npm install` -> Use bun, not npm.",
 		"agbox evidence cand_",
 		"ready to propose inside your agent",
+		"Manage recorded workflows: agbox inbox",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("beta candidate output missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestInboxEmptyShowsRecordedWorkflowOnboarding(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+
+	var out bytes.Buffer
+	if err := Execute([]string{"inbox"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"No Recorded Workflows yet.",
+		"agbox demo",
+		"agbox doctor",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("inbox empty output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "Promotion Inbox") {
+		t.Fatalf("inbox empty output still uses promotion copy:\n%s", got)
+	}
+}
+
+func TestInboxShowsRecordedWorkflowCard(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+
+	s, err := store.Open(filepath.Join(root, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedBetaCandidate(t, s, model.Candidate{
+		Name:         "current-project-analysis-workflow",
+		RuleText:     "현재 프로젝트 분석해줘.",
+		SemanticKey:  "current-project-analysis",
+		SourceKind:   model.CandidateSourcePromptPattern,
+		State:        model.CandidateProposalReady,
+		EventCount:   3,
+		ProjectCount: 1,
+		SourceCount:  1,
+		Confidence:   "high",
+	})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := Execute([]string{"inbox"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"Recorded Workflows",
+		"Current Project Analysis",
+		"lifecycle=Ready to replay",
+		"when:",
+		"replay:",
+		"Inspect repository structure",
+		"evidence:",
+		"safety:",
+		"does not re-run prior commands",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("inbox card missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "Promotion Inbox") {
+		t.Fatalf("inbox card still uses promotion copy:\n%s", got)
+	}
+}
+
+func TestInboxFiltersAppliedOnce(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+
+	s, err := store.Open(filepath.Join(root, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedBetaCandidate(t, s, model.Candidate{
+		Name:         "current-project-analysis-workflow",
+		RuleText:     "현재 프로젝트 분석해줘.",
+		SemanticKey:  "current-project-analysis",
+		SourceKind:   model.CandidateSourcePromptPattern,
+		State:        model.CandidateAppliedOnce,
+		EventCount:   3,
+		ProjectCount: 1,
+		SourceCount:  1,
+		Confidence:   "high",
+	})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := Execute([]string{"inbox", "--state", "applied_once"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "lifecycle=Applied once") {
+		t.Fatalf("inbox applied_once output missing lifecycle:\n%s", got)
 	}
 }
 

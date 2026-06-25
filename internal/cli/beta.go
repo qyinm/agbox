@@ -20,6 +20,8 @@ import (
 var betaStatePriority = []model.CandidateState{
 	model.CandidateProposalReady,
 	model.CandidateProposed,
+	model.CandidateAppliedOnce,
+	model.CandidateSaveSuggested,
 	model.CandidatePending,
 	model.CandidateApproved,
 }
@@ -97,6 +99,7 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 		fmt.Fprintln(stdout)
 		fmt.Fprintln(stdout, "No strong workflow candidates yet.")
 		fmt.Fprintln(stdout, "Keep working in Claude, Codex, Cursor, or Grok; agbox will watch for repeated workflow signals.")
+		fmt.Fprintln(stdout, "Manage recorded workflows anytime: agbox inbox")
 		fmt.Fprintln(stdout, "Try the loop without touching your data: agbox demo")
 		fmt.Fprintln(stdout, "Check setup anytime: agbox doctor")
 		return nil
@@ -117,6 +120,8 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 		fmt.Fprintf(stdout, "   next: %s\n", betaNextAction(c))
 		fmt.Fprintf(stdout, "   inspect: agbox evidence %s\n", c.ID)
 	}
+	fmt.Fprintln(stdout)
+	fmt.Fprintln(stdout, "Manage recorded workflows: agbox inbox")
 	return nil
 }
 
@@ -260,6 +265,10 @@ func betaNextAction(c model.Candidate) string {
 		return "ready to propose inside your agent; keep working or run agbox review --state proposal_ready"
 	case model.CandidateProposed:
 		return "answer the in-agent proposal, or run agbox snooze " + c.ID
+	case model.CandidateAppliedOnce:
+		return "save for future at session stop, or review in agbox inbox --state applied_once"
+	case model.CandidateSaveSuggested:
+		return "answer the save-for-future prompt, or run agbox snooze " + c.ID
 	case model.CandidateApproved:
 		return "preview a safe write with agbox export " + c.ID + " --target agents-md --dry-run"
 	default:

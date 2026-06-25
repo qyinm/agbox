@@ -22,6 +22,7 @@ import (
 	"github.com/hippoom/agbox/internal/impact"
 	"github.com/hippoom/agbox/internal/manifest"
 	"github.com/hippoom/agbox/internal/model"
+	"github.com/hippoom/agbox/internal/pipeline"
 	"github.com/hippoom/agbox/internal/propose"
 	"github.com/hippoom/agbox/internal/scan"
 	"github.com/hippoom/agbox/internal/session"
@@ -29,6 +30,7 @@ import (
 	"github.com/hippoom/agbox/internal/store"
 	"github.com/hippoom/agbox/internal/telemetry"
 	"github.com/hippoom/agbox/internal/tui"
+	"github.com/hippoom/agbox/internal/workflow"
 )
 
 var maybeRecordDailyActiveHook = telemetry.MaybeRecordDailyActive
@@ -231,21 +233,53 @@ func runScan(s *store.Store, args []string, stdout io.Writer) error {
 func runInbox(s *store.Store, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("inbox", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	state := fs.String("state", "", "candidate state filter")
+	state := fs.String("state", "", "recorded workflow state filter, or all")
 	if err := fs.Parse(reorderFlags(args, map[string]bool{"state": true})); err != nil {
 		return err
 	}
-	candidates, err := s.ListCandidates(*state)
+	syncResult, err := pipeline.SyncBestEffortIfStale(s)
+	if err != nil {
+		return err
+	}
+	if syncResult.Warning != nil {
+		fmt.Fprintf(stdout, "warning: partial sync before inbox: %s\n\n", syncResult.Warning)
+	}
+	stateFilter := strings.ToLower(strings.TrimSpace(*state))
+	if stateFilter == "all" {
+		stateFilter = ""
+	}
+	if stateFilter != "" && !validReviewState(stateFilter) {
+		return fmt.Errorf("--state must be %s", reviewStateHelp)
+	}
+	candidates, err := s.ListCandidates(stateFilter)
 	if err != nil {
 		return err
 	}
 	if len(candidates) == 0 {
-		fmt.Fprintln(stdout, "Inbox empty. Run `agbox discover` after a few agent sessions, or test manually with `agbox capture` and `agbox scan`.")
+		fmt.Fprintln(stdout, "No Recorded Workflows yet.")
+		fmt.Fprintln(stdout, "Keep using your agents; agbox records repeated prompts and corrections automatically.")
+		fmt.Fprintln(stdout, "Try the loop without touching your data: agbox demo")
+		fmt.Fprintln(stdout, "Check setup anytime: agbox doctor")
 		return nil
 	}
-	fmt.Fprintln(stdout, "Promotion Inbox")
-	for _, c := range candidates {
-		fmt.Fprintf(stdout, "%s  %-9s  repeats=%d projects=%d confidence=%s  %s\n", c.ID, c.State, c.EventCount, c.ProjectCount, c.Confidence, c.Name)
+	fmt.Fprintf(stdout, "Recorded Workflows (showing %d %s)\n", len(candidates), displayState(stateFilter))
+	for i, c := range candidates {
+		evidenceCard, err := evidence.Build(s, c.ID)
+		if err != nil {
+			return err
+		}
+		card := workflow.Build(evidenceCard)
+		fmt.Fprintf(stdout, "\n%d. %s (%s)\n", i+1, card.Name, c.ID)
+		fmt.Fprintf(stdout, "   lifecycle=%s confidence=%s repeats=%d projects=%d source=%s\n",
+			card.Lifecycle, c.Confidence, c.EventCount, c.ProjectCount, c.SourceKind)
+		fmt.Fprintf(stdout, "   when: %s\n", card.WhenItApplies)
+		fmt.Fprintln(stdout, "   replay:")
+		for stepIndex, step := range card.ReplayPlan {
+			fmt.Fprintf(stdout, "     %d. %s\n", stepIndex+1, step)
+		}
+		fmt.Fprintf(stdout, "   evidence: %s\n", card.EvidenceSummary)
+		fmt.Fprintf(stdout, "   safety: %s\n", card.SafetyNote)
+		fmt.Fprintf(stdout, "   actions: agbox evidence %s | agbox reject %s | agbox snooze %s\n", c.ID, c.ID, c.ID)
 	}
 	return nil
 }
@@ -350,6 +384,8 @@ func validReviewState(state string) bool {
 	case string(model.CandidatePending),
 		string(model.CandidateProposalReady),
 		string(model.CandidateProposed),
+		string(model.CandidateAppliedOnce),
+		string(model.CandidateSaveSuggested),
 		string(model.CandidateAccepted),
 		string(model.CandidateSnoozed),
 		string(model.CandidateApproved),
@@ -362,7 +398,7 @@ func validReviewState(state string) bool {
 	}
 }
 
-const reviewStateHelp = "pending, proposal_ready, proposed, accepted, snoozed, approved, rejected, exported, or all"
+const reviewStateHelp = "pending, proposal_ready, proposed, applied_once, save_suggested, accepted, snoozed, approved, rejected, exported, or all"
 
 func interactiveTerminal(v any) bool {
 	f, ok := v.(*os.File)
