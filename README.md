@@ -8,7 +8,7 @@
 
   <!-- ASSET-PLACEHOLDER: <img src=".github/assets/agbox-banner.png" alt="agbox" width="100%" /> -->
 
-  <h1>🧠 agbox</h1>
+  <h1>agbox</h1>
 
   <p><strong>Workflow memory for AI coding agents.</strong></p>
   <p>
@@ -37,7 +37,7 @@
 
 ---
 
-## ⚡ The 30-second aha
+## The 30-second aha
 
 You've typed `use bun, not npm` or `analyze the current project first` to your agent all week.
 
@@ -53,12 +53,12 @@ $ agbox inbox
 
   Promotion Inbox · 3 candidates
   ───────────────────────────────────────────────
-  ●  use-bun-not-npm        seen 7×    confidence  high
-  ●  pr-summary-format      seen 4×    confidence  med
-  ○  conventional-commits   seen 3×    confidence  low
+  -  use-bun-not-npm        seen 7x    confidence  high
+  -  pr-summary-format      seen 4x    confidence  med
+  -  conventional-commits   seen 3x    confidence  low
 
-  → agbox evidence use-bun-not-npm     see why it's a candidate
-  → agbox approve  use-bun-not-npm     promote it to a skill
+  > agbox evidence use-bun-not-npm     see why it's a candidate
+  > agbox approve  use-bun-not-npm     promote it to a skill
 ```
 
 You review the evidence, approve it, and agbox writes the rule into the files your
@@ -66,10 +66,10 @@ agents already read — so the workflow sticks, across every agent.
 
 ```console
 $ agbox approve use-bun-not-npm --name package-manager
-✓ promoted → approved
+promoted -> approved
 
 $ agbox export use-bun-not-npm --target claude
-✓ wrote CLAUDE.md  (wrapped in an agbox:start/end block, backup saved)
+wrote CLAUDE.md  (wrapped in an agbox:start/end block, backup saved)
   undo anytime:  agbox export rollback <export-id>
 ```
 
@@ -77,7 +77,7 @@ That's the whole product: **stop repeating yourself to your AI.**
 
 ---
 
-## 🚀 Quick start
+## Quick start
 
 > **Platform:** `@agboxhq/cli` on npm is **macOS Apple Silicon (arm64) only** today.
 > Intel Mac, Linux, and Homebrew are on the roadmap. Other platforms: clone and `go install` from source.
@@ -103,7 +103,9 @@ Then just work:
 ```bash
 # 1. Code like you always do. Correct your agent or repeat workflow prompts like you always do.
 #    agbox watches session files in the background.
-#    Managed hooks only propose skills and acknowledge created skill files.
+#    Managed hooks propose skills and acknowledge created skill files.
+#    If a hook misses a SKILL.md write, agbox reconciles files with agbox_candidate_id
+#    when you run status, beta, doctor, or sync.
 
 # 2. See setup + candidates in one terminal-safe summary
 agbox beta                      # best first beta command
@@ -118,7 +120,7 @@ agbox doctor                    # full health check
 
 ---
 
-## 🎁 What you get
+## What you get
 
 ### See *why* a correction or prompt became a candidate — before anything touches your config
 
@@ -139,7 +141,7 @@ $ agbox evidence use-bun-not-npm
   Suggested rule
     Always use bun as the package manager. Never use npm.
   ─────────────────────────────────────────────
-  → agbox approve use-bun-not-npm --name package-manager
+  > agbox approve use-bun-not-npm --name package-manager
 ```
 
 No black box. Every candidate is a readable **Evidence Card** you can trust or reject.
@@ -151,20 +153,20 @@ $ agbox impact use-bun-not-npm
 
   Repeat corrections · before vs after promotion
   ───────────────────────────────────────────────
-  use-bun-not-npm     7  →  0     ✓ stopped recurring
+  use-bun-not-npm     7  ->  0    stopped recurring
 ```
 
 > Output above is illustrative — run `agbox demo` to see the real thing end to end.
 
 ---
 
-## 🧩 How it works
+## How it works
 
 agbox keeps a tiny, local store in your home directory — like `.git/`, but for the
 workflows your agents keep forgetting.
 
 ```
-  ingest     →    cluster    →    review      →    export
+  ingest     ->   cluster    ->   review      ->   export
  ┌────────┐      ┌────────┐      ┌─────────┐      ┌──────────────┐
  │watcher │      │ scan   │      │ review  │      │ CLAUDE.md    │
  │ session│ ───▶ │ group  │ ───▶ │ approve │ ───▶ │ AGENTS.md    │
@@ -194,23 +196,23 @@ rules). agbox never silently installs a detected workflow.
 
 ---
 
-## ✨ Features
+## Features
 
 | | |
 |---|---|
-| 📥 **Automatic ingest** | A background watcher reads Claude Code, Codex, Cursor, and Grok session files. No manual commits, no copy-paste-into-a-fresh-chat. |
-| 💬 **In-context proposals** | Managed hooks can ask before creating a skill when agbox finds a repeated correction or recurring prompt pattern. Remove them with `agbox disconnect <agent>`. |
-| 🧮 **Smart clustering** | Repeated instructions get normalized, grouped, and confidence-scored — directional prefs like `bun-over-npm` included. |
-| 👀 **Beta summary + Review TUI** | `agbox beta` gives a terminal-safe summary; `agbox review` drills into evidence, approval, and export. |
-| 📤 **Vendor-neutral export** | One skill → `CLAUDE.md`, `AGENTS.md`, Cursor, Cline. Promote once, every agent obeys. |
-| ↩️ **Always reversible** | Every export is backed up and wrapped in markers. `agbox export rollback` undoes it cleanly. |
-| 🔒 **Local-first & private** | Sessions and workflow data stay in `~/.agbox/`. Redacted excerpts + hashes by default — raw prompts stay local. Anonymous usage counters only (opt-out: `agbox telemetry off`). |
-| 📊 **Impact tracking** | `agbox impact` shows repeat-correction counts before vs after. Proof, not vibes. |
-| 🧾 **Audit & doctor** | `agbox audit` produces a shareable report; `agbox doctor` checks your setup. |
+| **Automatic ingest** | A background watcher reads Claude Code, Codex, Cursor, and Grok session files. No manual commits, no copy-paste-into-a-fresh-chat. |
+| **In-context proposals** | Managed hooks can ask before creating a skill when agbox finds a repeated correction or recurring prompt pattern. If hook acknowledgement misses the write, agbox reconciles existing `SKILL.md` files containing `agbox_candidate_id`. Remove hooks with `agbox disconnect <agent>`. |
+| **Smart clustering** | Repeated instructions get normalized, grouped, and confidence-scored — directional prefs like `bun-over-npm` included. |
+| **Beta summary + Review TUI** | `agbox beta` gives a terminal-safe summary; `agbox review` drills into evidence, approval, and export. |
+| **Vendor-neutral export** | One skill -> `CLAUDE.md`, `AGENTS.md`, Cursor, Cline. Promote once, every agent obeys. |
+| **Always reversible** | Every export is backed up and wrapped in markers. `agbox export rollback` undoes it cleanly. |
+| **Local-first & private** | Sessions and workflow data stay in `~/.agbox/`. Redacted excerpts + hashes by default — raw prompts stay local. Anonymous usage counters only (opt-out: `agbox telemetry off`). |
+| **Impact tracking** | `agbox impact` shows repeat-correction counts before vs after. Proof, not vibes. |
+| **Audit & doctor** | `agbox audit` produces a shareable report; `agbox doctor` checks your setup. |
 
 ---
 
-## 🔌 Works with
+## Works with
 
 agbox is **vendor-neutral by design.** It ingests from the agents you already run and
 exports to the formats they already read.
@@ -226,7 +228,7 @@ One workflow signal, promoted once, lands everywhere your agents look.
 
 ---
 
-## 🔒 Privacy & local-first
+## Privacy & Local-First
 
 agbox touches your prompts and your config files. That trust is the product, so:
 
@@ -251,13 +253,13 @@ agbox touches your prompts and your config files. That trust is the product, so:
 
 ---
 
-## 🤔 Why agbox exists
+## Why agbox Exists
 
 AI agents are brilliant and forgetful. You correct the same thing every session:
 
 - *"use bun, not npm"*
 - *"tests go in `__tests__`, not next to the file"*
-- *"summary → tests → risk, in that order, in every PR"*
+- *"summary -> tests -> risk, in that order, in every PR"*
 - *"analyze the current project before recommending changes"*
 
 Today that knowledge lives in your head and your patience. You either re-type it forever,
@@ -272,7 +274,7 @@ files shipped — repetition eliminated.
 
 ---
 
-## 📟 Command reference
+## Command Reference
 
 ```text
 agbox init [--quiet]                initialize ~/.agbox/, install watcher + managed hooks, ingest sessions
@@ -294,7 +296,7 @@ agbox evidence <id>                 explain why a candidate exists
 agbox approve <id> [--name …]       move a candidate to approved
 agbox reject  <id>                  reject a candidate
 agbox snooze  <id>                  snooze a promotion candidate (24h)
-agbox accept  <id> [--skill-path …] mark accepted after SKILL.md creation
+agbox accept  <id> [--skill-path …] mark accepted after SKILL.md creation (usually automatic when SKILL.md has agbox_candidate_id)
 agbox compile <id> [--target …]     render an approved skill (no write)
 agbox export  <id>… [--target …]    dry-run or apply an export plan (by candidate id)
 agbox export rollback <export-id>   restore the file backup for an export
@@ -318,7 +320,7 @@ Run `agbox <command> --help` for command-specific options.
 
 ---
 
-## 🛠️ Development
+## Development
 
 ```bash
 git clone https://github.com/qyinm/agbox
@@ -332,17 +334,17 @@ workflow, or pushing a `v*` tag).
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 agbox is Go, local-first, and small enough to read in an afternoon. Issues, ideas, and
 PRs are all welcome — [open an issue](https://github.com/qyinm/agbox/issues) to start.
 
-## 📄 License
+## License
 
 [MIT](LICENSE) © qyinm
 
 ---
 
 <div align="center">
-  <sub>Built for people who tell their agents the same thing twice. ⌘</sub>
+  <sub>Built for people who tell their agents the same thing twice.</sub>
 </div>
