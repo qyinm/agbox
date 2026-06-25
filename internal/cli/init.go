@@ -87,6 +87,9 @@ project: .agbox/
 	} else {
 		fmt.Fprintf(stdout, "initial ingest: %d corrections\n\n", syncResult.Ingested)
 	}
+	if syncResult.AcceptedSkills > 0 {
+		fmt.Fprintf(stdout, "accepted existing skills: %d\n\n", syncResult.AcceptedSkills)
+	}
 	fmt.Fprintln(stdout, `Next steps:
   agbox beta              # See setup + candidates in one terminal summary
   agbox doctor            # Check watcher + managed proposal hooks

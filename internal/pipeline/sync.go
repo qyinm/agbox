@@ -10,8 +10,9 @@ import (
 )
 
 type BestEffortSyncResult struct {
-	Ingested int
-	Warning  error
+	Ingested       int
+	Warning        error
+	AcceptedSkills int
 }
 
 func SyncAll(s *store.Store) (int, error) {
@@ -23,6 +24,9 @@ func SyncAll(s *store.Store) (int, error) {
 		return n, err
 	}
 	if err := propose.PromoteAfterScan(s); err != nil {
+		return n, err
+	}
+	if _, err := propose.ReconcileAcceptedSkills(s); err != nil {
 		return n, err
 	}
 	return n, nil
@@ -37,6 +41,11 @@ func SyncBestEffort(s *store.Store) (BestEffortSyncResult, error) {
 	if err := propose.PromoteAfterScan(s); err != nil {
 		return result, err
 	}
+	reconcileResult, err := propose.ReconcileAcceptedSkills(s)
+	if err != nil {
+		return result, err
+	}
+	result.AcceptedSkills = reconcileResult.Accepted
 	return result, nil
 }
 
@@ -58,7 +67,11 @@ func SyncBestEffortIfStale(s *store.Store) (BestEffortSyncResult, error) {
 		return BestEffortSyncResult{}, err
 	}
 	if !lastSync.IsZero() && time.Since(lastSync) < 5*time.Minute {
-		return BestEffortSyncResult{}, nil
+		reconcileResult, err := propose.ReconcileAcceptedSkills(s)
+		if err != nil {
+			return BestEffortSyncResult{}, err
+		}
+		return BestEffortSyncResult{AcceptedSkills: reconcileResult.Accepted}, nil
 	}
 	return SyncBestEffort(s)
 }

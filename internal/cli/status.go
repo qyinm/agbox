@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/hippoom/agbox/internal/propose"
 	"github.com/hippoom/agbox/internal/store"
 	"github.com/hippoom/agbox/internal/watcher"
 )
@@ -25,6 +26,10 @@ func runStatus(s *store.Store, stdout io.Writer) error {
 		state = "installed (not running)"
 	}
 
+	reconcileResult, err := propose.ReconcileAcceptedSkills(s)
+	if err != nil {
+		return err
+	}
 	stats, err := s.Stats()
 	if err != nil {
 		return err
@@ -44,6 +49,9 @@ func runStatus(s *store.Store, stdout io.Writer) error {
 	fmt.Fprintf(stdout, "last sync: %s\n", formatLastSync(lastSync))
 	fmt.Fprintf(stdout, "corrections: %d\n", corrections)
 	fmt.Fprintf(stdout, "candidates: %d\n", stats.Candidates)
+	if reconcileResult.Accepted > 0 {
+		fmt.Fprintf(stdout, "accepted skills: %d reconciled\n", reconcileResult.Accepted)
+	}
 	fmt.Fprintf(stdout, "events: %d\n", stats.Events)
 	fmt.Fprintf(stdout, "exports: %d\n", stats.Exports)
 	return nil

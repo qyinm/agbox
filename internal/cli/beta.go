@@ -68,6 +68,9 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 	} else {
 		fmt.Fprintf(stdout, "  sync: ok (%d new corrections)\n", ingested)
 	}
+	if syncResult.AcceptedSkills > 0 {
+		fmt.Fprintf(stdout, "  skills: accepted %d existing skill file(s)\n", syncResult.AcceptedSkills)
+	}
 	if *limit == 0 {
 		fmt.Fprintln(stdout)
 		fmt.Fprintln(stdout, "Candidate display disabled by --limit 0.")

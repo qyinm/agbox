@@ -22,6 +22,7 @@ import (
 	"github.com/hippoom/agbox/internal/impact"
 	"github.com/hippoom/agbox/internal/manifest"
 	"github.com/hippoom/agbox/internal/model"
+	"github.com/hippoom/agbox/internal/propose"
 	"github.com/hippoom/agbox/internal/scan"
 	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/session/claude"
@@ -464,6 +465,9 @@ func printDiscoverNext(stdout io.Writer) {
 func runEvidence(s *store.Store, args []string, stdout io.Writer) error {
 	if len(args) == 0 {
 		return errors.New("usage: agbox evidence <candidate-id>")
+	}
+	if _, err := propose.ReconcileAcceptedSkills(s); err != nil {
+		return err
 	}
 	card, err := evidence.Build(s, args[0])
 	if err != nil {

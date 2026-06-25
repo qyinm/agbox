@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/hippoom/agbox/internal/connect"
+	"github.com/hippoom/agbox/internal/propose"
 	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/store"
 	"github.com/hippoom/agbox/internal/telemetry"
@@ -36,6 +37,12 @@ func Run(s *store.Store) Report {
 	}
 	r.Lines = append(r.Lines, fmt.Sprintf("candidates: %d", stats.Candidates))
 	r.Lines = append(r.Lines, fmt.Sprintf("exports: %d", stats.Exports))
+	if reconcileResult, err := propose.ReconcileAcceptedSkills(s); err != nil {
+		r.Lines = append(r.Lines, "skills: FAIL "+err.Error())
+		r.OK = false
+	} else if reconcileResult.Accepted > 0 {
+		r.Lines = append(r.Lines, fmt.Sprintf("skills: accepted %d existing skill file(s)", reconcileResult.Accepted))
+	}
 	r.Lines = append(r.Lines, telemetry.StatusLine())
 
 	home, err := os.UserHomeDir()

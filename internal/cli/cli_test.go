@@ -303,6 +303,73 @@ func TestStatusFreshHomeShowsZeroCounts(t *testing.T) {
 	}
 }
 
+func TestStatusReconcilesExistingSkillFile(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "agbox.db")
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", dbPath)
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(wd)
+
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	c := model.Candidate{
+		ID:          "cand_status123",
+		Fingerprint: "fp_status123",
+		Name:        "status-skill",
+		State:       model.CandidateProposed,
+		EventCount:  3,
+		ProposedAt:  now,
+		FirstSeen:   now,
+		LastSeen:    now,
+		UpdatedAt:   now,
+	}
+	if err := s.UpsertCandidate(c, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	skillDir := filepath.Join(root, ".agents", "skills", "status-skill")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: status-skill\nagbox_candidate_id: cand_status123\n---\nbody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := Execute([]string{"status"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "accepted skills: 1 reconciled") {
+		t.Fatalf("status output missing reconcile line:\n%s", out.String())
+	}
+
+	s, err = store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	got, err := s.GetCandidate(c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != model.CandidateAccepted {
+		t.Fatalf("state = %s, want accepted", got.State)
+	}
+}
+
 func TestDoctorFreshHomeShowsRepairGuidance(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
