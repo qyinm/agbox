@@ -98,6 +98,7 @@ func canReconcileToAccepted(state model.CandidateState) bool {
 	case model.CandidatePending,
 		model.CandidateProposalReady,
 		model.CandidateProposed,
+		model.CandidateSaveSuggested,
 		model.CandidateSnoozed,
 		model.CandidateApproved:
 		return true

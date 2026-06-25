@@ -142,7 +142,10 @@ func (s *Store) migrate() error {
 	if err := migrateV4(s.db); err != nil {
 		return err
 	}
-	return migrateV5(s.db)
+	if err := migrateV5(s.db); err != nil {
+		return err
+	}
+	return migrateV6(s.db)
 }
 
 func (s *Store) TableExists(name string) bool {
@@ -437,6 +440,71 @@ func (s *Store) ListCandidatesByState(states ...model.CandidateState) ([]model.C
 	return out, rows.Err()
 }
 
+func (s *Store) RecordReplayApplication(app model.ReplayApplication) (model.ReplayApplication, error) {
+	c, err := s.GetCandidate(app.CandidateID)
+	if err != nil {
+		return model.ReplayApplication{}, err
+	}
+	now := time.Now()
+	if app.ID == "" {
+		app.ID = replayApplicationID(app.CandidateID, now)
+	}
+	if app.AppliedAt.IsZero() {
+		app.AppliedAt = now
+	}
+	if app.CreatedAt.IsZero() {
+		app.CreatedAt = now
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return model.ReplayApplication{}, err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`INSERT INTO replay_applications
+		(id, candidate_id, agent, project, prompt_hash, prompt_excerpt, applied_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		app.ID, app.CandidateID, app.Agent, app.Project, app.PromptHash, app.PromptExcerpt,
+		formatTime(app.AppliedAt), formatTime(app.CreatedAt)); err != nil {
+		return model.ReplayApplication{}, err
+	}
+	if canMarkAppliedOnce(c.State) {
+		if _, err := tx.Exec(`UPDATE candidates SET state = ?, version = version + 1, updated_at = ? WHERE id = ?`,
+			model.CandidateAppliedOnce, formatTime(now), app.CandidateID); err != nil {
+			return model.ReplayApplication{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return model.ReplayApplication{}, err
+	}
+	return app, nil
+}
+
+func (s *Store) ListReplayApplications(candidateID string) ([]model.ReplayApplication, error) {
+	query := `SELECT id, candidate_id, agent, project, prompt_hash, prompt_excerpt, applied_at, created_at FROM replay_applications`
+	var args []any
+	if strings.TrimSpace(candidateID) != "" {
+		query += ` WHERE candidate_id = ?`
+		args = append(args, candidateID)
+	}
+	query += ` ORDER BY applied_at DESC, created_at DESC`
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.ReplayApplication
+	for rows.Next() {
+		app, err := scanReplayApplication(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, app)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) CreateExport(e model.ExportRecord) error {
 	_, err := s.db.Exec(`INSERT INTO exports
 		(id, candidate_id, target, path, status, plan_json, backup_path, before_hash, after_hash, applied_at, rolled_back_at, created_at)
@@ -518,6 +586,15 @@ func scanCandidate(scanner interface{ Scan(dest ...any) error }) (model.Candidat
 	return c, err
 }
 
+func scanReplayApplication(scanner interface{ Scan(dest ...any) error }) (model.ReplayApplication, error) {
+	var app model.ReplayApplication
+	var applied, created string
+	err := scanner.Scan(&app.ID, &app.CandidateID, &app.Agent, &app.Project, &app.PromptHash, &app.PromptExcerpt, &applied, &created)
+	app.AppliedAt = parseTime(applied)
+	app.CreatedAt = parseTime(created)
+	return app, err
+}
+
 func scanExport(scanner interface{ Scan(dest ...any) error }) (model.ExportRecord, error) {
 	var e model.ExportRecord
 	var status, applied, rolled, created string
@@ -549,4 +626,24 @@ func boolInt(v bool) int {
 		return 1
 	}
 	return 0
+}
+
+func replayApplicationID(candidateID string, t time.Time) string {
+	base := strings.TrimPrefix(candidateID, "cand_")
+	if base == "" {
+		base = "unknown"
+	}
+	return fmt.Sprintf("rapp_%s_%d", base, t.UnixNano())
+}
+
+func canMarkAppliedOnce(state model.CandidateState) bool {
+	switch state {
+	case model.CandidatePending,
+		model.CandidateProposalReady,
+		model.CandidateProposed,
+		model.CandidateAppliedOnce:
+		return true
+	default:
+		return false
+	}
 }

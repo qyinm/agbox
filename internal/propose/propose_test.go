@@ -381,6 +381,53 @@ func TestReconcileAcceptedSkillsFindsExistingRepoSkill(t *testing.T) {
 	}
 }
 
+func TestReconcileAcceptedSkillsAcceptsSaveSuggestedCandidate(t *testing.T) {
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now()
+	c := model.Candidate{
+		ID:          "cand_save123456",
+		Fingerprint: "fp_save123456",
+		Name:        "test-skill",
+		State:       model.CandidateSaveSuggested,
+		EventCount:  3,
+		FirstSeen:   now,
+		LastSeen:    now,
+		UpdatedAt:   now,
+	}
+	if err := s.UpsertCandidate(c, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	skillDir := filepath.Join(dir, ".agents", "skills", "test-skill")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: test\nagbox_candidate_id: cand_save123456\n---\nbody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := propose.ReconcileAcceptedSkillsInRoots(s, []string{filepath.Join(dir, ".agents", "skills")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Accepted != 1 {
+		t.Fatalf("accepted = %d, want 1", result.Accepted)
+	}
+	got, err := s.GetCandidate(c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != model.CandidateAccepted {
+		t.Fatalf("state = %s, want accepted", got.State)
+	}
+}
+
 func TestReconcileAcceptedSkillsDoesNotReviveRejectedCandidate(t *testing.T) {
 	dir := t.TempDir()
 	s, err := store.Open(filepath.Join(dir, "agbox.db"))
