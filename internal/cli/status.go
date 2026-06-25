@@ -48,7 +48,7 @@ func runStatus(s *store.Store, stdout io.Writer) error {
 	fmt.Fprintf(stdout, "store: %s\n", stats.Path)
 	fmt.Fprintf(stdout, "last sync: %s\n", formatLastSync(lastSync))
 	fmt.Fprintf(stdout, "corrections: %d\n", corrections)
-	fmt.Fprintf(stdout, "candidates: %d\n", stats.Candidates)
+	fmt.Fprintf(stdout, "recorded workflows: %d\n", stats.Candidates)
 	if reconcileResult.Accepted > 0 {
 		fmt.Fprintf(stdout, "accepted skills: %d reconciled\n", reconcileResult.Accepted)
 	}

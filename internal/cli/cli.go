@@ -223,7 +223,7 @@ func runScan(s *store.Store, args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "scanned %d signals, found %d candidates\n", result.Scanned, len(result.Candidates))
+	fmt.Fprintf(stdout, "scanned %d signals, found %d recorded workflows\n", result.Scanned, len(result.Candidates))
 	for _, c := range result.Candidates {
 		fmt.Fprintf(stdout, "%s  %s  repeats=%d confidence=%s state=%s\n", c.ID, c.Name, c.EventCount, c.Confidence, c.State)
 	}
@@ -288,8 +288,8 @@ func runDiscover(s *store.Store, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("discover", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	minRepeats := fs.Int("min-repeats", 2, "minimum repeated signals")
-	state := fs.String("state", string(model.CandidatePending), "candidate state filter, or all")
-	limit := fs.Int("limit", 5, "maximum candidates to show")
+	state := fs.String("state", string(model.CandidatePending), "Recorded Workflow state filter, or all")
+	limit := fs.Int("limit", 5, "maximum workflows to show")
 	if err := fs.Parse(reorderFlags(args, map[string]bool{"min-repeats": true, "state": true, "limit": true})); err != nil {
 		return err
 	}
@@ -312,16 +312,16 @@ func runDiscover(s *store.Store, args []string, stdout io.Writer) error {
 		candidates = candidates[:*limit]
 	}
 	if len(candidates) == 0 {
-		fmt.Fprintf(stdout, "No workflow candidates yet.\nscanned %d signals, found %d repeated signals\n", result.Scanned, len(result.Candidates))
+		fmt.Fprintf(stdout, "No Recorded Workflows yet.\nscanned %d signals, found %d repeated signals\n", result.Scanned, len(result.Candidates))
 		if result.Scanned == 0 {
 			fmt.Fprintln(stdout, "agbox has not ingested any workflow signals in this store.")
 		} else {
-			fmt.Fprintf(stdout, "Capture at least %d matching prompts before a candidate appears.\n", normalizedMinRepeats(*minRepeats))
+			fmt.Fprintf(stdout, "Capture at least %d matching prompts before a Recorded Workflow appears.\n", normalizedMinRepeats(*minRepeats))
 		}
 		printDiscoverNext(stdout)
 		return nil
 	}
-	fmt.Fprintf(stdout, "Workflow candidates\nscanned %d signals, found %d repeated signals, showing %d %s candidates\n",
+	fmt.Fprintf(stdout, "Recorded Workflows\nscanned %d signals, found %d repeated signals, showing %d %s workflows\n",
 		result.Scanned, len(result.Candidates), len(candidates), displayState(stateFilter))
 	for i, c := range candidates {
 		card, err := evidence.Build(s, c.ID)
@@ -347,7 +347,7 @@ func runReview(args []string, stdin io.Reader, stdout io.Writer) error {
 	fs.SetOutput(io.Discard)
 	state := fs.String("state", string(model.CandidatePending), "candidate state filter, or all")
 	minRepeats := fs.Int("min-repeats", 2, "minimum repeated signals")
-	limit := fs.Int("limit", 20, "maximum candidates to show")
+	limit := fs.Int("limit", 20, "maximum workflows to show")
 	if err := fs.Parse(reorderFlags(args, map[string]bool{"state": true, "min-repeats": true, "limit": true})); err != nil {
 		return err
 	}
@@ -472,6 +472,7 @@ func runDemo(stdout io.Writer) error {
 	fmt.Fprintln(stdout, "\nNo files were changed; this demo used a temporary local store.")
 	fmt.Fprintln(stdout, "Use this on your own agent sessions:")
 	fmt.Fprintln(stdout, "  agbox beta")
+	fmt.Fprintln(stdout, "  agbox inbox")
 	fmt.Fprintln(stdout, "  agbox review")
 	fmt.Fprintln(stdout, "  agbox status")
 	return nil
@@ -494,9 +495,9 @@ func displayState(state string) string {
 func printDiscoverNext(stdout io.Writer) {
 	fmt.Fprintln(stdout, "\nNext")
 	fmt.Fprintln(stdout, "1. Work normally in Claude, Codex, Cursor, or Grok.")
-	fmt.Fprintln(stdout, "2. agbox beta              # see setup + curated candidates in one terminal summary")
+	fmt.Fprintln(stdout, "2. agbox inbox             # review Recorded Workflow cards and replay plans")
 	fmt.Fprintln(stdout, "3. agbox status            # confirm watcher is collecting")
-	fmt.Fprintln(stdout, "4. agbox review            # review candidates with evidence")
+	fmt.Fprintln(stdout, "4. agbox review            # drill into evidence in the TUI")
 	fmt.Fprintln(stdout, "\nWant to see the loop without touching your data? Run `agbox demo`.")
 }
 
@@ -616,7 +617,7 @@ func runExport(s *store.Store, args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(stdout, "exported %s candidate=%s target=%s path=%s\n", rec.ID, c.ID, rec.Target, rec.Path)
+		fmt.Fprintf(stdout, "exported %s workflow=%s target=%s path=%s\n", rec.ID, c.ID, rec.Target, rec.Path)
 		fmt.Fprintf(stderr, "undo: agbox export rollback %s\n", rec.ID)
 	}
 	return nil
@@ -645,7 +646,7 @@ func runImpact(s *store.Store, args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "candidate=%s before=%d after=%d reduction=%d confidence=%s\n%s\n",
+	fmt.Fprintf(stdout, "workflow=%s before=%d after=%d reduction=%d confidence=%s\n%s\n",
 		meter.CandidateID, meter.Before, meter.After, meter.Reduction, meter.Confidence, meter.Window)
 	return nil
 }
@@ -789,20 +790,21 @@ func defaultProject() string {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, `agbox turns repeated AI-agent workflow signals into reusable skills.
+	fmt.Fprintln(w, `agbox records and replays repeated AI-agent workflows.
 
 Usage:
   agbox init
   agbox capture [--source manual] [--agent codex] "Use bun, not npm"
   agbox scan
-  agbox inbox [--state pending]
+  agbox inbox [--state pending|proposal_ready|proposed|applied_once|save_suggested|accepted|snoozed|approved|rejected|exported|all]
   agbox evidence <candidate-id>
+  agbox apply <candidate-id> [--agent codex] [--project name]
   agbox approve <candidate-id> [--name api-change-workflow]
   agbox compile <candidate-id> [--target agents-md|claude|codex|cursor|cline]
   agbox export [candidate-id...] [--target agents-md] [--dry-run]
   agbox export rollback <export-id>
-  agbox discover [--min-repeats 2] [--state pending|proposal_ready|proposed|accepted|snoozed|approved|rejected|exported|all] [--limit 5]
-  agbox review [--state pending|proposal_ready|proposed|accepted|snoozed|approved|rejected|exported|all] [--min-repeats 2] [--limit 20]
+  agbox discover [--min-repeats 2] [--state pending|proposal_ready|proposed|applied_once|save_suggested|accepted|snoozed|approved|rejected|exported|all] [--limit 5]
+  agbox review [--state pending|proposal_ready|proposed|applied_once|save_suggested|accepted|snoozed|approved|rejected|exported|all] [--min-repeats 2] [--limit 20]
   agbox beta [--limit 5] [--sync]
   agbox demo
   agbox impact <candidate-id>
@@ -863,31 +865,31 @@ Options:
   --raw            Store redacted raw text
   --no-excerpt     Store hash and metadata only`,
 	"discover": `Usage:
-  agbox discover [--min-repeats 2] [--state pending|proposal_ready|proposed|accepted|snoozed|approved|rejected|exported|all] [--limit 5]
+  agbox discover [--min-repeats 2] [--state pending|proposal_ready|proposed|applied_once|save_suggested|accepted|snoozed|approved|rejected|exported|all] [--limit 5]
 
-Scan captured events and show reviewable workflow candidates with next actions.
+Scan captured events and show reviewable workflow signals with next actions.
 
 Options:
   --min-repeats n  Minimum repeated signals. Default: 2
-  --state state    Candidate state filter, or all. Default: pending
-  --limit n        Maximum candidates to show. Default: 5`,
+  --state state    Recorded Workflow state filter, or all. Default: pending
+  --limit n        Maximum workflows to show. Default: 5`,
 	"review": `Usage:
-  agbox review [--state pending|proposal_ready|proposed|accepted|snoozed|approved|rejected|exported|all] [--min-repeats 2] [--limit 20]
+  agbox review [--state pending|proposal_ready|proposed|applied_once|save_suggested|accepted|snoozed|approved|rejected|exported|all] [--min-repeats 2] [--limit 20]
 
-Open the interactive review UI for workflow candidates.
+Open the interactive review UI for Recorded Workflows.
 
 Options:
-  --state state    Candidate state filter, or all. Default: pending
+  --state state    Recorded Workflow state filter, or all. Default: pending
   --min-repeats n  Minimum repeated signals. Default: 2
-  --limit n        Maximum candidates to show. Default: 20`,
+  --limit n        Maximum workflows to show. Default: 20`,
 	"beta": `Usage:
   agbox beta [--limit 5] [--sync]
 
-Show setup health and curated repeated workflow candidates in a terminal-safe beta summary.
+Show setup health and a curated Recorded Workflow summary.
 
 Options:
-  --limit n        Maximum candidates to show. Default: 5
-  --sync           Force session ingest before showing candidates`,
+  --limit n        Maximum workflows to show. Default: 5
+  --sync           Force session ingest before showing workflows`,
 	"demo": `Usage:
   agbox demo
 
@@ -900,42 +902,52 @@ Scan captured events for repeated workflow signals.
 Options:
   --min-repeats n  Minimum repeated signals. Default: 2`,
 	"inbox": `Usage:
-  agbox inbox [--state pending]
+  agbox inbox [--state pending|proposal_ready|proposed|applied_once|save_suggested|accepted|snoozed|approved|rejected|exported|all]
 
-List workflow candidates in the promotion inbox.
+Show Recorded Workflow cards with replay plans and safe next actions.
 
 Options:
-  --state state    Candidate state filter`,
+  --state state    Recorded Workflow state filter, or all`,
 	"evidence": `Usage:
   agbox evidence <candidate-id>
 
-Show evidence, privacy status, and excerpts for a workflow candidate.`,
+Show evidence, privacy status, and excerpts for a Recorded Workflow.`,
+	"apply": `Usage:
+  agbox apply <candidate-id> [--agent agent] [--project project] [--prompt-hash hash] [--prompt-excerpt text]
+
+Record that a replay plan was applied once for the current request.
+
+Options:
+  --agent name       Agent that applied the replay
+  --project name     Project where replay was applied
+  --prompt-hash hash Hash of the matched prompt
+  --prompt-excerpt text Redacted prompt excerpt`,
 	"approve": `Usage:
   agbox approve <candidate-id> [--name workflow-name]
 
-Approve a workflow candidate for export.
+Approve a Recorded Workflow for export.
 
 Options:
-  --name name      Candidate skill name`,
+  --name name      Workflow name`,
 	"reject": `Usage:
   agbox reject <candidate-id>
 
-Reject a skill promotion candidate (7-day cooldown).`,
+Reject a Recorded Workflow (7-day cooldown).`,
 	"snooze": `Usage:
   agbox snooze <candidate-id>
 
-Snooze a skill promotion candidate (24-hour cooldown).`,
+Snooze a Recorded Workflow (24-hour cooldown).`,
 	"accept": `Usage:
   agbox accept <candidate-id> [--skill-path path]
 
-Mark a candidate as accepted after SKILL.md creation.
+Mark a Recorded Workflow as saved for future after approved SKILL.md creation.
 
 Options:
   --skill-path path  Path to created SKILL.md`,
 	"connect": `Usage:
   agbox connect <claude|codex|grok> [--command path] [--project]
 
-Install agbox managed hooks for an agent.
+Install agbox managed workflow hooks for an agent.
 
 Options:
   --command path   Absolute path to agbox binary
@@ -943,19 +955,21 @@ Options:
 	"disconnect": `Usage:
   agbox disconnect <claude|codex|grok> [--project]
 
-Remove agbox managed hooks for an agent.
+Remove agbox managed workflow hooks for an agent.
 
 Options:
   --project        Remove project-scoped hooks (grok only)`,
 	"hook": `Usage:
   agbox hook propose <claude|codex|grok>
+  agbox hook replay <claude|codex|grok>
+  agbox hook save <claude|codex|grok>
   agbox hook acknowledge <claude|codex|grok>
 
 Hook entrypoints used by agent hook configs. Reads JSON from stdin.`,
 	"compile": `Usage:
   agbox compile <candidate-id> [--target agents-md|claude|codex|cursor|cline]
 
-Render an approved workflow candidate for a target agent format.
+Render an approved Recorded Workflow for a target agent format.
 
 Options:
   --target target  Output format. Default: agents-md`,
@@ -963,7 +977,7 @@ Options:
   agbox export [candidate-id...] [--target agents-md] [--path relative/path] [--dry-run]
   agbox export rollback <export-id>
 
-Export approved workflow candidates or roll back an export.
+Export approved Recorded Workflows or roll back an export.
 
 Options:
   --target target  Export target. Default: agents-md
@@ -976,7 +990,7 @@ Verify exported agbox manifest state for the current project.`,
 	"impact": `Usage:
   agbox impact <candidate-id>
 
-Show before/after recurrence counts for an exported workflow candidate.`,
+Show before/after recurrence counts for an exported Recorded Workflow.`,
 	"audit": `Usage:
   agbox audit [--profile private|shareable|client] [--out audit.md]
 

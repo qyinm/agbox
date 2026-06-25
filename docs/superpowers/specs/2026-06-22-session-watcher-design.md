@@ -5,10 +5,18 @@
 **Scope:** agbox CLI pivot from hook-based prompt capture to automatic session-level ingestion
 
 > 2026-06-23 update: the current beta keeps the session watcher pivot, but managed
-> proposal hooks are back in scope for in-agent skill suggestions and skill-file
+> workflow hooks are back in scope for in-agent suggestions and skill-file
 > acknowledgement. Hook-based prompt capture remains out of scope. Sections below
 > that say hook commands are removed are superseded by the beta aha loop plan in
 > `docs/plans/2026-06-23-001-feat-beta-aha-loop-plan.md`.
+>
+> 2026-06-25 update: the primary product surface is now Recorded Workflows.
+> `agbox inbox` shows workflow cards and replay plans. Prompt-submit hooks for
+> supported agents can suggest apply-once replay for the current request, while
+> Stop hooks can separately ask whether to save an applied workflow for future
+> use through native `SKILL.md` acknowledgement. Replay remains instruction-only:
+> agbox does not re-run prior commands or create persistent skills without
+> explicit approval.
 
 ---
 
@@ -19,7 +27,7 @@ agbox currently captures user corrections via reversible hooks (`connect` / `hoo
 The core product loop should be:
 
 ```text
-agent action → user correction → repeated pattern → skill promotion
+agent action -> user correction -> repeated pattern -> recorded workflow -> saved workflow
 ```
 
 This causal chain requires session-level analysis, not prompt hooks.
@@ -29,7 +37,7 @@ This causal chain requires session-level analysis, not prompt hooks.
 ## Goals
 
 1. Automatically ingest corrections from Claude Code, Codex, and Cursor session files after `npm install`.
-2. Make `agbox review` the primary user-facing interface.
+2. Make `agbox inbox` the primary user-facing interface, with `agbox review` as the deeper TUI.
 3. Show causal evidence (agent action → user correction) with summary + drill-down.
 4. Integrate export into the review TUI.
 5. Remove hook-based capture from v1.
@@ -50,13 +58,13 @@ This causal chain requires session-level analysis, not prompt hooks.
 | Decision | Choice |
 |----------|--------|
 | Notification model | Quiet accumulation — no push alerts; user pulls via `agbox review` |
-| Primary interface | `agbox review` TUI |
+| Primary interface | `agbox inbox` Recorded Workflow cards; `agbox review` TUI for drill-down |
 | Evidence display | Summary causal chains + `enter` drill-down per occurrence |
 | Export flow | Integrated in TUI via `e` → target picker |
 | Installation | `npm install` postinstall installs watcher; `agbox init` for repair |
 | v1 session sources | Claude Code + Codex + Cursor (build order: Claude → Codex → Cursor) |
 | Store location | Global `~/.agbox/agbox.db` with project filter in review TUI |
-| Hook commands | Removed in v1 (`connect`, `disconnect`, `hook`) |
+| Hook commands | Managed workflow hooks install replay, save-for-future, and acknowledgement entrypoints |
 
 ---
 
@@ -69,12 +77,20 @@ npm install -g @agboxhq/cli
 
 (user codes normally; agbox collects quietly)
 
-agbox review
-  → pending candidates (default filter: current project cwd)
-  → evidence summary: agent action → user correction
-  → enter: drill into one occurrence
-  → a: approve → e: export (target picker)
-  → x: reject
+agbox inbox
+  → Recorded Workflow cards
+  → when it applies + replay plan + evidence + safety note
+  → reject or snooze noisy workflows
+
+prompt-submit hook
+  → match the current user prompt to a Recorded Workflow
+  → ask whether to apply the replay plan for this request only
+  → if yes: agent follows instruction-only replay and runs agbox apply
+
+stop hook
+  → if a workflow was applied once, ask whether to save for future
+  → if yes: create native SKILL.md with agbox_candidate_id
+  → acknowledgement marks the workflow saved for future
 
 agbox doctor          # only when troubleshooting
 agbox init            # reinstall/repair watcher (not required for npm users)
@@ -84,12 +100,12 @@ agbox init            # reinstall/repair watcher (not required for npm users)
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Move between candidates |
+| `j` / `k` | Move between Recorded Workflows |
 | `enter` | Drill into selected occurrence |
 | `esc` | Back to summary |
-| `a` → `y` | Approve candidate |
-| `x` → `y` | Reject candidate |
-| `e` → target | Export approved candidate |
+| `a` → `y` | Approve Recorded Workflow |
+| `x` → `y` | Reject Recorded Workflow |
+| `e` → target | Export approved workflow |
 | `f` | Toggle project filter (current / all) |
 | `r` | Refresh data |
 | `?` | Toggle help |
@@ -118,7 +134,7 @@ correction detector
         ↓
 SQLite (~/.agbox/agbox.db)
         ↓
-scan/cluster → candidates
+scan/cluster -> Recorded Workflows
         ↓
 review TUI (evidence + export)
 ```
@@ -319,7 +335,7 @@ sources:
   codex      ~/.codex/sessions/...                  synced
   cursor     ~/Library/Application Support/Cursor/...  pending
 corrections: 142
-candidates:  8
+recorded workflows: 8
 exports:     3
 ```
 
@@ -336,19 +352,15 @@ exports:     3
 | `agbox status` | Short status: watcher, last sync, candidate count |
 | `agbox sources` | List discovered session source paths |
 | `agbox sync --once` | Debug/recovery: force one ingestion pass |
-| `agbox review` | Primary UX (enhanced) |
-
-### Remove
-
-| Command | Reason |
-|---------|--------|
-| `agbox connect` | Replaced by session watcher |
-| `agbox disconnect` | No hooks to remove |
-| `agbox hook` | Replaced by session adapters |
+| `agbox inbox` | Primary UX: Recorded Workflow cards and replay plans |
+| `agbox review` | Deeper TUI drill-down for evidence, approval, and export |
+| `agbox connect` | Install managed workflow hooks |
+| `agbox disconnect` | Remove managed workflow hooks |
+| `agbox hook` | Managed hook entrypoints for propose, replay, save, and acknowledge |
 
 ### Keep
 
-`capture`, `scan`, `discover`, `inbox`, `evidence`, `approve`, `reject`, `export`, `impact`, `audit`, `doctor`, `demo`, `debug-bundle`, `repair`, `manifest`, `compile`
+`capture`, `scan`, `discover`, `evidence`, `apply`, `approve`, `reject`, `snooze`, `accept`, `export`, `impact`, `audit`, `doctor`, `demo`, `debug-bundle`, `repair`, `manifest`, `compile`
 
 `capture` remains for manual testing only.
 
@@ -368,10 +380,10 @@ exports:     3
 
 ### agbox README
 
-- Quick start: `npm install -g @agboxhq/cli` → `agbox review`
-- Remove all hook/connect references.
+- Quick start: `npm install -g @agboxhq/cli` -> `agbox inbox`
+- Document managed workflow hooks and `AGBOX_SKIP_CONNECT`.
 - Fix store description: global `~/.agbox/agbox.db`, not project `.agbox/index.db`.
-- Update architecture diagram: session watcher → scan → review → export.
+- Update architecture diagram: session watcher -> scan -> replay once -> save for future.
 
 ### npm README
 
@@ -399,11 +411,11 @@ exports:     3
 ## Success Criteria
 
 1. `npm install -g @agboxhq/cli` installs watcher without user action.
-2. After a Claude Code session with a repeated correction, `agbox review` shows a candidate with causal evidence.
-3. User can approve and export from review TUI without leaving the interface.
+2. After repeated prompts or corrections, `agbox inbox` shows a Recorded Workflow with evidence and a replay plan.
+3. Prompt-submit hooks suggest apply-once replay only for matching current prompts.
 4. `agbox doctor` reports watcher health and source sync status.
-5. `go test ./...` passes with hook/connect packages removed.
-6. No hook commands remain in CLI help or README.
+5. `go test ./...` passes with watcher and managed hook packages intact.
+6. CLI help and README describe `apply once` separately from save-for-future SKILL creation.
 
 ---
 
@@ -411,7 +423,7 @@ exports:     3
 
 - [x] All approved UX decisions captured
 - [x] Store location matches code (`~/.agbox/agbox.db`) and supersedes README `.agbox/index.db` claim
-- [x] Hook removal scope explicit
+- [x] Managed hook scope explicit
 - [x] Privacy constraints explicit (no raw transcript in DB)
 - [x] v1 platform scope explicit (macOS arm64)
 - [x] Adapter build order explicit (Claude → Codex → Cursor)

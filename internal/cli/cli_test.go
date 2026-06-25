@@ -96,8 +96,9 @@ func TestInitShowsNextSteps(t *testing.T) {
 		"Next steps:",
 		"managed hooks:",
 		"telemetry: on by default",
-		"agbox beta              # See setup + curated candidates in one terminal summary",
-		"agbox doctor            # Check watcher + managed proposal hooks",
+		"agbox beta              # See setup + recorded workflow summary",
+		"agbox inbox             # Review Recorded Workflows and replay plans",
+		"agbox doctor            # Check watcher + managed workflow hooks",
 		"agbox disconnect <agent>",
 		"agbox status            # Check watcher and sync status",
 		"agbox demo              # See the workflow in action",
@@ -266,6 +267,45 @@ func TestBetaHelpDocumentsSyncFlag(t *testing.T) {
 	}
 }
 
+func TestHelpDocumentsReplayWorkflowCommands(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "agbox.db")
+	t.Setenv("AGBOX_DB", dbPath)
+
+	var out bytes.Buffer
+	if err := Execute([]string{"--help"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"agbox records and replays repeated AI-agent workflows.",
+		"agbox inbox [--state pending|proposal_ready|proposed|applied_once|save_suggested",
+		"agbox apply <candidate-id>",
+		"agbox review [--state pending|proposal_ready|proposed|applied_once|save_suggested",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("root help missing %q:\n%s", want, got)
+		}
+	}
+
+	out.Reset()
+	if err := Execute([]string{"help", "hook"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got = out.String()
+	for _, want := range []string{
+		"agbox hook replay <claude|codex|grok>",
+		"agbox hook save <claude|codex|grok>",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("hook help missing %q:\n%s", want, got)
+		}
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("help opened store: %v", err)
+	}
+}
+
 func TestReviewProposalStateIsValidBeforeTerminalCheck(t *testing.T) {
 	root := t.TempDir()
 	dbPath := filepath.Join(root, "agbox.db")
@@ -318,7 +358,7 @@ func TestStatusFreshHomeShowsZeroCounts(t *testing.T) {
 		"watcher: stopped",
 		"last sync: never",
 		"corrections: 0",
-		"candidates: 0",
+		"recorded workflows: 0",
 		"managed hooks:",
 	} {
 		if !strings.Contains(got, want) {
@@ -458,7 +498,7 @@ func TestBetaEmptyStoreShowsSetupAndDemo(t *testing.T) {
 		"agbox beta",
 		"watcher:",
 		"managed hooks:",
-		"No strong workflow candidates yet.",
+		"No strong Recorded Workflows yet.",
 		"agbox demo",
 		"agbox doctor",
 	} {
@@ -578,7 +618,7 @@ func TestBetaHiddenCandidatesShowNoStrongCandidates(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := out.String()
-	if !strings.Contains(got, "No strong workflow candidates yet.") {
+	if !strings.Contains(got, "No strong Recorded Workflows yet.") {
 		t.Fatalf("beta output missing no-strong-candidates message:\n%s", got)
 	}
 	if strings.Contains(got, "files-mentioned-by-the-user") {
@@ -598,7 +638,7 @@ func TestBetaShowsCandidateCausalEvidenceAndNextAction(t *testing.T) {
 	}
 	got := out.String()
 	for _, want := range []string{
-		"Workflow candidates",
+		"Recorded Workflows",
 		"package-manager-workflow",
 		"state=proposal_ready",
 		"repeats=2",
@@ -933,7 +973,7 @@ func TestBetaLimitZeroDoesNotClaimNoCorrections(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := out.String()
-	if !strings.Contains(got, "Candidate display disabled by --limit 0.") {
+	if !strings.Contains(got, "Recorded Workflow display disabled by --limit 0.") {
 		t.Fatalf("beta limit 0 output missing setup-only copy:\n%s", got)
 	}
 	if strings.Contains(got, "No repeated corrections yet.") {
@@ -956,7 +996,7 @@ func TestDiscoverShowsCandidateEvidenceAndNextCommands(t *testing.T) {
 	}
 	got := out.String()
 	for _, want := range []string{
-		"Workflow candidates",
+		"Recorded Workflows",
 		"repeats=2",
 		"excerpt: Use bun, not npm.",
 		"agbox evidence cand_",
@@ -980,9 +1020,9 @@ func TestDiscoverEmptyShowsHookSetupNextStep(t *testing.T) {
 	}
 	got := out.String()
 	for _, want := range []string{
-		"No workflow candidates yet.",
+		"No Recorded Workflows yet.",
 		"Claude, Codex, Cursor, or Grok",
-		"agbox beta",
+		"agbox inbox",
 		"agbox status",
 		"agbox review",
 		"agbox demo",
@@ -1010,6 +1050,7 @@ func TestDemoShowsPreviewWithoutPersistentStore(t *testing.T) {
 		"evidence:",
 		"No files were changed",
 		"agbox beta",
+		"agbox inbox",
 		"agbox review",
 		"agbox status",
 	} {

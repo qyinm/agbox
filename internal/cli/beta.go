@@ -29,8 +29,8 @@ var betaStatePriority = []model.CandidateState{
 func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("beta", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	limit := fs.Int("limit", 5, "maximum candidates to show")
-	forceSync := fs.Bool("sync", false, "force session ingest before showing candidates")
+	limit := fs.Int("limit", 5, "maximum workflows to show")
+	forceSync := fs.Bool("sync", false, "force session ingest before showing workflows")
 	if err := fs.Parse(reorderFlags(args, map[string]bool{"limit": true})); err != nil {
 		return err
 	}
@@ -73,11 +73,11 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 	fmt.Fprintf(stdout, "  last sync: %s\n", formatLastSync(lastSync))
 	fmt.Fprintf(stdout, "  corrections: %d\n", corrections)
 	fmt.Fprintf(stdout, "  prompt events: %d\n", stats.Events)
-	fmt.Fprintf(stdout, "  candidates: %d\n", stats.Candidates)
+	fmt.Fprintf(stdout, "  recorded workflows: %d\n", stats.Candidates)
 	if syncErr != nil {
 		fmt.Fprintf(stdout, "  sync: partial (%s)\n", betaSyncIssue(syncErr))
 	} else if syncResult.IngestSkipped {
-		fmt.Fprintln(stdout, "  sync: fresh (skipped ingest, scanned candidates)")
+		fmt.Fprintln(stdout, "  sync: fresh (skipped ingest, scanned workflows)")
 	} else {
 		fmt.Fprintf(stdout, "  sync: ok (%d new corrections)\n", ingested)
 	}
@@ -86,8 +86,8 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 	}
 	if *limit == 0 {
 		fmt.Fprintln(stdout)
-		fmt.Fprintln(stdout, "Candidate display disabled by --limit 0.")
-		fmt.Fprintln(stdout, "Run agbox beta --limit 5 to show candidates.")
+		fmt.Fprintln(stdout, "Recorded Workflow display disabled by --limit 0.")
+		fmt.Fprintln(stdout, "Run agbox beta --limit 5 to show workflows.")
 		return nil
 	}
 
@@ -97,7 +97,7 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 	}
 	if len(candidates) == 0 {
 		fmt.Fprintln(stdout)
-		fmt.Fprintln(stdout, "No strong workflow candidates yet.")
+		fmt.Fprintln(stdout, "No strong Recorded Workflows yet.")
 		fmt.Fprintln(stdout, "Keep working in Claude, Codex, Cursor, or Grok; agbox will watch for repeated workflow signals.")
 		fmt.Fprintln(stdout, "Manage recorded workflows anytime: agbox inbox")
 		fmt.Fprintln(stdout, "Try the loop without touching your data: agbox demo")
@@ -106,7 +106,7 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 	}
 
 	fmt.Fprintln(stdout)
-	fmt.Fprintf(stdout, "Workflow candidates (showing %d)\n", len(candidates))
+	fmt.Fprintf(stdout, "Recorded Workflows (showing %d)\n", len(candidates))
 	for i, c := range candidates {
 		card, err := evidence.Build(s, c.ID)
 		if err != nil {
@@ -334,7 +334,7 @@ func betaSourceState() string {
 func betaSyncIssue(err error) string {
 	msg := err.Error()
 	if strings.Contains(msg, "token too long") {
-		return "one session file was too large to parse; run agbox doctor if candidates look wrong"
+		return "one session file was too large to parse; run agbox doctor if workflows look wrong"
 	}
-	return "run agbox doctor if candidates look wrong"
+	return "run agbox doctor if workflows look wrong"
 }
