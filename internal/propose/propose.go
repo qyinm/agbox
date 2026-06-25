@@ -72,7 +72,14 @@ func SelectAndRenderForPrompt(s *store.Store, agent, project, prompt string) (ca
 	if err != nil {
 		return "", "", err
 	}
-	return match.ID, RenderInjection(agent, card), nil
+	normalized := privacy.NormalizeSignal(prompt)
+	ctx := ReplayContext{
+		Agent:         agent,
+		Project:       project,
+		PromptHash:    privacy.HashSignal(normalized),
+		PromptExcerpt: privacy.Excerpt(prompt, 160),
+	}
+	return match.ID, RenderReplayInjection(agent, card, ctx), nil
 }
 
 func SelectForPrompt(s *store.Store, project, prompt string) (model.Candidate, error) {

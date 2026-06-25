@@ -645,6 +645,12 @@ func TestHookReplayUsesPromptMatchAndMarksProposed(t *testing.T) {
 	if !strings.Contains(got, c.ID) {
 		t.Fatalf("replay output missing candidate id %s:\n%s", c.ID, got)
 	}
+	if !strings.Contains(got, "agbox recorded workflow replay instructions") {
+		t.Fatalf("replay output missing replay instructions:\n%s", got)
+	}
+	if strings.Contains(got, "agbox skill proposal instructions") {
+		t.Fatalf("replay output used skill proposal payload:\n%s", got)
+	}
 	s, err = store.Open(filepath.Join(root, "agbox.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -656,6 +662,67 @@ func TestHookReplayUsesPromptMatchAndMarksProposed(t *testing.T) {
 	}
 	if stored.State != model.CandidateProposed {
 		t.Fatalf("state = %s, want proposed", stored.State)
+	}
+}
+
+func TestApplyRecordsAppliedOnce(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+
+	s, err := store.Open(filepath.Join(root, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := seedBetaCandidate(t, s, model.Candidate{
+		Name:         "current-project-analysis-workflow",
+		RuleText:     "현재 프로젝트 분석해줘.",
+		SemanticKey:  "current-project-analysis",
+		SourceKind:   model.CandidateSourcePromptPattern,
+		State:        model.CandidateProposed,
+		EventCount:   3,
+		ProjectCount: 1,
+		SourceCount:  1,
+		Confidence:   "high",
+	})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := Execute([]string{
+		"apply", c.ID,
+		"--agent", "codex",
+		"--project", "agbox",
+		"--prompt-hash", "hash123",
+		"--prompt-excerpt", "현재 프로젝트 분석해줘",
+	}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), c.ID+" -> applied once") {
+		t.Fatalf("apply output = %q", out.String())
+	}
+	s, err = store.Open(filepath.Join(root, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	stored, err := s.GetCandidate(c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != model.CandidateAppliedOnce {
+		t.Fatalf("state = %s, want applied_once", stored.State)
+	}
+	apps, err := s.ListReplayApplications(c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(apps) != 1 {
+		t.Fatalf("applications = %d, want 1", len(apps))
+	}
+	if apps[0].Agent != "codex" || apps[0].Project != "agbox" || apps[0].PromptHash != "hash123" {
+		t.Fatalf("application metadata = %+v", apps[0])
 	}
 }
 

@@ -100,6 +100,8 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) error 
 		return withStore(func(s *store.Store) error { return runReject(s, args[1:], stdout) })
 	case "snooze":
 		return withStore(func(s *store.Store) error { return runSnooze(s, args[1:], stdout) })
+	case "apply":
+		return withStore(func(s *store.Store) error { return runApply(s, args[1:], stdout) })
 	case "accept":
 		return withStore(func(s *store.Store) error { return runAccept(s, args[1:], stdout) })
 	case "connect":

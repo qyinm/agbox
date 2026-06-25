@@ -115,6 +115,14 @@ func Accept(s *store.Store, candidateID, skillPath string) error {
 	})
 }
 
+func ApplyOnce(s *store.Store, app model.ReplayApplication) error {
+	if _, err := s.GetCandidate(app.CandidateID); err != nil {
+		return err
+	}
+	_, err := s.RecordReplayApplication(app)
+	return err
+}
+
 func canAcknowledgeToAccepted(state model.CandidateState) bool {
 	switch state {
 	case model.CandidateProposed, model.CandidateSaveSuggested:
