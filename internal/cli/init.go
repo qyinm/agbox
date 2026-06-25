@@ -12,11 +12,33 @@ import (
 	"github.com/hippoom/agbox/internal/watcher"
 )
 
+var (
+	stopWatcher    = watcher.Stop
+	installWatcher = watcher.Install
+	syncBestEffort = pipeline.SyncBestEffort
+)
+
 func runInit(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	quiet := fs.Bool("quiet", false, "suppress status output")
 	if err := fs.Parse(reorderFlags(args, map[string]bool{})); err != nil {
+		return err
+	}
+
+	home := os.Getenv("HOME")
+	if home == "" {
+		var err error
+		home, err = os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+	}
+	agboxBin, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if err := stopWatcher(home); err != nil {
 		return err
 	}
 
@@ -32,24 +54,13 @@ func runInit(args []string, stdout io.Writer) error {
 		return err
 	}
 
-	home := os.Getenv("HOME")
-	if home == "" {
-		home, err = os.UserHomeDir()
-		if err != nil {
-			return err
-		}
-	}
-	agboxBin, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	if err := watcher.Install(home, agboxBin); err != nil {
-		return err
-	}
-
-	syncResult, syncFatalErr := pipeline.SyncBestEffort(s)
+	syncResult, syncFatalErr := syncBestEffort(s)
+	installErr := installWatcher(home, agboxBin)
 	if syncFatalErr != nil {
 		return syncFatalErr
+	}
+	if installErr != nil {
+		return installErr
 	}
 	connectOut := stdout
 	if *quiet {

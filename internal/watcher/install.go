@@ -62,6 +62,13 @@ func Install(home, agboxBin string) error {
 	return nil
 }
 
+func Stop(home string) error {
+	if shouldManageLaunchd(home) {
+		_ = stopAgent(home, PlistPath(home))
+	}
+	return nil
+}
+
 func Uninstall(home string) error {
 	plistPath := PlistPath(home)
 	if shouldManageLaunchd(home) {

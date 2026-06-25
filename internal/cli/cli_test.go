@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/hippoom/agbox/internal/model"
+	"github.com/hippoom/agbox/internal/pipeline"
 	"github.com/hippoom/agbox/internal/privacy"
 	"github.com/hippoom/agbox/internal/scan"
 	"github.com/hippoom/agbox/internal/store"
@@ -131,6 +132,61 @@ func TestInitCanSkipManagedHooks(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, ".claude", "settings.json")); !os.IsNotExist(err) {
 		t.Fatalf("managed hooks were written despite AGBOX_SKIP_CONNECT=1: %v", err)
+	}
+}
+
+func TestInitStopsWatcherBeforeSyncAndInstallsAfter(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+	t.Setenv("AGBOX_SKIP_CONNECT", "1")
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(wd)
+
+	oldStopWatcher := stopWatcher
+	oldInstallWatcher := installWatcher
+	oldSyncBestEffort := syncBestEffort
+	t.Cleanup(func() {
+		stopWatcher = oldStopWatcher
+		installWatcher = oldInstallWatcher
+		syncBestEffort = oldSyncBestEffort
+	})
+
+	var steps []string
+	stopWatcher = func(home string) error {
+		if home != root {
+			t.Fatalf("stop home = %q, want %q", home, root)
+		}
+		steps = append(steps, "stop")
+		return nil
+	}
+	syncBestEffort = func(*store.Store) (pipeline.BestEffortSyncResult, error) {
+		steps = append(steps, "sync")
+		return pipeline.BestEffortSyncResult{}, nil
+	}
+	installWatcher = func(home, agboxBin string) error {
+		if home != root {
+			t.Fatalf("install home = %q, want %q", home, root)
+		}
+		if agboxBin == "" {
+			t.Fatal("install agboxBin is empty")
+		}
+		steps = append(steps, "install")
+		return nil
+	}
+
+	if err := Execute([]string{"init", "--quiet"}, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"stop", "sync", "install"}
+	if strings.Join(steps, ",") != strings.Join(want, ",") {
+		t.Fatalf("init steps = %v, want %v", steps, want)
 	}
 }
 
