@@ -91,7 +91,7 @@ project: .agbox/
 		fmt.Fprintf(stdout, "accepted existing skills: %d\n\n", syncResult.AcceptedSkills)
 	}
 	fmt.Fprintln(stdout, `Next steps:
-  agbox beta              # See setup + candidates in one terminal summary
+  agbox beta              # See setup + curated candidates in one terminal summary
   agbox doctor            # Check watcher + managed proposal hooks
   agbox status            # Check watcher and sync status
   agbox demo              # See the workflow in action

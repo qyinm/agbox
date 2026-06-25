@@ -45,7 +45,7 @@ agbox noticed.
 
 ```bash
 npm install -g @agboxhq/cli   # macOS Apple Silicon (arm64) only today
-agbox beta                    # setup health + best candidates (or: agbox inbox)
+agbox beta                    # setup health + curated candidates (or: agbox inbox)
 ```
 
 ```console
@@ -107,8 +107,9 @@ Then just work:
 #    If a hook misses a SKILL.md write, agbox reconciles files with agbox_candidate_id
 #    when you run status, beta, doctor, or sync.
 
-# 2. See setup + candidates in one terminal-safe summary
+# 2. See setup + curated candidates in one terminal-safe summary
 agbox beta                      # best first beta command
+agbox beta --sync               # force a refresh when you want one
 
 # 3. Review what it learned
 agbox review                    # interactive TUI: evidence, approve, export
@@ -203,7 +204,7 @@ rules). agbox never silently installs a detected workflow.
 | **Automatic ingest** | A background watcher reads Claude Code, Codex, Cursor, and Grok session files. No manual commits, no copy-paste-into-a-fresh-chat. |
 | **In-context proposals** | Managed hooks can ask before creating a skill when agbox finds a repeated correction or recurring prompt pattern. If hook acknowledgement misses the write, agbox reconciles existing `SKILL.md` files containing `agbox_candidate_id`. Remove hooks with `agbox disconnect <agent>`. |
 | **Smart clustering** | Repeated instructions get normalized, grouped, and confidence-scored — directional prefs like `bun-over-npm` included. |
-| **Beta summary + Review TUI** | `agbox beta` gives a terminal-safe summary; `agbox review` drills into evidence, approval, and export. |
+| **Beta summary + Review TUI** | `agbox beta` gives a terminal-safe curated summary; `agbox review` drills into evidence, approval, and export. |
 | **Vendor-neutral export** | One skill -> `CLAUDE.md`, `AGENTS.md`, Cursor, Cline. Promote once, every agent obeys. |
 | **Always reversible** | Every export is backed up and wrapped in markers. `agbox export rollback` undoes it cleanly. |
 | **Local-first & private** | Sessions and workflow data stay in `~/.agbox/`. Redacted excerpts + hashes by default — raw prompts stay local. Anonymous usage counters only (opt-out: `agbox telemetry off`). |
@@ -278,11 +279,11 @@ files shipped — repetition eliminated.
 
 ```text
 agbox init [--quiet]                initialize ~/.agbox/, install watcher + managed hooks, ingest sessions
-agbox beta [--limit 5]              setup health + best candidate summary
+agbox beta [--limit 5] [--sync]     setup health + curated candidate summary
 agbox demo                          run the full loop in a throwaway store
 agbox status                        watcher state, last sync, correction/event counts
 agbox sources                       list discovered session source paths
-agbox sync --once                   force a session ingestion pass
+agbox sync --once                   force a standalone session ingestion pass
 agbox watch                         internal daemon (used by LaunchAgent)
 
 agbox capture --agent <a> "text"    record a workflow signal manually

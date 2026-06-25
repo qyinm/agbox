@@ -13,6 +13,7 @@ type BestEffortSyncResult struct {
 	Ingested       int
 	Warning        error
 	AcceptedSkills int
+	IngestSkipped  bool
 }
 
 func SyncAll(s *store.Store) (int, error) {
@@ -35,6 +36,10 @@ func SyncAll(s *store.Store) (int, error) {
 func SyncBestEffort(s *store.Store) (BestEffortSyncResult, error) {
 	n, warning := session.IngestAllBestEffort(s)
 	result := BestEffortSyncResult{Ingested: n, Warning: warning}
+	return finishBestEffortSync(s, result)
+}
+
+func finishBestEffortSync(s *store.Store, result BestEffortSyncResult) (BestEffortSyncResult, error) {
 	if _, err := scan.Run(s, 2); err != nil {
 		return result, err
 	}
@@ -67,11 +72,7 @@ func SyncBestEffortIfStale(s *store.Store) (BestEffortSyncResult, error) {
 		return BestEffortSyncResult{}, err
 	}
 	if !lastSync.IsZero() && time.Since(lastSync) < 5*time.Minute {
-		reconcileResult, err := propose.ReconcileAcceptedSkills(s)
-		if err != nil {
-			return BestEffortSyncResult{}, err
-		}
-		return BestEffortSyncResult{AcceptedSkills: reconcileResult.Accepted}, nil
+		return finishBestEffortSync(s, BestEffortSyncResult{IngestSkipped: true})
 	}
 	return SyncBestEffort(s)
 }

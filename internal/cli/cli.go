@@ -456,7 +456,7 @@ func displayState(state string) string {
 func printDiscoverNext(stdout io.Writer) {
 	fmt.Fprintln(stdout, "\nNext")
 	fmt.Fprintln(stdout, "1. Work normally in Claude, Codex, Cursor, or Grok.")
-	fmt.Fprintln(stdout, "2. agbox beta              # see setup + candidates in one terminal summary")
+	fmt.Fprintln(stdout, "2. agbox beta              # see setup + curated candidates in one terminal summary")
 	fmt.Fprintln(stdout, "3. agbox status            # confirm watcher is collecting")
 	fmt.Fprintln(stdout, "4. agbox review            # review candidates with evidence")
 	fmt.Fprintln(stdout, "\nWant to see the loop without touching your data? Run `agbox demo`.")
@@ -765,7 +765,7 @@ Usage:
   agbox export rollback <export-id>
   agbox discover [--min-repeats 2] [--state pending|proposal_ready|proposed|accepted|snoozed|approved|rejected|exported|all] [--limit 5]
   agbox review [--state pending|proposal_ready|proposed|accepted|snoozed|approved|rejected|exported|all] [--min-repeats 2] [--limit 20]
-  agbox beta [--limit 5]
+  agbox beta [--limit 5] [--sync]
   agbox demo
   agbox impact <candidate-id>
   agbox audit [--profile private|shareable|client] [--out audit.md]
@@ -843,12 +843,13 @@ Options:
   --min-repeats n  Minimum repeated signals. Default: 2
   --limit n        Maximum candidates to show. Default: 20`,
 	"beta": `Usage:
-  agbox beta [--limit 5]
+  agbox beta [--limit 5] [--sync]
 
-Show setup health and the best repeated workflow candidates in a terminal-safe beta summary.
+Show setup health and curated repeated workflow candidates in a terminal-safe beta summary.
 
 Options:
-  --limit n        Maximum candidates to show. Default: 5`,
+  --limit n        Maximum candidates to show. Default: 5
+  --sync           Force session ingest before showing candidates`,
 	"demo": `Usage:
   agbox demo
 

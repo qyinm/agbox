@@ -96,7 +96,7 @@ func TestInitShowsNextSteps(t *testing.T) {
 		"Next steps:",
 		"managed hooks:",
 		"telemetry: on by default",
-		"agbox beta              # See setup + candidates in one terminal summary",
+		"agbox beta              # See setup + curated candidates in one terminal summary",
 		"agbox doctor            # Check watcher + managed proposal hooks",
 		"agbox disconnect <agent>",
 		"agbox status            # Check watcher and sync status",
@@ -239,6 +239,30 @@ func TestReviewHelpDoesNotOpenStore(t *testing.T) {
 	}
 	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
 		t.Fatalf("review help opened store: %v", err)
+	}
+}
+
+func TestBetaHelpDocumentsSyncFlag(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "agbox.db")
+	t.Setenv("AGBOX_DB", dbPath)
+
+	var out bytes.Buffer
+	if err := Execute([]string{"beta", "--help"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"agbox beta [--limit 5] [--sync]",
+		"--sync",
+		"Force session ingest",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("beta help missing %q:\n%s", want, got)
+		}
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("beta help opened store: %v", err)
 	}
 }
 
@@ -434,13 +458,131 @@ func TestBetaEmptyStoreShowsSetupAndDemo(t *testing.T) {
 		"agbox beta",
 		"watcher:",
 		"managed hooks:",
-		"No repeated corrections yet.",
+		"No strong workflow candidates yet.",
 		"agbox demo",
 		"agbox doctor",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("beta empty output missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestBetaCandidatesHideGeneratedPromptNoise(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	good := seedBetaCandidate(t, s, model.Candidate{
+		Name:         "package-manager-workflow",
+		RuleText:     "Use bun, not npm.",
+		SemanticKey:  "package-manager:bun-over-npm",
+		SourceKind:   model.CandidateSourceCorrection,
+		State:        model.CandidateProposalReady,
+		EventCount:   2,
+		ProjectCount: 1,
+		SourceCount:  1,
+		Confidence:   "medium",
+	})
+	seedBetaCandidate(t, s, model.Candidate{
+		Name:         "generated-suggestion-boilerplate",
+		RuleText:     "Generate 0 to 3 hyperpersonalized suggestions for the user based on their recent prompts.",
+		SourceKind:   model.CandidateSourcePromptPattern,
+		State:        model.CandidateProposalReady,
+		EventCount:   20,
+		ProjectCount: 3,
+		SourceCount:  2,
+		Confidence:   "high",
+	})
+
+	candidates, err := betaCandidates(s, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidates = %d, want 1", len(candidates))
+	}
+	if candidates[0].ID != good.ID {
+		t.Fatalf("candidate = %s, want %s", candidates[0].ID, good.ID)
+	}
+}
+
+func TestBetaCandidatesPrioritizeSemanticPromptOverFileWrapper(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	currentProject := seedBetaCandidate(t, s, model.Candidate{
+		Name:         "current-project-analysis-workflow",
+		RuleText:     "현재 프로젝트 분석해줘.",
+		SemanticKey:  "current-project-analysis",
+		SourceKind:   model.CandidateSourcePromptPattern,
+		State:        model.CandidateProposalReady,
+		EventCount:   3,
+		ProjectCount: 2,
+		SourceCount:  1,
+		Confidence:   "high",
+	})
+	seedBetaCandidate(t, s, model.Candidate{
+		Name:         "files-mentioned-by-the-user-codex-clipboard",
+		RuleText:     "# Files mentioned by the user:\n\n- /Users/demo/Desktop/Codex Clipboard.txt",
+		SourceKind:   model.CandidateSourcePromptPattern,
+		State:        model.CandidateProposalReady,
+		EventCount:   30,
+		ProjectCount: 5,
+		SourceCount:  2,
+		Confidence:   "high",
+	})
+
+	candidates, err := betaCandidates(s, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidates = %d, want 1", len(candidates))
+	}
+	if candidates[0].ID != currentProject.ID {
+		t.Fatalf("candidate = %s, want %s", candidates[0].ID, currentProject.ID)
+	}
+}
+
+func TestBetaHiddenCandidatesShowNoStrongCandidates(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+
+	s, err := store.Open(filepath.Join(root, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedBetaCandidate(t, s, model.Candidate{
+		Name:         "files-mentioned-by-the-user-codex-clipboard",
+		RuleText:     "# Files mentioned by the user:\n\n- /Users/demo/Desktop/Codex Clipboard.txt",
+		SourceKind:   model.CandidateSourcePromptPattern,
+		State:        model.CandidateProposalReady,
+		EventCount:   30,
+		ProjectCount: 5,
+		SourceCount:  2,
+		Confidence:   "high",
+	})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := Execute([]string{"beta"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "No strong workflow candidates yet.") {
+		t.Fatalf("beta output missing no-strong-candidates message:\n%s", got)
+	}
+	if strings.Contains(got, "files-mentioned-by-the-user") {
+		t.Fatalf("beta output showed hidden noise candidate:\n%s", got)
 	}
 }
 
@@ -815,4 +957,49 @@ func seedBetaCorrectionCandidate(t *testing.T, dbPath string) {
 	if err := s.UpdateCandidateMeta(candidates[0].ID, store.CandidateMetaUpdate{State: model.CandidateProposalReady}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func seedBetaCandidate(t *testing.T, s *store.Store, c model.Candidate) model.Candidate {
+	t.Helper()
+	now := time.Now()
+	if c.Fingerprint == "" {
+		c.Fingerprint = privacy.HashSignal(c.Name + "|" + c.RuleText + "|" + string(c.SourceKind))
+	}
+	if c.ID == "" {
+		c.ID = "cand_" + c.Fingerprint[:12]
+	}
+	if c.Description == "" {
+		c.Description = "test candidate"
+	}
+	if c.State == "" {
+		c.State = model.CandidateProposalReady
+	}
+	if c.EventCount == 0 {
+		c.EventCount = 1
+	}
+	if c.ProjectCount == 0 {
+		c.ProjectCount = 1
+	}
+	if c.SourceCount == 0 {
+		c.SourceCount = 1
+	}
+	if c.Confidence == "" {
+		c.Confidence = "medium"
+	}
+	if c.FirstSeen.IsZero() {
+		c.FirstSeen = now
+	}
+	if c.LastSeen.IsZero() {
+		c.LastSeen = now
+	}
+	if c.UpdatedAt.IsZero() {
+		c.UpdatedAt = now
+	}
+	if c.Version == 0 {
+		c.Version = 1
+	}
+	if err := s.UpsertCandidate(c, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	return c
 }
