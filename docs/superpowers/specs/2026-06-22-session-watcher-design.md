@@ -428,3 +428,9 @@ exports:     3
 - [x] v1 platform scope explicit (macOS arm64)
 - [x] Adapter build order explicit (Claude → Codex → Cursor)
 - [x] No TBD placeholders
+
+---
+
+## Related Implementation Learning
+
+- `docs/solutions/workflow-issues/recorded-workflow-replay-lifecycle-guardrails.md`: concrete replay lifecycle guardrails added after review, including project-scoped save prompts, expected-state lifecycle updates, low-latency prompt-submit replay hooks, save prompt persistence errors, terminal control sanitization, and workflow command test ownership.

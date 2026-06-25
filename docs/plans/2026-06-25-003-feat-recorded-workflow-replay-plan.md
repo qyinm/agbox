@@ -293,3 +293,4 @@ The implementation should extend the existing candidate lifecycle instead of int
 - `docs/plans/2026-06-23-001-feat-beta-aha-loop-plan.md`: existing beta proposal lifecycle and trust posture.
 - `docs/plans/2026-06-25-001-fix-repeated-prompt-candidates-plan.md`: prompt-pattern candidate source and source-aware evidence plan.
 - `docs/plans/2026-06-25-002-feat-beta-aha-quality-plan.md`: current-project-analysis semantic key and candidate quality gates.
+- `docs/solutions/workflow-issues/recorded-workflow-replay-lifecycle-guardrails.md`: post-review implementation guardrails for replay lifecycle eligibility, project-scoped replay applications, expected-state transitions, prompt-hook latency, save prompt persistence failures, terminal sanitization, and workflow command test ownership.

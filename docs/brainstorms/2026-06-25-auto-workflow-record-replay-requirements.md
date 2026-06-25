@@ -178,3 +178,9 @@ The main UX risk is trust. If "replay" sounds like automatic command execution, 
 - O3. What exact success signals count toward `validated` after `apply once`?
 - O4. Should `auto_applied` always compile to a SKILL.md file, or can there be a lighter local rule first?
 - O5. Should `agbox beta` become an alias for `agbox inbox`, or remain a separate onboarding/report command during the transition?
+
+---
+
+## Related Implementation Learning
+
+- `docs/solutions/workflow-issues/recorded-workflow-replay-lifecycle-guardrails.md`: post-review guardrails for keeping apply-once and save-for-future states separate, scoping save prompts to same-project replay applications, guarding lifecycle writes, keeping prompt-submit hooks fast, and sanitizing workflow card output.
