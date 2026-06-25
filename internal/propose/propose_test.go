@@ -703,6 +703,46 @@ func TestDeliverSaveSuggestedMarksSaveSuggested(t *testing.T) {
 	}
 }
 
+func TestDeliverSaveSuggestedReturnsPersistenceFailure(t *testing.T) {
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	c := seedPromptCandidate(t, s, model.Candidate{
+		ID:           "cand_savefail",
+		Fingerprint:  "fp_savefail",
+		Name:         "current-project-analysis-workflow",
+		SemanticKey:  "current-project-analysis",
+		State:        model.CandidateAppliedOnce,
+		EventCount:   3,
+		ProjectCount: 1,
+		SourceCount:  1,
+		Confidence:   "high",
+		FirstSeen:    now,
+		LastSeen:     now,
+		UpdatedAt:    now,
+	})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out strings.Builder
+	var log strings.Builder
+	err = propose.DeliverSaveSuggested(s, c.ID, "payload", &out, &log)
+	if err == nil {
+		t.Fatal("DeliverSaveSuggested error = nil, want persistence failure")
+	}
+	if out.String() != "payload" {
+		t.Fatalf("payload = %q", out.String())
+	}
+	if !strings.Contains(log.String(), "save prompt "+c.ID+" delivered but state not updated") {
+		t.Fatalf("warning log missing persistence failure:\n%s", log.String())
+	}
+}
+
 func TestPromptFromHookParsesNestedPromptAndIgnoresMalformedJSON(t *testing.T) {
 	got := propose.PromptFromHook([]byte(`{"payload":{"userPrompt":"  현재   프로젝트 분석해줘  "}}`))
 	if got != "현재 프로젝트 분석해줘" {

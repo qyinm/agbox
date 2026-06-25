@@ -186,8 +186,11 @@ func DeliverSaveSuggested(s *store.Store, candidateID, payload string, stdout, l
 	if _, err := io.WriteString(stdout, payload); err != nil {
 		return err
 	}
-	if err := MarkSaveSuggested(s, candidateID); err != nil && log != nil {
-		_, _ = io.WriteString(log, "agbox: warning: save prompt "+candidateID+" delivered but state not updated: "+err.Error()+"\n")
+	if err := MarkSaveSuggested(s, candidateID); err != nil {
+		if log != nil {
+			_, _ = io.WriteString(log, "agbox: warning: save prompt "+candidateID+" delivered but state not updated: "+err.Error()+"\n")
+		}
+		return err
 	}
 	return nil
 }
