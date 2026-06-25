@@ -41,7 +41,7 @@ func normalizeTarget(target string) string {
 }
 
 func renderBody(c model.Candidate, target string) string {
-	header := fmt.Sprintf("---\nname: %s\ndescription: %s\n---\n", c.Name, c.Description)
+	header := fmt.Sprintf("---\nname: %s\ndescription: %s\nagbox_candidate_id: %s\n---\n", c.Name, c.Description, c.ID)
 	rule := strings.TrimSpace(c.RuleText)
 	if rule == "" {
 		rule = "Follow this workflow when the matching repeated signal appears."
