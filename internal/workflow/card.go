@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -9,6 +10,8 @@ import (
 )
 
 const SafetyNote = "Replay injects instructions and context for the current request only; it does not re-run prior commands or create a persistent skill."
+
+var terminalControlSequence = regexp.MustCompile(`(?:\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b[@-_])`)
 
 type Card struct {
 	CandidateID     string
@@ -204,7 +207,7 @@ func packageManagers(key string) (preferred, avoided string) {
 }
 
 func titleFromSlug(slug string) string {
-	slug = strings.TrimSpace(slug)
+	slug = sanitizeDisplayText(slug)
 	if slug == "" {
 		return ""
 	}
@@ -221,11 +224,26 @@ func titleFromSlug(slug string) string {
 }
 
 func oneLine(value string) string {
-	value = strings.Join(strings.Fields(value), " ")
+	value = strings.Join(strings.Fields(sanitizeDisplayText(value)), " ")
 	if len(value) > 180 {
 		return strings.TrimSpace(value[:177]) + "..."
 	}
 	return value
+}
+
+func sanitizeDisplayText(value string) string {
+	value = terminalControlSequence.ReplaceAllString(value, "")
+	value = strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\t':
+			return r
+		case r < 0x20 || r == 0x7f:
+			return -1
+		default:
+			return r
+		}
+	}, value)
+	return strings.TrimSpace(value)
 }
 
 func plural(n int, singular, plural string) string {

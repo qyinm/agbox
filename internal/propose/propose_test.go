@@ -396,6 +396,91 @@ func TestSelectForPromptUsesCurrentPromptSemanticMatch(t *testing.T) {
 	}
 }
 
+func TestSelectForPromptUsesExactFingerprintWhenSemanticKeyIsAbsent(t *testing.T) {
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now()
+	prompt := "Use the custom release checklist"
+	normalized := privacy.NormalizeSignal(prompt)
+	exactFingerprint := privacy.HashSignal(string(model.CandidateSourcePromptPattern) + ":exact:" + privacy.HashSignal(normalized))
+	exact := seedPromptCandidate(t, s, model.Candidate{
+		ID:           "cand_exactprompt",
+		Fingerprint:  exactFingerprint,
+		Name:         "custom-release-checklist",
+		SemanticKey:  "",
+		State:        model.CandidateProposalReady,
+		EventCount:   4,
+		ProjectCount: 2,
+		SourceCount:  1,
+		Confidence:   "medium",
+		FirstSeen:    now,
+		LastSeen:     now,
+		UpdatedAt:    now,
+	})
+
+	got, err := propose.SelectForPrompt(s, "agbox", prompt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != exact.ID {
+		t.Fatalf("selected = %s, want %s", got.ID, exact.ID)
+	}
+}
+
+func TestSelectForPromptIncludesPreviouslyAppliedReplayStates(t *testing.T) {
+	for _, st := range []model.CandidateState{model.CandidateAppliedOnce, model.CandidateSaveSuggested} {
+		t.Run(string(st), func(t *testing.T) {
+			dir := t.TempDir()
+			s, err := store.Open(filepath.Join(dir, "agbox.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+
+			now := time.Now()
+			c := seedPromptCandidate(t, s, model.Candidate{
+				ID:           "cand_" + string(st),
+				Fingerprint:  privacy.HashSignal("prompt_pattern:semantic:current-project-analysis:" + string(st)),
+				Name:         "current-project-analysis-workflow",
+				SemanticKey:  "current-project-analysis",
+				State:        st,
+				EventCount:   3,
+				ProjectCount: 1,
+				SourceCount:  1,
+				Confidence:   "high",
+				FirstSeen:    now,
+				LastSeen:     now,
+				UpdatedAt:    now,
+			})
+
+			got, err := propose.SelectForPrompt(s, "agbox", "현재 프로젝트 분석해줘")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.ID != c.ID {
+				t.Fatalf("selected = %s, want %s", got.ID, c.ID)
+			}
+
+			var out strings.Builder
+			if err := propose.DeliverProposed(s, c.ID, "payload", &out, nil); err != nil {
+				t.Fatal(err)
+			}
+			stored, err := s.GetCandidate(c.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored.State != st {
+				t.Fatalf("state after replay delivery = %s, want %s", stored.State, st)
+			}
+		})
+	}
+}
+
 func TestSelectForPromptRejectsUnrelatedAndLowConfidenceWorkflows(t *testing.T) {
 	dir := t.TempDir()
 	s, err := store.Open(filepath.Join(dir, "agbox.db"))
@@ -526,6 +611,56 @@ func TestSelectForSaveForFutureRequiresAppliedOnceApplication(t *testing.T) {
 	}
 	if got.ID != applied.ID {
 		t.Fatalf("selected = %s, want %s", got.ID, applied.ID)
+	}
+}
+
+func TestSelectForSaveForFutureRequiresApplicationInProject(t *testing.T) {
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now()
+	c := seedPromptCandidate(t, s, model.Candidate{
+		ID:           "cand_crossprojectsave",
+		Fingerprint:  "fp_crossprojectsave",
+		Name:         "current-project-analysis-workflow",
+		SemanticKey:  "current-project-analysis",
+		State:        model.CandidateAppliedOnce,
+		EventCount:   4,
+		ProjectCount: 2,
+		SourceCount:  1,
+		Confidence:   "high",
+		FirstSeen:    now,
+		LastSeen:     now,
+		UpdatedAt:    now,
+	})
+	if _, err := s.RecordReplayApplication(model.ReplayApplication{
+		ID:          "rapp_crossprojectsave",
+		CandidateID: c.ID,
+		Agent:       "codex",
+		Project:     "project-a",
+		AppliedAt:   now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := propose.SelectForSaveForFuture(s, "project-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "" {
+		t.Fatalf("selected = %s, want none for unapplied project", got.ID)
+	}
+
+	got, err = propose.SelectForSaveForFuture(s, "project-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != c.ID {
+		t.Fatalf("selected = %s, want %s for applied project", got.ID, c.ID)
 	}
 }
 

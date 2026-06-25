@@ -178,6 +178,67 @@ func TestRecordReplayApplicationPersistsAppliedOnce(t *testing.T) {
 	}
 }
 
+func TestUpdateCandidateMetaIfStateRequiresExpectedState(t *testing.T) {
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now()
+	c := model.Candidate{
+		ID:          "cand_guarded",
+		Fingerprint: "fp_guarded",
+		Name:        "guarded",
+		Description: "test",
+		RuleText:    "test",
+		State:       model.CandidateAppliedOnce,
+		EventCount:  3,
+		Confidence:  "high",
+		FirstSeen:   now,
+		LastSeen:    now,
+		UpdatedAt:   now,
+	}
+	if err := s.UpsertCandidate(c, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := s.UpdateCandidateMetaIfState(c.ID, model.CandidateProposalReady, store.CandidateMetaUpdate{
+		State: model.CandidateSaveSuggested,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated {
+		t.Fatal("updated with stale expected state, want false")
+	}
+	got, err := s.GetCandidate(c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != model.CandidateAppliedOnce {
+		t.Fatalf("state after stale update = %s, want applied_once", got.State)
+	}
+
+	updated, err = s.UpdateCandidateMetaIfState(c.ID, model.CandidateAppliedOnce, store.CandidateMetaUpdate{
+		State: model.CandidateSaveSuggested,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated {
+		t.Fatal("updated = false, want true")
+	}
+	got, err = s.GetCandidate(c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != model.CandidateSaveSuggested {
+		t.Fatalf("state after guarded update = %s, want save_suggested", got.State)
+	}
+}
+
 func TestUpsertCandidatePreservesAppliedOnceAndSaveSuggested(t *testing.T) {
 	dir := t.TempDir()
 	s, err := store.Open(filepath.Join(dir, "test.db"))

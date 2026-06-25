@@ -94,7 +94,11 @@ func SelectForPrompt(s *store.Store, project, prompt string) (model.Candidate, e
 		semanticFingerprint = privacy.HashSignal(string(model.CandidateSourcePromptPattern) + ":semantic:" + semanticKey)
 	}
 
-	candidates, err := s.ListCandidatesByState(model.CandidateProposalReady)
+	candidates, err := s.ListCandidatesByState(
+		model.CandidateProposalReady,
+		model.CandidateAppliedOnce,
+		model.CandidateSaveSuggested,
+	)
 	if err != nil {
 		return model.Candidate{}, err
 	}
@@ -103,10 +107,10 @@ func SelectForPrompt(s *store.Store, project, prompt string) (model.Candidate, e
 		if !eligiblePromptReplayCandidate(c) {
 			continue
 		}
-		if project != "" && !candidateMatchesProject(s, c.ID, project) {
+		if !candidateMatchesPrompt(c, semanticKey, semanticFingerprint, exactFingerprint) {
 			continue
 		}
-		if !candidateMatchesPrompt(c, semanticKey, semanticFingerprint, exactFingerprint) {
+		if project != "" && !candidateMatchesProject(s, c.ID, project) {
 			continue
 		}
 		eligible = append(eligible, c)
@@ -141,11 +145,11 @@ func SelectForSaveForFuture(s *store.Store, project string) (model.Candidate, er
 		if project != "" && !candidateMatchesProject(s, c.ID, project) {
 			continue
 		}
-		apps, err := s.ListReplayApplications(c.ID)
-		if err != nil || len(apps) == 0 {
+		app, err := s.LatestReplayApplication(c.ID, project)
+		if err != nil {
 			continue
 		}
-		appliedAt[c.ID] = apps[0].AppliedAt
+		appliedAt[c.ID] = app.AppliedAt
 		eligible = append(eligible, c)
 	}
 	if len(eligible) == 0 {
@@ -190,33 +194,35 @@ func DeliverSaveSuggested(s *store.Store, candidateID, payload string, stdout, l
 
 // MarkProposed transitions a candidate to proposed after successful stdout delivery.
 func MarkProposed(s *store.Store, candidateID string) error {
-	c, err := s.GetCandidate(candidateID)
-	if err != nil {
-		return err
-	}
-	if c.State != model.CandidateProposalReady {
-		return nil
-	}
 	now := time.Now()
-	return s.UpdateCandidateMeta(candidateID, store.CandidateMetaUpdate{
+	updated, err := s.UpdateCandidateMetaIfState(candidateID, model.CandidateProposalReady, store.CandidateMetaUpdate{
 		State:      model.CandidateProposed,
 		ProposedAt: &now,
 	})
-}
-
-func MarkSaveSuggested(s *store.Store, candidateID string) error {
-	c, err := s.GetCandidate(candidateID)
 	if err != nil {
 		return err
 	}
-	if c.State != model.CandidateAppliedOnce {
+	if updated {
 		return nil
 	}
+	_, err = s.GetCandidate(candidateID)
+	return err
+}
+
+func MarkSaveSuggested(s *store.Store, candidateID string) error {
 	now := time.Now()
-	return s.UpdateCandidateMeta(candidateID, store.CandidateMetaUpdate{
+	updated, err := s.UpdateCandidateMetaIfState(candidateID, model.CandidateAppliedOnce, store.CandidateMetaUpdate{
 		State:      model.CandidateSaveSuggested,
 		ProposedAt: &now,
 	})
+	if err != nil {
+		return err
+	}
+	if updated {
+		return nil
+	}
+	_, err = s.GetCandidate(candidateID)
+	return err
 }
 
 func ParseHookInput(data []byte) HookInput {

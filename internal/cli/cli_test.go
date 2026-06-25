@@ -760,6 +760,45 @@ func TestInboxFiltersAppliedOnce(t *testing.T) {
 	}
 }
 
+func TestBetaShowsSaveSuggestedNextAction(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+
+	s, err := store.Open(filepath.Join(root, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := seedBetaCandidate(t, s, model.Candidate{
+		Name:         "current-project-analysis-workflow",
+		RuleText:     "현재 프로젝트 분석해줘.",
+		SemanticKey:  "current-project-analysis",
+		SourceKind:   model.CandidateSourcePromptPattern,
+		State:        model.CandidateSaveSuggested,
+		EventCount:   3,
+		ProjectCount: 1,
+		SourceCount:  1,
+		Confidence:   "high",
+	})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := Execute([]string{"beta"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"state=save_suggested",
+		"answer the save-for-future prompt, or run agbox snooze " + c.ID,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("beta save_suggested output missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestHookReplayUsesPromptMatchAndMarksProposed(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)

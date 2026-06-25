@@ -108,6 +108,64 @@ func TestBuildLexicalFallbackCardIsConservative(t *testing.T) {
 	}
 }
 
+func TestBuildAPIRouteOpenAPISyncCard(t *testing.T) {
+	card := workflow.Build(model.EvidenceCard{
+		Candidate: model.Candidate{
+			ID:           "cand_api",
+			Name:         "api-route-openapi-workflow",
+			SemanticKey:  "api-route-openapi-sync",
+			SourceKind:   model.CandidateSourcePromptPattern,
+			State:        model.CandidateProposalReady,
+			EventCount:   3,
+			ProjectCount: 1,
+			SourceCount:  1,
+			Confidence:   "high",
+		},
+	})
+
+	if card.Name != "API Route OpenAPI Sync" {
+		t.Fatalf("name = %q", card.Name)
+	}
+	for _, want := range []string{
+		"changes API routes, schemas, or OpenAPI documentation",
+		"Inspect route handlers and OpenAPI or schema definitions together",
+		"Keep implementation behavior and documented schema changes synchronized",
+		"Mention any route/schema mismatch that remains after this request",
+	} {
+		if !strings.Contains(strings.Join(append(card.ReplayPlan, card.WhenItApplies), "\n"), want) {
+			t.Fatalf("api card missing %q: %+v", want, card)
+		}
+	}
+}
+
+func TestBuildSanitizesEvidenceControlSequences(t *testing.T) {
+	card := workflow.Build(model.EvidenceCard{
+		Candidate: model.Candidate{
+			ID:           "cand_unsafe",
+			Name:         "unsafe-workflow",
+			SourceKind:   model.CandidateSourcePromptPattern,
+			State:        model.CandidateProposalReady,
+			EventCount:   2,
+			ProjectCount: 1,
+			SourceCount:  1,
+			Confidence:   "medium",
+		},
+		Excerpts: []string{"copy\x1b]52;c;SGVsbG8=\x07secret \x1b[31mred\x1b[0m"},
+	})
+
+	rendered := workflow.Render(card)
+	for _, bad := range []string{"\x1b", "\x07", "]52", "[31m", "[0m"} {
+		if strings.Contains(rendered, bad) {
+			t.Fatalf("rendered card contains control sequence %q:\n%s", bad, rendered)
+		}
+	}
+	for _, want := range []string{"copysecret red", "Evidence:"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered card missing sanitized text %q:\n%s", want, rendered)
+		}
+	}
+}
+
 func TestLifecycleLabelMapsSavedForFuture(t *testing.T) {
 	if got := workflow.LifecycleLabel(model.CandidateAccepted); got != "Saved for future" {
 		t.Fatalf("accepted label = %q", got)

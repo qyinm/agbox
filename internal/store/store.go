@@ -386,6 +386,28 @@ type CandidateMetaUpdate struct {
 
 func (s *Store) UpdateCandidateMeta(id string, upd CandidateMetaUpdate) error {
 	now := time.Now()
+	sets, args := candidateMetaUpdateParts(upd, now)
+	args = append(args, id)
+	_, err := s.db.Exec(`UPDATE candidates SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...)
+	return err
+}
+
+func (s *Store) UpdateCandidateMetaIfState(id string, expected model.CandidateState, upd CandidateMetaUpdate) (bool, error) {
+	now := time.Now()
+	sets, args := candidateMetaUpdateParts(upd, now)
+	args = append(args, id, expected)
+	result, err := s.db.Exec(`UPDATE candidates SET `+strings.Join(sets, ", ")+` WHERE id = ? AND state = ?`, args...)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+func candidateMetaUpdateParts(upd CandidateMetaUpdate, now time.Time) ([]string, []any) {
 	sets := []string{"version = version + 1", "updated_at = ?"}
 	args := []any{formatTime(now)}
 	if upd.State != "" {
@@ -408,9 +430,7 @@ func (s *Store) UpdateCandidateMeta(id string, upd CandidateMetaUpdate) error {
 		sets = append(sets, "skill_path = ?")
 		args = append(args, upd.SkillPath)
 	}
-	args = append(args, id)
-	_, err := s.db.Exec(`UPDATE candidates SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...)
-	return err
+	return sets, args
 }
 
 func (s *Store) ListCandidatesByState(states ...model.CandidateState) ([]model.Candidate, error) {
@@ -441,10 +461,6 @@ func (s *Store) ListCandidatesByState(states ...model.CandidateState) ([]model.C
 }
 
 func (s *Store) RecordReplayApplication(app model.ReplayApplication) (model.ReplayApplication, error) {
-	c, err := s.GetCandidate(app.CandidateID)
-	if err != nil {
-		return model.ReplayApplication{}, err
-	}
 	now := time.Now()
 	if app.ID == "" {
 		app.ID = replayApplicationID(app.CandidateID, now)
@@ -462,6 +478,15 @@ func (s *Store) RecordReplayApplication(app model.ReplayApplication) (model.Repl
 	}
 	defer tx.Rollback()
 
+	var state string
+	if err := tx.QueryRow(`SELECT state FROM candidates WHERE id = ?`, app.CandidateID).Scan(&state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.ReplayApplication{}, fmt.Errorf("candidate not found: %s", app.CandidateID)
+		}
+		return model.ReplayApplication{}, err
+	}
+	currentState := model.CandidateState(state)
+
 	if _, err := tx.Exec(`INSERT INTO replay_applications
 		(id, candidate_id, agent, project, prompt_hash, prompt_excerpt, applied_at, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -469,10 +494,18 @@ func (s *Store) RecordReplayApplication(app model.ReplayApplication) (model.Repl
 		formatTime(app.AppliedAt), formatTime(app.CreatedAt)); err != nil {
 		return model.ReplayApplication{}, err
 	}
-	if canMarkAppliedOnce(c.State) {
-		if _, err := tx.Exec(`UPDATE candidates SET state = ?, version = version + 1, updated_at = ? WHERE id = ?`,
-			model.CandidateAppliedOnce, formatTime(now), app.CandidateID); err != nil {
+	if canMarkAppliedOnce(currentState) {
+		result, err := tx.Exec(`UPDATE candidates SET state = ?, version = version + 1, updated_at = ? WHERE id = ? AND state = ?`,
+			model.CandidateAppliedOnce, formatTime(now), app.CandidateID, currentState)
+		if err != nil {
 			return model.ReplayApplication{}, err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return model.ReplayApplication{}, err
+		}
+		if rows == 0 {
+			return model.ReplayApplication{}, fmt.Errorf("candidate state changed before replay application: %s", app.CandidateID)
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -503,6 +536,22 @@ func (s *Store) ListReplayApplications(candidateID string) ([]model.ReplayApplic
 		out = append(out, app)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) LatestReplayApplication(candidateID, project string) (model.ReplayApplication, error) {
+	query := `SELECT id, candidate_id, agent, project, prompt_hash, prompt_excerpt, applied_at, created_at
+		FROM replay_applications WHERE candidate_id = ?`
+	args := []any{candidateID}
+	if strings.TrimSpace(project) != "" {
+		query += ` AND project = ?`
+		args = append(args, project)
+	}
+	query += ` ORDER BY applied_at DESC, created_at DESC LIMIT 1`
+	app, err := scanReplayApplication(s.db.QueryRow(query, args...))
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.ReplayApplication{}, fmt.Errorf("replay application not found: %s", candidateID)
+	}
+	return app, err
 }
 
 func (s *Store) CreateExport(e model.ExportRecord) error {
