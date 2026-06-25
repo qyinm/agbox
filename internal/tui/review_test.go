@@ -22,8 +22,8 @@ func TestReviewModelEmptyCandidates(t *testing.T) {
 	m := NewReviewModel(NewReviewService(s, ReviewOptions{})).Refresh()
 	got := stripANSI(m.Render())
 	for _, want := range []string{
-		"No workflow candidates to review.",
-		"agbox beta",
+		"No Recorded Workflows to review.",
+		"agbox inbox",
 		"agbox demo",
 	} {
 		if !strings.Contains(got, want) {
@@ -38,12 +38,15 @@ func TestReviewModelRendersCandidateAndEvidence(t *testing.T) {
 	m := NewReviewModel(NewReviewService(s, ReviewOptions{})).Refresh()
 	got := stripANSI(m.Render())
 	for _, want := range []string{
-		"package-manager-workflow",
+		"Package Manager Preference",
 		"pending",
 		"confidence=low",
 		"repeats=2",
 		"Use bun, not npm.",
-		"Reason",
+		"When It Applies",
+		"Replay Plan",
+		"Evidence",
+		"Safety",
 		"Excerpts",
 	} {
 		if !strings.Contains(got, want) {
@@ -59,6 +62,8 @@ func TestReviewModelRendersProposalStateBadges(t *testing.T) {
 	states := []model.CandidateState{
 		model.CandidateProposalReady,
 		model.CandidateProposed,
+		model.CandidateAppliedOnce,
+		model.CandidateSaveSuggested,
 		model.CandidateAccepted,
 		model.CandidateSnoozed,
 	}
@@ -85,7 +90,7 @@ func TestReviewModelRendersProposalStateBadges(t *testing.T) {
 
 	m := NewReviewModel(NewReviewService(s, ReviewOptions{State: "all"})).Refresh()
 	got := stripANSI(m.Render())
-	for _, want := range []string{"proposal_ready", "proposed", "accepted", "snoozed"} {
+	for _, want := range []string{"proposal_ready", "proposed", "applied_once", "save_suggested", "accepted", "snoozed"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("review render missing state badge %q:\n%s", want, got)
 		}

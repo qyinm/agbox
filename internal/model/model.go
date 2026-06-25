@@ -21,6 +21,8 @@ const (
 	CandidatePending       CandidateState = "pending"
 	CandidateProposalReady CandidateState = "proposal_ready"
 	CandidateProposed      CandidateState = "proposed"
+	CandidateAppliedOnce   CandidateState = "applied_once"
+	CandidateSaveSuggested CandidateState = "save_suggested"
 	CandidateAccepted      CandidateState = "accepted"
 	CandidateSnoozed       CandidateState = "snoozed"
 	CandidateApproved      CandidateState = "approved"
@@ -66,6 +68,17 @@ type EvidenceCard struct {
 	Occurrences []Occurrence
 	Reason      string
 	Privacy     string
+}
+
+type ReplayApplication struct {
+	ID            string
+	CandidateID   string
+	Agent         string
+	Project       string
+	PromptHash    string
+	PromptExcerpt string
+	AppliedAt     time.Time
+	CreatedAt     time.Time
 }
 
 type ExportStatus string

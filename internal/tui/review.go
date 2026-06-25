@@ -13,6 +13,7 @@ import (
 	"github.com/hippoom/agbox/internal/model"
 	"github.com/hippoom/agbox/internal/scan"
 	"github.com/hippoom/agbox/internal/store"
+	"github.com/hippoom/agbox/internal/workflow"
 )
 
 type ReviewOptions struct {
@@ -196,7 +197,7 @@ func (m ReviewModel) Render() string {
 	if m.activeProjectFilter() != "" {
 		filterLabel = "project " + m.activeProjectFilter()
 	}
-	fmt.Fprintln(&b, mutedStyle.Render(fmt.Sprintf("scanned %d events  found %d repeated signals  showing %d %s candidates  filter=%s",
+	fmt.Fprintln(&b, mutedStyle.Render(fmt.Sprintf("scanned %d events  found %d repeated signals  showing %d %s recorded workflows  filter=%s",
 		m.data.Scanned, m.data.Found, len(m.data.Candidates), displayState(m.service.opts.State), filterLabel)))
 	if m.statusMessage != "" {
 		fmt.Fprintln(&b, hintStyle.Render(m.statusMessage))
@@ -209,15 +210,16 @@ func (m ReviewModel) Render() string {
 		return m.renderExportTarget()
 	}
 	if len(m.data.Candidates) == 0 {
-		fmt.Fprintln(&b, sectionTitleStyle.Render("No candidates"))
-		fmt.Fprintln(&b, bodyStyle.Render("No workflow candidates to review."))
-		fmt.Fprintln(&b, mutedStyle.Render("Run agbox beta after a few agent sessions, or use agbox demo to see the loop without touching your data."))
+		fmt.Fprintln(&b, sectionTitleStyle.Render("No Recorded Workflows"))
+		fmt.Fprintln(&b, bodyStyle.Render("No Recorded Workflows to review."))
+		fmt.Fprintln(&b, mutedStyle.Render("Run agbox inbox after a few agent sessions, or use agbox demo to see the loop without touching your data."))
 		return b.String()
 	}
-	fmt.Fprintln(&b, sectionTitleStyle.Render("Candidates"))
+	fmt.Fprintln(&b, sectionTitleStyle.Render("Recorded Workflows"))
 	for i, c := range m.data.Candidates {
+		card := workflow.Build(m.data.Cards[c.ID])
 		line := fmt.Sprintf("%-30s %s %s %s",
-			truncate(c.Name, 30),
+			truncate(card.Name, 30),
 			stateBadge(c.State),
 			metric("confidence", c.Confidence),
 			metric("repeats", fmt.Sprintf("%d", c.EventCount)),
@@ -230,38 +232,44 @@ func (m ReviewModel) Render() string {
 	}
 	fmt.Fprintln(&b)
 	if c, ok := m.selected(); ok {
-		card := m.data.Cards[c.ID]
-		fmt.Fprintln(&b, sectionTitleStyle.Render("Evidence"))
-		fmt.Fprintln(&b, detailTitleStyle.Render(c.Name))
+		evidenceCard := m.data.Cards[c.ID]
+		card := workflow.Build(evidenceCard)
+		fmt.Fprintln(&b, sectionTitleStyle.Render("Workflow"))
+		fmt.Fprintln(&b, detailTitleStyle.Render(card.Name))
 		fmt.Fprintf(&b, "%s  %s  %s  %s\n",
 			kv("id", c.ID),
-			kv("state", string(c.State)),
+			kv("lifecycle", card.Lifecycle),
 			kv("source", string(c.SourceKind)),
 			kv("confidence", c.Confidence),
 		)
 		fmt.Fprintf(&b, "%s\n", kv("repeats", fmt.Sprintf("%d", c.EventCount)))
-		fmt.Fprintf(&b, "%s  %s\n", kv("projects", join(card.Projects)), kv("sources", join(card.Sources)))
-		fmt.Fprintf(&b, "\n%s\n%s\n", labelStyle.Render("Reason"), bodyStyle.Render(card.Reason))
-		fmt.Fprintf(&b, "\n%s\n%s\n", labelStyle.Render("Rule"), bodyStyle.Render(c.RuleText))
-		if len(card.Occurrences) > 0 {
+		fmt.Fprintf(&b, "%s  %s\n", kv("projects", join(evidenceCard.Projects)), kv("sources", join(evidenceCard.Sources)))
+		fmt.Fprintf(&b, "\n%s\n%s\n", labelStyle.Render("When It Applies"), bodyStyle.Render(card.WhenItApplies))
+		fmt.Fprintf(&b, "\n%s\n", labelStyle.Render("Replay Plan"))
+		for i, step := range card.ReplayPlan {
+			fmt.Fprintf(&b, "%s\n", bodyStyle.Render(fmt.Sprintf("  %d. %s", i+1, step)))
+		}
+		fmt.Fprintf(&b, "\n%s\n%s\n", labelStyle.Render("Evidence"), bodyStyle.Render(card.EvidenceSummary))
+		fmt.Fprintf(&b, "\n%s\n%s\n", labelStyle.Render("Safety"), bodyStyle.Render(card.SafetyNote))
+		if len(evidenceCard.Occurrences) > 0 {
 			fmt.Fprintln(&b)
 			fmt.Fprintln(&b, labelStyle.Render("Occurrences"))
-			limit := len(card.Occurrences)
+			limit := len(evidenceCard.Occurrences)
 			if limit > 5 {
 				limit = 5
 			}
 			for i := 0; i < limit; i++ {
-				line := fmt.Sprintf("  %d. %s", i+1, card.Occurrences[i].SummaryLine())
+				line := fmt.Sprintf("  %d. %s", i+1, evidenceCard.Occurrences[i].SummaryLine())
 				if i == m.occurrenceCursor {
 					fmt.Fprintln(&b, selectedRowStyle.Render(line))
 					continue
 				}
 				fmt.Fprintln(&b, excerptStyle.Render(line))
 			}
-		} else if len(card.Excerpts) > 0 {
+		} else if len(evidenceCard.Excerpts) > 0 {
 			fmt.Fprintln(&b)
 			fmt.Fprintln(&b, labelStyle.Render("Excerpts"))
-			for _, ex := range card.Excerpts {
+			for _, ex := range evidenceCard.Excerpts {
 				fmt.Fprintln(&b, excerptStyle.Render("  "+ex))
 			}
 		}
@@ -531,6 +539,10 @@ func stateBadge(state model.CandidateState) string {
 		return badgeBase.Copy().Foreground(lipgloss.Color("#DDD6FE")).Background(lipgloss.Color("#4C1D95")).Render(" proposal_ready ")
 	case model.CandidateProposed:
 		return badgeBase.Copy().Foreground(lipgloss.Color("#BAE6FD")).Background(lipgloss.Color("#075985")).Render(" proposed ")
+	case model.CandidateAppliedOnce:
+		return badgeBase.Copy().Foreground(lipgloss.Color("#FDE68A")).Background(lipgloss.Color("#713F12")).Render(" applied_once ")
+	case model.CandidateSaveSuggested:
+		return badgeBase.Copy().Foreground(lipgloss.Color("#FBCFE8")).Background(lipgloss.Color("#831843")).Render(" save_suggested ")
 	case model.CandidateAccepted:
 		return badgeBase.Copy().Foreground(lipgloss.Color("#A7F3D0")).Background(lipgloss.Color("#065F46")).Render(" accepted ")
 	case model.CandidateSnoozed:

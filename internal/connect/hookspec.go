@@ -37,7 +37,7 @@ func ConfigPath(agent string, project bool) (string, error) {
 
 func addManagedHooks(cfg map[string]any, agent, command string) {
 	hooks := ensureObject(cfg, "hooks")
-	for _, event := range managedEvents {
+	for _, event := range managedEventsForAgent(agent) {
 		groups, _ := hooks[event].([]any)
 		group := managedHookGroup(agent, command, event)
 		hooks[event] = append(groups, group)
@@ -67,8 +67,12 @@ func managedHookGroup(agent, command, event string) map[string]any {
 
 func managedHookCommand(agent, command, event string) string {
 	switch event {
-	case "SessionStart", "Stop":
+	case "SessionStart":
 		return managedMarker + " " + shellQuote(command) + " hook propose " + agent
+	case "Stop":
+		return managedMarker + " " + shellQuote(command) + " hook save " + agent
+	case "UserPromptSubmit":
+		return managedMarker + " " + shellQuote(command) + " hook replay " + agent
 	case "PostToolUse":
 		return managedMarker + " " + shellQuote(command) + " hook acknowledge " + agent
 	default:
@@ -82,7 +86,7 @@ func removeManagedHooks(cfg map[string]any) bool {
 		return false
 	}
 	removed := false
-	for _, event := range managedEvents {
+	for _, event := range allManagedEvents {
 		groups, ok := hooks[event].([]any)
 		if !ok {
 			continue
@@ -128,7 +132,7 @@ func managedCommands(cfg map[string]any) []string {
 		return nil
 	}
 	var out []string
-	for _, event := range managedEvents {
+	for _, event := range allManagedEvents {
 		groups, ok := hooks[event].([]any)
 		if !ok {
 			continue
@@ -155,6 +159,23 @@ func managedCommands(cfg map[string]any) []string {
 		}
 	}
 	return out
+}
+
+func managedEventsForAgent(agent string) []string {
+	events := append([]string{}, baseManagedEvents...)
+	if supportsPromptSubmitHook(agent) {
+		events = append(events, "UserPromptSubmit")
+	}
+	return events
+}
+
+func supportsPromptSubmitHook(agent string) bool {
+	switch agent {
+	case AgentClaude, AgentCodex:
+		return true
+	default:
+		return false
+	}
 }
 
 func isManagedHandler(handlerAny any) bool {

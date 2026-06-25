@@ -18,7 +18,7 @@ func IsFrozen(state model.CandidateState) bool {
 	switch state {
 	case model.CandidateRejected, model.CandidateExported, model.CandidateAccepted,
 		model.CandidateApproved, model.CandidateProposed, model.CandidateProposalReady,
-		model.CandidateSnoozed:
+		model.CandidateAppliedOnce, model.CandidateSaveSuggested, model.CandidateSnoozed:
 		return true
 	default:
 		return false

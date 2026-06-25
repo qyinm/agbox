@@ -22,8 +22,9 @@ const (
 )
 
 var (
-	executablePath = os.Executable
-	managedEvents  = []string{"SessionStart", "Stop", "PostToolUse"}
+	executablePath    = os.Executable
+	baseManagedEvents = []string{"SessionStart", "Stop", "PostToolUse"}
+	allManagedEvents  = []string{"SessionStart", "Stop", "PostToolUse", "UserPromptSubmit"}
 )
 
 type Options struct {
@@ -294,4 +295,3 @@ func validateExecutable(path string) error {
 	}
 	return nil
 }
-

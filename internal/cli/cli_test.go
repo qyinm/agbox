@@ -96,8 +96,9 @@ func TestInitShowsNextSteps(t *testing.T) {
 		"Next steps:",
 		"managed hooks:",
 		"telemetry: on by default",
-		"agbox beta              # See setup + candidates in one terminal summary",
-		"agbox doctor            # Check watcher + managed proposal hooks",
+		"agbox beta              # See setup + recorded workflow summary",
+		"agbox inbox             # Review Recorded Workflows and replay plans",
+		"agbox doctor            # Check watcher + managed workflow hooks",
 		"agbox disconnect <agent>",
 		"agbox status            # Check watcher and sync status",
 		"agbox demo              # See the workflow in action",
@@ -242,6 +243,69 @@ func TestReviewHelpDoesNotOpenStore(t *testing.T) {
 	}
 }
 
+func TestBetaHelpDocumentsSyncFlag(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "agbox.db")
+	t.Setenv("AGBOX_DB", dbPath)
+
+	var out bytes.Buffer
+	if err := Execute([]string{"beta", "--help"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"agbox beta [--limit 5] [--sync]",
+		"--sync",
+		"Force session ingest",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("beta help missing %q:\n%s", want, got)
+		}
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("beta help opened store: %v", err)
+	}
+}
+
+func TestHelpDocumentsReplayWorkflowCommands(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "agbox.db")
+	t.Setenv("AGBOX_DB", dbPath)
+
+	var out bytes.Buffer
+	if err := Execute([]string{"--help"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"agbox records and replays repeated AI-agent workflows.",
+		"agbox inbox [--state pending|proposal_ready|proposed|applied_once|save_suggested",
+		"agbox apply <candidate-id>",
+		"agbox review [--state pending|proposal_ready|proposed|applied_once|save_suggested",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("root help missing %q:\n%s", want, got)
+		}
+	}
+
+	out.Reset()
+	if err := Execute([]string{"help", "hook"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got = out.String()
+	for _, want := range []string{
+		"agbox hook replay <claude|codex|grok>",
+		"agbox hook save <claude|codex|grok>",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("hook help missing %q:\n%s", want, got)
+		}
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("help opened store: %v", err)
+	}
+}
+
 func TestReviewProposalStateIsValidBeforeTerminalCheck(t *testing.T) {
 	root := t.TempDir()
 	dbPath := filepath.Join(root, "agbox.db")
@@ -294,7 +358,7 @@ func TestStatusFreshHomeShowsZeroCounts(t *testing.T) {
 		"watcher: stopped",
 		"last sync: never",
 		"corrections: 0",
-		"candidates: 0",
+		"recorded workflows: 0",
 		"managed hooks:",
 	} {
 		if !strings.Contains(got, want) {
@@ -434,38 +498,12 @@ func TestBetaEmptyStoreShowsSetupAndDemo(t *testing.T) {
 		"agbox beta",
 		"watcher:",
 		"managed hooks:",
-		"No repeated corrections yet.",
+		"No strong Recorded Workflows yet.",
 		"agbox demo",
 		"agbox doctor",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("beta empty output missing %q:\n%s", want, got)
-		}
-	}
-}
-
-func TestBetaShowsCandidateCausalEvidenceAndNextAction(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("HOME", root)
-	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
-	seedBetaCorrectionCandidate(t, filepath.Join(root, "agbox.db"))
-
-	var out bytes.Buffer
-	if err := Execute([]string{"beta"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
-		t.Fatal(err)
-	}
-	got := out.String()
-	for _, want := range []string{
-		"Workflow candidates",
-		"package-manager-workflow",
-		"state=proposal_ready",
-		"repeats=2",
-		"example: ran `npm install` -> Use bun, not npm.",
-		"agbox evidence cand_",
-		"ready to propose inside your agent",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("beta candidate output missing %q:\n%s", want, got)
 		}
 	}
 }
@@ -481,7 +519,7 @@ func TestBetaLimitZeroDoesNotClaimNoCorrections(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := out.String()
-	if !strings.Contains(got, "Candidate display disabled by --limit 0.") {
+	if !strings.Contains(got, "Recorded Workflow display disabled by --limit 0.") {
 		t.Fatalf("beta limit 0 output missing setup-only copy:\n%s", got)
 	}
 	if strings.Contains(got, "No repeated corrections yet.") {
@@ -504,7 +542,7 @@ func TestDiscoverShowsCandidateEvidenceAndNextCommands(t *testing.T) {
 	}
 	got := out.String()
 	for _, want := range []string{
-		"Workflow candidates",
+		"Recorded Workflows",
 		"repeats=2",
 		"excerpt: Use bun, not npm.",
 		"agbox evidence cand_",
@@ -528,9 +566,9 @@ func TestDiscoverEmptyShowsHookSetupNextStep(t *testing.T) {
 	}
 	got := out.String()
 	for _, want := range []string{
-		"No workflow candidates yet.",
+		"No Recorded Workflows yet.",
 		"Claude, Codex, Cursor, or Grok",
-		"agbox beta",
+		"agbox inbox",
 		"agbox status",
 		"agbox review",
 		"agbox demo",
@@ -558,6 +596,7 @@ func TestDemoShowsPreviewWithoutPersistentStore(t *testing.T) {
 		"evidence:",
 		"No files were changed",
 		"agbox beta",
+		"agbox inbox",
 		"agbox review",
 		"agbox status",
 	} {
@@ -815,4 +854,49 @@ func seedBetaCorrectionCandidate(t *testing.T, dbPath string) {
 	if err := s.UpdateCandidateMeta(candidates[0].ID, store.CandidateMetaUpdate{State: model.CandidateProposalReady}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func seedBetaCandidate(t *testing.T, s *store.Store, c model.Candidate) model.Candidate {
+	t.Helper()
+	now := time.Now()
+	if c.Fingerprint == "" {
+		c.Fingerprint = privacy.HashSignal(c.Name + "|" + c.RuleText + "|" + string(c.SourceKind))
+	}
+	if c.ID == "" {
+		c.ID = "cand_" + c.Fingerprint[:12]
+	}
+	if c.Description == "" {
+		c.Description = "test candidate"
+	}
+	if c.State == "" {
+		c.State = model.CandidateProposalReady
+	}
+	if c.EventCount == 0 {
+		c.EventCount = 1
+	}
+	if c.ProjectCount == 0 {
+		c.ProjectCount = 1
+	}
+	if c.SourceCount == 0 {
+		c.SourceCount = 1
+	}
+	if c.Confidence == "" {
+		c.Confidence = "medium"
+	}
+	if c.FirstSeen.IsZero() {
+		c.FirstSeen = now
+	}
+	if c.LastSeen.IsZero() {
+		c.LastSeen = now
+	}
+	if c.UpdatedAt.IsZero() {
+		c.UpdatedAt = now
+	}
+	if c.Version == 0 {
+		c.Version = 1
+	}
+	if err := s.UpsertCandidate(c, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	return c
 }

@@ -40,8 +40,8 @@ func Acknowledge(s *store.Store, agent string, hookData []byte) error {
 	if candidateID == "" {
 		return nil
 	}
-	c, err := s.GetProposedCandidate(candidateID)
-	if err != nil {
+	c, err := s.GetCandidate(candidateID)
+	if err != nil || !canAcknowledgeToAccepted(c.State) {
 		return nil
 	}
 	if project := ProjectFromHook(hookData); project != "" && !candidateMatchesProject(s, c.ID, project) {
@@ -113,6 +113,23 @@ func Accept(s *store.Store, candidateID, skillPath string) error {
 			return &t
 		}(),
 	})
+}
+
+func ApplyOnce(s *store.Store, app model.ReplayApplication) error {
+	if _, err := s.GetCandidate(app.CandidateID); err != nil {
+		return err
+	}
+	_, err := s.RecordReplayApplication(app)
+	return err
+}
+
+func canAcknowledgeToAccepted(state model.CandidateState) bool {
+	switch state {
+	case model.CandidateProposed, model.CandidateSaveSuggested:
+		return true
+	default:
+		return false
+	}
 }
 
 func Snooze(s *store.Store, candidateID string) error {

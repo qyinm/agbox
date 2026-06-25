@@ -4,12 +4,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/hippoom/agbox/internal/connect"
 	"github.com/hippoom/agbox/internal/evidence"
 	"github.com/hippoom/agbox/internal/model"
 	"github.com/hippoom/agbox/internal/pipeline"
+	"github.com/hippoom/agbox/internal/scan"
 	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/store"
 	"github.com/hippoom/agbox/internal/watcher"
@@ -18,6 +20,8 @@ import (
 var betaStatePriority = []model.CandidateState{
 	model.CandidateProposalReady,
 	model.CandidateProposed,
+	model.CandidateAppliedOnce,
+	model.CandidateSaveSuggested,
 	model.CandidatePending,
 	model.CandidateApproved,
 }
@@ -25,7 +29,8 @@ var betaStatePriority = []model.CandidateState{
 func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("beta", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	limit := fs.Int("limit", 5, "maximum candidates to show")
+	limit := fs.Int("limit", 5, "maximum workflows to show")
+	forceSync := fs.Bool("sync", false, "force session ingest before showing workflows")
 	if err := fs.Parse(reorderFlags(args, map[string]bool{"limit": true})); err != nil {
 		return err
 	}
@@ -33,7 +38,13 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 		return fmt.Errorf("--limit must be 0 or greater")
 	}
 
-	syncResult, syncFatalErr := pipeline.SyncBestEffort(s)
+	var syncResult pipeline.BestEffortSyncResult
+	var syncFatalErr error
+	if *forceSync {
+		syncResult, syncFatalErr = pipeline.SyncBestEffort(s)
+	} else {
+		syncResult, syncFatalErr = pipeline.SyncBestEffortIfStale(s)
+	}
 	if syncFatalErr != nil {
 		return syncFatalErr
 	}
@@ -62,9 +73,11 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 	fmt.Fprintf(stdout, "  last sync: %s\n", formatLastSync(lastSync))
 	fmt.Fprintf(stdout, "  corrections: %d\n", corrections)
 	fmt.Fprintf(stdout, "  prompt events: %d\n", stats.Events)
-	fmt.Fprintf(stdout, "  candidates: %d\n", stats.Candidates)
+	fmt.Fprintf(stdout, "  recorded workflows: %d\n", stats.Candidates)
 	if syncErr != nil {
 		fmt.Fprintf(stdout, "  sync: partial (%s)\n", betaSyncIssue(syncErr))
+	} else if syncResult.IngestSkipped {
+		fmt.Fprintln(stdout, "  sync: fresh (skipped ingest, scanned workflows)")
 	} else {
 		fmt.Fprintf(stdout, "  sync: ok (%d new corrections)\n", ingested)
 	}
@@ -73,8 +86,8 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 	}
 	if *limit == 0 {
 		fmt.Fprintln(stdout)
-		fmt.Fprintln(stdout, "Candidate display disabled by --limit 0.")
-		fmt.Fprintln(stdout, "Run agbox beta --limit 5 to show candidates.")
+		fmt.Fprintln(stdout, "Recorded Workflow display disabled by --limit 0.")
+		fmt.Fprintln(stdout, "Run agbox beta --limit 5 to show workflows.")
 		return nil
 	}
 
@@ -84,16 +97,16 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 	}
 	if len(candidates) == 0 {
 		fmt.Fprintln(stdout)
-		fmt.Fprintln(stdout, "No repeated corrections yet.")
-		fmt.Fprintln(stdout, "No repeated prompt patterns yet.")
+		fmt.Fprintln(stdout, "No strong Recorded Workflows yet.")
 		fmt.Fprintln(stdout, "Keep working in Claude, Codex, Cursor, or Grok; agbox will watch for repeated workflow signals.")
+		fmt.Fprintln(stdout, "Manage recorded workflows anytime: agbox inbox")
 		fmt.Fprintln(stdout, "Try the loop without touching your data: agbox demo")
 		fmt.Fprintln(stdout, "Check setup anytime: agbox doctor")
 		return nil
 	}
 
 	fmt.Fprintln(stdout)
-	fmt.Fprintf(stdout, "Workflow candidates (showing %d)\n", len(candidates))
+	fmt.Fprintf(stdout, "Recorded Workflows (showing %d)\n", len(candidates))
 	for i, c := range candidates {
 		card, err := evidence.Build(s, c.ID)
 		if err != nil {
@@ -107,6 +120,8 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 		fmt.Fprintf(stdout, "   next: %s\n", betaNextAction(c))
 		fmt.Fprintf(stdout, "   inspect: agbox evidence %s\n", c.ID)
 	}
+	fmt.Fprintln(stdout)
+	fmt.Fprintln(stdout, "Manage recorded workflows: agbox inbox")
 	return nil
 }
 
@@ -115,7 +130,7 @@ func betaCandidates(s *store.Store, limit int) ([]model.Candidate, error) {
 		return nil, nil
 	}
 	seen := map[string]bool{}
-	out := make([]model.Candidate, 0, limit)
+	scored := make([]betaCandidateScore, 0, limit)
 	for _, state := range betaStatePriority {
 		candidates, err := s.ListCandidatesByState(state)
 		if err != nil {
@@ -126,13 +141,109 @@ func betaCandidates(s *store.Store, limit int) ([]model.Candidate, error) {
 				continue
 			}
 			seen[c.ID] = true
-			out = append(out, c)
-			if len(out) == limit {
-				return out, nil
+			score, hidden := betaCandidateQuality(c)
+			if hidden {
+				continue
 			}
+			scored = append(scored, betaCandidateScore{
+				Candidate: c,
+				StateRank: betaStateRank(c.State),
+				Score:     score,
+			})
+		}
+	}
+	sort.SliceStable(scored, func(i, j int) bool {
+		if scored[i].StateRank != scored[j].StateRank {
+			return scored[i].StateRank < scored[j].StateRank
+		}
+		if scored[i].Score != scored[j].Score {
+			return scored[i].Score > scored[j].Score
+		}
+		if scored[i].Candidate.EventCount != scored[j].Candidate.EventCount {
+			return scored[i].Candidate.EventCount > scored[j].Candidate.EventCount
+		}
+		if !scored[i].Candidate.LastSeen.Equal(scored[j].Candidate.LastSeen) {
+			return scored[i].Candidate.LastSeen.After(scored[j].Candidate.LastSeen)
+		}
+		return scored[i].Candidate.ID < scored[j].Candidate.ID
+	})
+	out := make([]model.Candidate, 0, min(limit, len(scored)))
+	for _, item := range scored {
+		out = append(out, item.Candidate)
+		if len(out) == limit {
+			break
 		}
 	}
 	return out, nil
+}
+
+type betaCandidateScore struct {
+	Candidate model.Candidate
+	StateRank int
+	Score     int
+}
+
+func betaStateRank(state model.CandidateState) int {
+	for i, candidateState := range betaStatePriority {
+		if state == candidateState {
+			return i
+		}
+	}
+	return len(betaStatePriority)
+}
+
+func betaCandidateQuality(c model.Candidate) (int, bool) {
+	text := betaCandidateText(c)
+	if c.SourceKind == model.CandidateSourcePromptPattern && scan.IsPromptNoiseText(text) {
+		return 0, true
+	}
+	semantic := strings.TrimSpace(c.SemanticKey)
+	knownSemantic := semantic != "" && !strings.HasPrefix(semantic, "lexical:")
+	if c.SourceKind == model.CandidateSourcePromptPattern && !knownSemantic && c.Confidence == "low" && c.ProjectCount <= 1 {
+		return 0, true
+	}
+
+	score := 0
+	switch c.SourceKind {
+	case model.CandidateSourceCorrection:
+		score += 60
+	case model.CandidateSourcePromptPattern:
+		score += 30
+	}
+	if knownSemantic {
+		score += 40
+	}
+	if semantic == "current-project-analysis" {
+		score += 30
+	}
+	switch c.Confidence {
+	case "high":
+		score += 30
+	case "medium":
+		score += 15
+	}
+	if c.ProjectCount > 1 {
+		score += min(c.ProjectCount, 5) * 8
+	}
+	if c.SourceCount > 1 {
+		score += min(c.SourceCount, 5) * 4
+	}
+	score += min(c.EventCount, 10) * 3
+	if strings.HasPrefix(semantic, "lexical:") {
+		score -= 10
+	}
+	if len(c.Name) >= 45 {
+		score -= 5
+	}
+	return score, false
+}
+
+func betaCandidateText(c model.Candidate) string {
+	parts := []string{c.RuleText, c.Name, c.Description, c.SemanticKey}
+	text := strings.ToLower(strings.Join(parts, " "))
+	text = strings.ReplaceAll(text, "-", " ")
+	text = strings.ReplaceAll(text, "_", " ")
+	return strings.TrimSpace(text)
 }
 
 func betaEvidenceExample(card model.EvidenceCard) string {
@@ -154,6 +265,10 @@ func betaNextAction(c model.Candidate) string {
 		return "ready to propose inside your agent; keep working or run agbox review --state proposal_ready"
 	case model.CandidateProposed:
 		return "answer the in-agent proposal, or run agbox snooze " + c.ID
+	case model.CandidateAppliedOnce:
+		return "save for future at session stop, or review in agbox inbox --state applied_once"
+	case model.CandidateSaveSuggested:
+		return "answer the save-for-future prompt, or run agbox snooze " + c.ID
 	case model.CandidateApproved:
 		return "preview a safe write with agbox export " + c.ID + " --target agents-md --dry-run"
 	default:
@@ -219,7 +334,7 @@ func betaSourceState() string {
 func betaSyncIssue(err error) string {
 	msg := err.Error()
 	if strings.Contains(msg, "token too long") {
-		return "one session file was too large to parse; run agbox doctor if candidates look wrong"
+		return "one session file was too large to parse; run agbox doctor if workflows look wrong"
 	}
-	return "run agbox doctor if candidates look wrong"
+	return "run agbox doctor if workflows look wrong"
 }

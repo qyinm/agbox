@@ -8,12 +8,12 @@
 
   <!-- ASSET-PLACEHOLDER: <img src=".github/assets/agbox-banner.png" alt="agbox" width="100%" /> -->
 
-  <h1>🧠 agbox</h1>
+  <h1>agbox</h1>
 
   <p><strong>Workflow memory for AI coding agents.</strong></p>
   <p>
     Your agents keep making the same mistakes.<br/>
-    agbox captures repeated corrections and recurring workflow prompts — then promotes them into reusable skills your agents actually follow.
+    agbox records repeated corrections and recurring workflow prompts, suggests replay plans when they match your next request, and saves durable behavior only after you approve it.
   </p>
 
   <p>
@@ -37,7 +37,7 @@
 
 ---
 
-## ⚡ The 30-second aha
+## The 30-second aha
 
 You've typed `use bun, not npm` or `analyze the current project first` to your agent all week.
 
@@ -45,39 +45,41 @@ agbox noticed.
 
 ```bash
 npm install -g @agboxhq/cli   # macOS Apple Silicon (arm64) only today
-agbox beta                    # setup health + best candidates (or: agbox inbox)
+agbox inbox                   # Recorded Workflows and replay plans
 ```
 
 ```console
 $ agbox inbox
 
-  Promotion Inbox · 3 candidates
-  ───────────────────────────────────────────────
-  ●  use-bun-not-npm        seen 7×    confidence  high
-  ●  pr-summary-format      seen 4×    confidence  med
-  ○  conventional-commits   seen 3×    confidence  low
+  Recorded Workflows (showing 3 all)
 
-  → agbox evidence use-bun-not-npm     see why it's a candidate
-  → agbox approve  use-bun-not-npm     promote it to a skill
+  1. Current Project Analysis (cand_abc123)
+     lifecycle=Ready to replay confidence=high repeats=4 projects=1 source=prompt_pattern
+     when: When the user asks to analyze the current project, repository, codebase, or progress.
+     replay:
+       1. Inspect repository structure, language stack, package metadata, and tests for this request.
+       2. Summarize what the project does, key entry points, current state, and notable risks.
+       3. Ground conclusions in files or commands inspected during this request.
+     safety: Replay injects instructions and context for the current request only; it does not re-run prior commands or create a persistent skill.
 ```
 
-You review the evidence, approve it, and agbox writes the rule into the files your
-agents already read — so the workflow sticks, across every agent.
+When you later type the same kind of prompt, agbox asks your agent to offer an
+apply-once replay plan. If it works, agbox can ask at the end of the session
+whether to save that workflow for future automatic use.
 
 ```console
-$ agbox approve use-bun-not-npm --name package-manager
-✓ promoted → approved
+$ agbox apply cand_abc123 --agent codex --project agbox
+cand_abc123 -> applied once
 
-$ agbox export use-bun-not-npm --target claude
-✓ wrote CLAUDE.md  (wrapped in an agbox:start/end block, backup saved)
-  undo anytime:  agbox export rollback <export-id>
+# Later, after explicit approval, a native SKILL.md containing agbox_candidate_id
+# marks the workflow as saved for future use.
 ```
 
-That's the whole product: **stop repeating yourself to your AI.**
+That's the whole product: **record the workflow automatically, replay it once, then save it only when you say so.**
 
 ---
 
-## 🚀 Quick start
+## Quick start
 
 > **Platform:** `@agboxhq/cli` on npm is **macOS Apple Silicon (arm64) only** today.
 > Intel Mac, Linux, and Homebrew are on the roadmap. Other platforms: clone and `go install` from source.
@@ -87,10 +89,10 @@ npm install -g @agboxhq/cli
 agbox beta
 ```
 
-`npm install` runs `agbox init --quiet` automatically — it creates `~/.agbox/`, installs the
-session watcher, installs managed proposal hooks, and ingests existing agent sessions.
+`npm install` runs `agbox init --quiet` automatically. It creates `~/.agbox/`, installs the
+session watcher, installs managed workflow hooks, and ingests existing agent sessions.
 Set `AGBOX_SKIP_WATCHER=1` to skip all setup, or `AGBOX_SKIP_CONNECT=1` to keep the
-watcher but skip managed proposal hooks.
+watcher but skip managed workflow hooks.
 
 See the entire loop in a throwaway store, without touching anything real:
 
@@ -103,13 +105,17 @@ Then just work:
 ```bash
 # 1. Code like you always do. Correct your agent or repeat workflow prompts like you always do.
 #    agbox watches session files in the background.
-#    Managed hooks only propose skills and acknowledge created skill files.
+#    Managed hooks suggest replay, ask whether to save for future, and acknowledge created skill files.
+#    If a hook misses a SKILL.md write, agbox reconciles files with agbox_candidate_id
+#    when you run status, beta, doctor, or sync.
 
-# 2. See setup + candidates in one terminal-safe summary
+# 2. See setup + a curated workflow summary
 agbox beta                      # best first beta command
+agbox beta --sync               # force a refresh when you want one
 
 # 3. Review what it learned
-agbox review                    # interactive TUI: evidence, approve, export
+agbox inbox                     # Recorded Workflow cards and replay plans
+agbox review                    # interactive TUI: evidence, replay plan, approve, export
 
 # 4. Check watcher and managed hook health anytime
 agbox status                    # watcher state, last sync, correction/event counts
@@ -118,14 +124,14 @@ agbox doctor                    # full health check
 
 ---
 
-## 🎁 What you get
+## What you get
 
-### See *why* a correction or prompt became a candidate — before anything touches your config
+### See *why* a workflow was recorded before anything becomes persistent
 
 ```console
 $ agbox evidence use-bun-not-npm
 
-  Candidate · use-bun-not-npm
+  Recorded Workflow · use-bun-not-npm
   ─────────────────────────────────────────────
   Seen        7 times · 2 sessions
   Agents      claude_code, codex_cli
@@ -139,44 +145,44 @@ $ agbox evidence use-bun-not-npm
   Suggested rule
     Always use bun as the package manager. Never use npm.
   ─────────────────────────────────────────────
-  → agbox approve use-bun-not-npm --name package-manager
+  > agbox inbox
 ```
 
-No black box. Every candidate is a readable **Evidence Card** you can trust or reject.
+No black box. Every Recorded Workflow is backed by readable evidence you can trust, snooze, reject, apply once, or save for future.
 
 ### Prove it actually worked
 
 ```console
 $ agbox impact use-bun-not-npm
 
-  Repeat corrections · before vs after promotion
+  Repeat corrections · before vs after saved workflow
   ───────────────────────────────────────────────
-  use-bun-not-npm     7  →  0     ✓ stopped recurring
+  use-bun-not-npm     7  ->  0    stopped recurring
 ```
 
 > Output above is illustrative — run `agbox demo` to see the real thing end to end.
 
 ---
 
-## 🧩 How it works
+## How it works
 
 agbox keeps a tiny, local store in your home directory — like `.git/`, but for the
 workflows your agents keep forgetting.
 
 ```
-  ingest     →    cluster    →    review      →    export
+  ingest     ->   cluster    ->   replay      ->   save
  ┌────────┐      ┌────────┐      ┌─────────┐      ┌──────────────┐
- │watcher │      │ scan   │      │ review  │      │ CLAUDE.md    │
- │ session│ ───▶ │ group  │ ───▶ │ approve │ ───▶ │ AGENTS.md    │
- │ files  │      │ repeats│      │ /reject │      │ Cursor·Cline │
+ │watcher │      │ scan   │      │ apply   │      │ SKILL.md     │
+ │ session│ ───▶ │ group  │ ───▶ │ once    │ ───▶ │ after        │
+ │ files  │      │ repeats│      │ /reject │      │ approval     │
  └────────┘      └────────┘      └─────────┘      └──────────────┘
-  automatic       confidence      you stay         written where
-                  scored          in control       agents read
+  automatic       confidence      current request  future reuse
+                  scored          only             requires yes
 ```
 
 ```
 ~/.agbox/
-├── agbox.db          # global SQLite store (sessions, corrections, prompt events, candidates)
+├── agbox.db          # global SQLite store (sessions, corrections, prompt events, workflows)
 ├── exports/          # reversible export backups
 └── watcher/          # LaunchAgent state
 
@@ -185,8 +191,9 @@ workflows your agents keep forgetting.
 └── config.toml
 ```
 
-Ingest is automatic and quiet — no notifications. Promotion is **always** a human
-decision. Export is **always** reversible.
+Ingest is automatic and quiet. Replay is instruction-only and scoped to the current
+request. Saving a workflow for future use is **always** a separate human decision.
+Export remains reversible.
 
 Clustering is deterministic and review-first: exact normalized hashes plus a small
 workflow taxonomy (package-manager preferences, PR-format rules, API/OpenAPI-sync
@@ -194,23 +201,23 @@ rules). agbox never silently installs a detected workflow.
 
 ---
 
-## ✨ Features
+## Features
 
 | | |
 |---|---|
-| 📥 **Automatic ingest** | A background watcher reads Claude Code, Codex, Cursor, and Grok session files. No manual commits, no copy-paste-into-a-fresh-chat. |
-| 💬 **In-context proposals** | Managed hooks can ask before creating a skill when agbox finds a repeated correction or recurring prompt pattern. Remove them with `agbox disconnect <agent>`. |
-| 🧮 **Smart clustering** | Repeated instructions get normalized, grouped, and confidence-scored — directional prefs like `bun-over-npm` included. |
-| 👀 **Beta summary + Review TUI** | `agbox beta` gives a terminal-safe summary; `agbox review` drills into evidence, approval, and export. |
-| 📤 **Vendor-neutral export** | One skill → `CLAUDE.md`, `AGENTS.md`, Cursor, Cline. Promote once, every agent obeys. |
-| ↩️ **Always reversible** | Every export is backed up and wrapped in markers. `agbox export rollback` undoes it cleanly. |
-| 🔒 **Local-first & private** | Sessions and workflow data stay in `~/.agbox/`. Redacted excerpts + hashes by default — raw prompts stay local. Anonymous usage counters only (opt-out: `agbox telemetry off`). |
-| 📊 **Impact tracking** | `agbox impact` shows repeat-correction counts before vs after. Proof, not vibes. |
-| 🧾 **Audit & doctor** | `agbox audit` produces a shareable report; `agbox doctor` checks your setup. |
+| **Automatic ingest** | A background watcher reads Claude Code, Codex, Cursor, and Grok session files. No manual commits, no copy-paste-into-a-fresh-chat. |
+| **In-context replay** | Managed hooks can suggest an apply-once replay plan when the current prompt matches a Recorded Workflow. At session stop, agbox can separately ask whether to save that workflow for future use. |
+| **Smart clustering** | Repeated instructions get normalized, grouped, and confidence-scored — directional prefs like `bun-over-npm` included. |
+| **Inbox + Review TUI** | `agbox inbox` shows Recorded Workflow cards with replay plans; `agbox review` drills into evidence, approval, and export. |
+| **Vendor-neutral export** | A saved workflow can be exported to `CLAUDE.md`, `AGENTS.md`, Cursor, and Cline formats when you want durable agent behavior. |
+| **Always reversible** | Every export is backed up and wrapped in markers. `agbox export rollback` undoes it cleanly. |
+| **Local-first & private** | Sessions and workflow data stay in `~/.agbox/`. Redacted excerpts + hashes by default — raw prompts stay local. Anonymous usage counters only (opt-out: `agbox telemetry off`). |
+| **Impact tracking** | `agbox impact` shows repeat-correction counts before vs after. Proof, not vibes. |
+| **Audit & doctor** | `agbox audit` produces a shareable report; `agbox doctor` checks your setup. |
 
 ---
 
-## 🔌 Works with
+## Works with
 
 agbox is **vendor-neutral by design.** It ingests from the agents you already run and
 exports to the formats they already read.
@@ -218,19 +225,19 @@ exports to the formats they already read.
 | Ingest from | Export to |
 |---|---|
 | Claude Code · Codex · Cursor · Grok | `CLAUDE.md` |
-| Managed proposal hooks: Claude · Codex · Grok | `AGENTS.md` *(read by most modern agents, including OpenClaw)* |
+| Managed workflow hooks: Claude · Codex · Grok | `AGENTS.md` *(read by most modern agents, including OpenClaw)* |
 | | `.cursor/rules/*.mdc` *(Cursor)* |
 | | `.clinerules/*.md` *(Cline — export only)* |
 
-One workflow signal, promoted once, lands everywhere your agents look.
+One recorded workflow can be replayed once for the current request, then saved for future agent use after explicit approval.
 
 ---
 
-## 🔒 Privacy & local-first
+## Privacy & Local-First
 
 agbox touches your prompts and your config files. That trust is the product, so:
 
-- **Sessions, prompts, and core workflow data stay local.** The global store is `~/.agbox/agbox.db`. Your corrections, prompt events, candidates, exports, and session ingest never leave your machine unless you explicitly share them (e.g. `agbox audit`).
+- **Sessions, prompts, and core workflow data stay local.** The global store is `~/.agbox/agbox.db`. Your corrections, prompt events, Recorded Workflows, replay applications, exports, and session ingest never leave your machine unless you explicitly share them (e.g. `agbox audit`).
 - **Anonymous usage stats (on by default).** Telemetry is enabled unless you opt out with `agbox telemetry off` or `AGBOX_TELEMETRY=0`. agbox sends only:
   - `agbox_install_completed` once (install/version signal)
   - `agbox_daily_active` at most once per UTC day (includes `streak_days`)
@@ -245,19 +252,19 @@ agbox touches your prompts and your config files. That trust is the product, so:
 
   Or set `AGBOX_TELEMETRY=0` in your shell. Check status with `agbox telemetry status` or `agbox doctor`.
 - **Redacted by default.** Persisted signals are short redacted excerpts + a hash + metadata. Raw text is opt-in via `--raw`; session ingest never stores full transcripts.
-- **Reversible by default.** Every export write is backed up; `agbox export rollback <id>` restores it. Managed proposal hooks can be removed with `agbox disconnect <agent>`.
+- **Reversible by default.** Every export write is backed up; `agbox export rollback <id>` restores it. Managed workflow hooks can be removed with `agbox disconnect <agent>`.
 - **Inspectable.** Open source, with a deterministic compiler — read exactly what gets written before it's written.
 - **Auditable.** `agbox audit` supports `private`, `shareable`, and `client` profiles.
 
 ---
 
-## 🤔 Why agbox exists
+## Why agbox Exists
 
 AI agents are brilliant and forgetful. You correct the same thing every session:
 
 - *"use bun, not npm"*
 - *"tests go in `__tests__`, not next to the file"*
-- *"summary → tests → risk, in that order, in every PR"*
+- *"summary -> tests -> risk, in that order, in every PR"*
 - *"analyze the current project before recommending changes"*
 
 Today that knowledge lives in your head and your patience. You either re-type it forever,
@@ -272,35 +279,37 @@ files shipped — repetition eliminated.
 
 ---
 
-## 📟 Command reference
+## Command Reference
 
 ```text
 agbox init [--quiet]                initialize ~/.agbox/, install watcher + managed hooks, ingest sessions
-agbox beta [--limit 5]              setup health + best candidate summary
+agbox beta [--limit 5] [--sync]     setup health + curated workflow summary
 agbox demo                          run the full loop in a throwaway store
 agbox status                        watcher state, last sync, correction/event counts
 agbox sources                       list discovered session source paths
-agbox sync --once                   force a session ingestion pass
+agbox sync --once                   force a standalone session ingestion pass
 agbox watch                         internal daemon (used by LaunchAgent)
 
 agbox capture --agent <a> "text"    record a workflow signal manually
 
 agbox scan                          detect repeated normalized signals
-agbox inbox [--state pending]       show Promotion Inbox candidates
+agbox inbox [--state …|all]         show Recorded Workflow cards and replay plans
 agbox discover                      scan + evidence + next-step commands
 agbox review                        interactive TUI review (primary interface)
 
-agbox evidence <id>                 explain why a candidate exists
-agbox approve <id> [--name …]       move a candidate to approved
-agbox reject  <id>                  reject a candidate
-agbox snooze  <id>                  snooze a promotion candidate (24h)
-agbox accept  <id> [--skill-path …] mark accepted after SKILL.md creation
+agbox evidence <id>                 explain why a Recorded Workflow exists
+agbox apply <id> [--agent …]        record that replay was applied once
+agbox approve <id> [--name …]       approve a Recorded Workflow for export
+agbox reject  <id>                  reject a Recorded Workflow
+agbox snooze  <id>                  snooze a Recorded Workflow (24h)
+agbox accept  <id> [--skill-path …] mark saved for future after SKILL.md creation
 agbox compile <id> [--target …]     render an approved skill (no write)
-agbox export  <id>… [--target …]    dry-run or apply an export plan (by candidate id)
+agbox export  <id>… [--target …]    dry-run or apply an export plan
 agbox export rollback <export-id>   restore the file backup for an export
-agbox connect <agent>               install managed proposal hooks (claude|codex|grok)
-agbox disconnect <agent>            remove managed proposal hooks
-agbox hook propose|acknowledge …    hook entrypoints (used by agent hook configs)
+agbox connect <agent>               install managed workflow hooks (claude|codex|grok)
+agbox disconnect <agent>            remove managed workflow hooks
+agbox hook propose|replay|save|acknowledge …
+                                    hook entrypoints (used by agent hook configs)
 
 agbox impact <id>                   repeat counts before vs after export
 agbox audit  [--profile …]          generate a workflow audit pack
@@ -318,7 +327,7 @@ Run `agbox <command> --help` for command-specific options.
 
 ---
 
-## 🛠️ Development
+## Development
 
 ```bash
 git clone https://github.com/qyinm/agbox
@@ -332,17 +341,17 @@ workflow, or pushing a `v*` tag).
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 agbox is Go, local-first, and small enough to read in an afternoon. Issues, ideas, and
 PRs are all welcome — [open an issue](https://github.com/qyinm/agbox/issues) to start.
 
-## 📄 License
+## License
 
 [MIT](LICENSE) © qyinm
 
 ---
 
 <div align="center">
-  <sub>Built for people who tell their agents the same thing twice. ⌘</sub>
+  <sub>Built for people who tell their agents the same thing twice.</sub>
 </div>

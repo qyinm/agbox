@@ -94,6 +94,39 @@ func TestConnectCodexPreservesUnknownFieldsAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestConnectCodexAddsPromptReplayHook(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AGBOX_HOME", filepath.Join(home, ".agbox"))
+	cmd := fakeExecutable(t, home)
+
+	plan, err := BuildPlan(AgentCodex, ActionConnect, Options{Command: cmd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Apply(plan); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := readJSONConfig(t, filepath.Join(home, ".codex", "hooks.json"))
+	promptCommands := managedCommandsForEvent(cfg, "UserPromptSubmit")
+	if len(promptCommands) != 1 {
+		t.Fatalf("prompt replay hook count = %d, want 1; cfg=%#v", len(promptCommands), cfg)
+	}
+	if !strings.Contains(promptCommands[0], " hook replay codex") {
+		t.Fatalf("prompt hook command = %q, want hook replay codex", promptCommands[0])
+	}
+	if !strings.Contains(strings.Join(managedCommandsForEvent(cfg, "SessionStart"), "\n"), " hook propose codex") {
+		t.Fatalf("session hook missing propose command: %#v", cfg)
+	}
+	if !strings.Contains(strings.Join(managedCommandsForEvent(cfg, "Stop"), "\n"), " hook save codex") {
+		t.Fatalf("stop hook missing save command: %#v", cfg)
+	}
+	if !strings.Contains(strings.Join(managedCommandsForEvent(cfg, "PostToolUse"), "\n"), " hook acknowledge codex") {
+		t.Fatalf("post-tool hook missing acknowledge command: %#v", cfg)
+	}
+}
+
 func TestConnectGrokWritesAgboxHooksFile(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -110,6 +143,9 @@ func TestConnectGrokWritesAgboxHooksFile(t *testing.T) {
 	cfg := readJSONConfig(t, filepath.Join(home, ".grok", "hooks", "agbox.json"))
 	if countManagedHandlers(cfg) < 3 {
 		t.Fatalf("managed hook count = %d, want >= 3", countManagedHandlers(cfg))
+	}
+	if _, ok := cfg["hooks"].(map[string]any)["UserPromptSubmit"]; ok {
+		t.Fatalf("grok should not receive unsupported prompt-submit hook: %#v", cfg)
 	}
 }
 
@@ -188,4 +224,37 @@ func mustRead(t *testing.T, path string) []byte {
 
 func countManagedHandlers(cfg map[string]any) int {
 	return len(managedCommands(cfg))
+}
+
+func managedCommandsForEvent(cfg map[string]any, event string) []string {
+	hooks, ok := cfg["hooks"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	groups, ok := hooks[event].([]any)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, groupAny := range groups {
+		group, ok := groupAny.(map[string]any)
+		if !ok {
+			continue
+		}
+		handlers, ok := group["hooks"].([]any)
+		if !ok {
+			continue
+		}
+		for _, handlerAny := range handlers {
+			handler, ok := handlerAny.(map[string]any)
+			if !ok {
+				continue
+			}
+			command, _ := handler["command"].(string)
+			if strings.Contains(command, managedMarker) {
+				out = append(out, command)
+			}
+		}
+	}
+	return out
 }

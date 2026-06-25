@@ -24,7 +24,7 @@ func eligiblePromptEvent(e model.Event) bool {
 	if normalized == "" {
 		return false
 	}
-	if isGeneratedProposalText(e.Excerpt) || isGeneratedProposalText(e.Raw) || isGeneratedProposalText(normalized) {
+	if IsPromptNoiseText(e.Excerpt) || IsPromptNoiseText(e.Raw) || IsPromptNoiseText(normalized) {
 		return false
 	}
 	if looksLikeStructuredContext(e.Excerpt) || looksLikeStructuredContext(e.Raw) {
@@ -49,6 +49,9 @@ func SemanticKey(normalized string) string {
 	if len(tokens) == 0 {
 		return ""
 	}
+	if key := currentProjectAnalysisKey(normalized, tokens); key != "" {
+		return key
+	}
 	if key := packageManagerKey(tokens); key != "" {
 		return key
 	}
@@ -64,6 +67,8 @@ func SemanticKey(normalized string) string {
 func workflowKind(events []model.Event) string {
 	for _, e := range events {
 		switch SemanticKey(e.Normalized) {
+		case "current-project-analysis":
+			return "current-project-analysis-workflow"
 		case "pr-format:summary-tests-risk":
 			return "pr-format-workflow"
 		case "api-route-openapi-sync":
@@ -170,13 +175,38 @@ func hasAny(tokens []string, values ...string) bool {
 	return false
 }
 
+func currentProjectAnalysisKey(normalized string, tokens []string) string {
+	if hasAny(tokens, "current") &&
+		hasAny(tokens, "project", "repo", "repository", "codebase") &&
+		hasAny(tokens, "analyze", "analyse", "analysis", "review") {
+		return "current-project-analysis"
+	}
+	if strings.Contains(normalized, "현재 프로젝트") && strings.Contains(normalized, "분석") {
+		return "current-project-analysis"
+	}
+	if strings.Contains(normalized, "현재까지") &&
+		strings.Contains(normalized, "진행사항") &&
+		strings.Contains(normalized, "분석") {
+		return "current-project-analysis"
+	}
+	return ""
+}
+
 var packageManagers = []string{"bun", "npm", "pnpm", "yarn"}
 
-func isGeneratedProposalText(value string) bool {
+// IsPromptNoiseText reports prompt text that should not become durable workflow memory.
+func IsPromptNoiseText(value string) bool {
 	value = strings.ToLower(strings.TrimSpace(value))
 	if value == "" {
 		return false
 	}
+	if isGeneratedProposalText(value) || isFileMentionWrapper(value) || isSessionControlBoilerplate(value) {
+		return true
+	}
+	return false
+}
+
+func isGeneratedProposalText(value string) bool {
 	if strings.Contains(value, "generate") &&
 		(strings.Contains(value, "hyperpersonalized suggestions") || strings.Contains(value, "hyper personalized suggestions")) {
 		return true
@@ -187,6 +217,39 @@ func isGeneratedProposalText(value string) bool {
 		"agbox candidate",
 		"should i create a reusable skill",
 		"reply yes no or later",
+	}
+	for _, marker := range markers {
+		if strings.Contains(value, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isFileMentionWrapper(value string) bool {
+	markers := []string{
+		"# files mentioned by the user",
+		"files mentioned by the user",
+		"codex clipboard",
+		"codex screenshot",
+		"codex image",
+		"codex pdf",
+		"the user has attached",
+	}
+	for _, marker := range markers {
+		if strings.HasPrefix(value, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSessionControlBoilerplate(value string) bool {
+	markers := []string{
+		"a previous agent produced the plan below",
+		"summary of previous conversation",
+		"user initiated a review task",
+		"request interrupted by user for tool use",
 	}
 	for _, marker := range markers {
 		if strings.Contains(value, marker) {

@@ -43,7 +43,7 @@ try {
   if (truthyEnv("AGBOX_SKIP_CONNECT") || truthyEnv("AGBOX_SKIP_HOOKS")) {
     console.log("agbox: watcher installed · managed hooks skipped · telemetry on by default · run `agbox doctor` to verify");
   } else {
-    console.log("agbox: watcher initialized · managed proposal hooks attempted · telemetry on by default · Codex users: run /hooks and trust agbox hooks · run `agbox doctor` to verify");
+    console.log("agbox: watcher initialized · managed workflow hooks attempted · telemetry on by default · Codex users: run /hooks and trust agbox hooks · run `agbox doctor` to verify");
   }
 } catch (err) {
   console.error("agbox: watcher install failed — run `agbox init` manually");

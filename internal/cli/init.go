@@ -91,11 +91,12 @@ project: .agbox/
 		fmt.Fprintf(stdout, "accepted existing skills: %d\n\n", syncResult.AcceptedSkills)
 	}
 	fmt.Fprintln(stdout, `Next steps:
-  agbox beta              # See setup + candidates in one terminal summary
-  agbox doctor            # Check watcher + managed proposal hooks
+  agbox beta              # See setup + recorded workflow summary
+  agbox inbox             # Review Recorded Workflows and replay plans
+  agbox doctor            # Check watcher + managed workflow hooks
   agbox status            # Check watcher and sync status
   agbox demo              # See the workflow in action
-  agbox disconnect <agent> # Remove managed proposal hooks`)
+  agbox disconnect <agent> # Remove managed workflow hooks`)
 	return nil
 }
 

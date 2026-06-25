@@ -10,13 +10,19 @@ import (
 	"github.com/hippoom/agbox/internal/store"
 )
 
+var syncBestEffortIfStale = pipeline.SyncBestEffortIfStale
+
 func runHook(s *store.Store, args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: agbox hook propose|acknowledge <agent>")
+		return fmt.Errorf("usage: agbox hook propose|replay|save|acknowledge <agent>")
 	}
 	switch args[0] {
 	case "propose":
 		return runHookPropose(s, args[1:], stdin, stdout)
+	case "replay":
+		return runHookReplay(s, args[1:], stdin, stdout)
+	case "save":
+		return runHookSave(s, args[1:], stdin, stdout)
 	case "acknowledge":
 		return runHookAcknowledge(s, args[1:], stdin, stdout)
 	default:
@@ -33,7 +39,7 @@ func runHookPropose(s *store.Store, args []string, stdin io.Reader, stdout io.Wr
 	if err != nil {
 		return err
 	}
-	syncResult, err := pipeline.SyncBestEffortIfStale(s)
+	syncResult, err := syncBestEffortIfStale(s)
 	if err != nil {
 		return err
 	}
@@ -52,6 +58,60 @@ func runHookPropose(s *store.Store, args []string, stdin io.Reader, stdout io.Wr
 		return nil
 	}
 	return propose.DeliverProposed(s, candidateID, payload, stdout, os.Stderr)
+}
+
+func runHookReplay(s *store.Store, args []string, stdin io.Reader, stdout io.Writer) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: agbox hook replay <claude|codex|grok>")
+	}
+	agent := args[0]
+	hookData, err := io.ReadAll(stdin)
+	if err != nil {
+		return err
+	}
+	project := propose.ProjectFromHook(hookData)
+	if project == "" {
+		project = defaultProject()
+	}
+	prompt := propose.PromptFromHook(hookData)
+	candidateID, payload, err := propose.SelectAndRenderForPrompt(s, agent, project, prompt)
+	if err != nil {
+		return err
+	}
+	if payload == "" {
+		return nil
+	}
+	return propose.DeliverProposed(s, candidateID, payload, stdout, os.Stderr)
+}
+
+func runHookSave(s *store.Store, args []string, stdin io.Reader, stdout io.Writer) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: agbox hook save <claude|codex|grok>")
+	}
+	agent := args[0]
+	hookData, err := io.ReadAll(stdin)
+	if err != nil {
+		return err
+	}
+	syncResult, err := syncBestEffortIfStale(s)
+	if err != nil {
+		return err
+	}
+	if syncResult.Warning != nil {
+		fmt.Fprintf(os.Stderr, "agbox: warning: partial sync before save prompt: %s\n", syncResult.Warning)
+	}
+	project := propose.ProjectFromHook(hookData)
+	if project == "" {
+		project = defaultProject()
+	}
+	candidateID, payload, err := propose.SelectAndRenderSaveForFuture(s, agent, project)
+	if err != nil {
+		return err
+	}
+	if payload == "" {
+		return nil
+	}
+	return propose.DeliverSaveSuggested(s, candidateID, payload, stdout, os.Stderr)
 }
 
 func runHookAcknowledge(s *store.Store, args []string, stdin io.Reader, stdout io.Writer) error {

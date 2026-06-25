@@ -82,6 +82,38 @@ func TestSyncBestEffortScansAndPromotesAfterIngestFailure(t *testing.T) {
 	}
 }
 
+func TestSyncBestEffortIfStaleStillScansAndPromotes(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	seedCorrectionPair(t, s)
+	if err := s.UpsertCursor(store.CursorRow{
+		SourcePath:   filepath.Join(t.TempDir(), "session.jsonl"),
+		Agent:        "claude",
+		LastSyncedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := pipeline.SyncBestEffortIfStale(s)
+	if err != nil {
+		t.Fatalf("SyncBestEffortIfStale error = %v", err)
+	}
+	if !result.IngestSkipped {
+		t.Fatal("SyncBestEffortIfStale did not report skipped ingest")
+	}
+
+	candidates, err := s.ListCandidatesByState(model.CandidateProposalReady)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("proposal_ready candidates = %d, want 1", len(candidates))
+	}
+}
+
 func seedCorrectionPair(t *testing.T, s *store.Store) {
 	t.Helper()
 	now := time.Now()

@@ -142,7 +142,10 @@ func (s *Store) migrate() error {
 	if err := migrateV4(s.db); err != nil {
 		return err
 	}
-	return migrateV5(s.db)
+	if err := migrateV5(s.db); err != nil {
+		return err
+	}
+	return migrateV6(s.db)
 }
 
 func (s *Store) TableExists(name string) bool {
@@ -383,6 +386,28 @@ type CandidateMetaUpdate struct {
 
 func (s *Store) UpdateCandidateMeta(id string, upd CandidateMetaUpdate) error {
 	now := time.Now()
+	sets, args := candidateMetaUpdateParts(upd, now)
+	args = append(args, id)
+	_, err := s.db.Exec(`UPDATE candidates SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...)
+	return err
+}
+
+func (s *Store) UpdateCandidateMetaIfState(id string, expected model.CandidateState, upd CandidateMetaUpdate) (bool, error) {
+	now := time.Now()
+	sets, args := candidateMetaUpdateParts(upd, now)
+	args = append(args, id, expected)
+	result, err := s.db.Exec(`UPDATE candidates SET `+strings.Join(sets, ", ")+` WHERE id = ? AND state = ?`, args...)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+func candidateMetaUpdateParts(upd CandidateMetaUpdate, now time.Time) ([]string, []any) {
 	sets := []string{"version = version + 1", "updated_at = ?"}
 	args := []any{formatTime(now)}
 	if upd.State != "" {
@@ -405,9 +430,7 @@ func (s *Store) UpdateCandidateMeta(id string, upd CandidateMetaUpdate) error {
 		sets = append(sets, "skill_path = ?")
 		args = append(args, upd.SkillPath)
 	}
-	args = append(args, id)
-	_, err := s.db.Exec(`UPDATE candidates SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...)
-	return err
+	return sets, args
 }
 
 func (s *Store) ListCandidatesByState(states ...model.CandidateState) ([]model.Candidate, error) {
@@ -435,6 +458,100 @@ func (s *Store) ListCandidatesByState(states ...model.CandidateState) ([]model.C
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) RecordReplayApplication(app model.ReplayApplication) (model.ReplayApplication, error) {
+	now := time.Now()
+	if app.ID == "" {
+		app.ID = replayApplicationID(app.CandidateID, now)
+	}
+	if app.AppliedAt.IsZero() {
+		app.AppliedAt = now
+	}
+	if app.CreatedAt.IsZero() {
+		app.CreatedAt = now
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return model.ReplayApplication{}, err
+	}
+	defer tx.Rollback()
+
+	var state string
+	if err := tx.QueryRow(`SELECT state FROM candidates WHERE id = ?`, app.CandidateID).Scan(&state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.ReplayApplication{}, fmt.Errorf("candidate not found: %s", app.CandidateID)
+		}
+		return model.ReplayApplication{}, err
+	}
+	currentState := model.CandidateState(state)
+
+	if _, err := tx.Exec(`INSERT INTO replay_applications
+		(id, candidate_id, agent, project, prompt_hash, prompt_excerpt, applied_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		app.ID, app.CandidateID, app.Agent, app.Project, app.PromptHash, app.PromptExcerpt,
+		formatTime(app.AppliedAt), formatTime(app.CreatedAt)); err != nil {
+		return model.ReplayApplication{}, err
+	}
+	if canMarkAppliedOnce(currentState) {
+		result, err := tx.Exec(`UPDATE candidates SET state = ?, version = version + 1, updated_at = ? WHERE id = ? AND state = ?`,
+			model.CandidateAppliedOnce, formatTime(now), app.CandidateID, currentState)
+		if err != nil {
+			return model.ReplayApplication{}, err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return model.ReplayApplication{}, err
+		}
+		if rows == 0 {
+			return model.ReplayApplication{}, fmt.Errorf("candidate state changed before replay application: %s", app.CandidateID)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return model.ReplayApplication{}, err
+	}
+	return app, nil
+}
+
+func (s *Store) ListReplayApplications(candidateID string) ([]model.ReplayApplication, error) {
+	query := `SELECT id, candidate_id, agent, project, prompt_hash, prompt_excerpt, applied_at, created_at FROM replay_applications`
+	var args []any
+	if strings.TrimSpace(candidateID) != "" {
+		query += ` WHERE candidate_id = ?`
+		args = append(args, candidateID)
+	}
+	query += ` ORDER BY applied_at DESC, created_at DESC`
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.ReplayApplication
+	for rows.Next() {
+		app, err := scanReplayApplication(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, app)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) LatestReplayApplication(candidateID, project string) (model.ReplayApplication, error) {
+	query := `SELECT id, candidate_id, agent, project, prompt_hash, prompt_excerpt, applied_at, created_at
+		FROM replay_applications WHERE candidate_id = ?`
+	args := []any{candidateID}
+	if strings.TrimSpace(project) != "" {
+		query += ` AND project = ?`
+		args = append(args, project)
+	}
+	query += ` ORDER BY applied_at DESC, created_at DESC LIMIT 1`
+	app, err := scanReplayApplication(s.db.QueryRow(query, args...))
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.ReplayApplication{}, fmt.Errorf("replay application not found: %s", candidateID)
+	}
+	return app, err
 }
 
 func (s *Store) CreateExport(e model.ExportRecord) error {
@@ -518,6 +635,15 @@ func scanCandidate(scanner interface{ Scan(dest ...any) error }) (model.Candidat
 	return c, err
 }
 
+func scanReplayApplication(scanner interface{ Scan(dest ...any) error }) (model.ReplayApplication, error) {
+	var app model.ReplayApplication
+	var applied, created string
+	err := scanner.Scan(&app.ID, &app.CandidateID, &app.Agent, &app.Project, &app.PromptHash, &app.PromptExcerpt, &applied, &created)
+	app.AppliedAt = parseTime(applied)
+	app.CreatedAt = parseTime(created)
+	return app, err
+}
+
 func scanExport(scanner interface{ Scan(dest ...any) error }) (model.ExportRecord, error) {
 	var e model.ExportRecord
 	var status, applied, rolled, created string
@@ -549,4 +675,24 @@ func boolInt(v bool) int {
 		return 1
 	}
 	return 0
+}
+
+func replayApplicationID(candidateID string, t time.Time) string {
+	base := strings.TrimPrefix(candidateID, "cand_")
+	if base == "" {
+		base = "unknown"
+	}
+	return fmt.Sprintf("rapp_%s_%d", base, t.UnixNano())
+}
+
+func canMarkAppliedOnce(state model.CandidateState) bool {
+	switch state {
+	case model.CandidatePending,
+		model.CandidateProposalReady,
+		model.CandidateProposed,
+		model.CandidateAppliedOnce:
+		return true
+	default:
+		return false
+	}
 }

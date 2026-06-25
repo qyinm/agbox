@@ -35,7 +35,7 @@ func Run(s *store.Store) Report {
 	} else {
 		r.Lines = append(r.Lines, fmt.Sprintf("corrections: %d", corrections))
 	}
-	r.Lines = append(r.Lines, fmt.Sprintf("candidates: %d", stats.Candidates))
+	r.Lines = append(r.Lines, fmt.Sprintf("recorded workflows: %d", stats.Candidates))
 	r.Lines = append(r.Lines, fmt.Sprintf("exports: %d", stats.Exports))
 	if reconcileResult, err := propose.ReconcileAcceptedSkills(s); err != nil {
 		r.Lines = append(r.Lines, "skills: FAIL "+err.Error())
@@ -91,7 +91,7 @@ func Run(s *store.Store) Report {
 		r.Lines = append(r.Lines, line)
 	}
 	if needsInit {
-		r.Lines = append(r.Lines, "next: agbox init # install or repair watcher and managed proposal hooks")
+		r.Lines = append(r.Lines, "next: agbox init # install or repair watcher and managed workflow hooks")
 	}
 	return r
 }

@@ -222,6 +222,52 @@ func TestRunCreatesPromptCandidateWhenCorrectionsExist(t *testing.T) {
 	}
 }
 
+func TestRunClustersCurrentProjectAnalysisPrompts(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	inputs := []struct {
+		text    string
+		project string
+	}{
+		{text: "현재 프로젝트 분석해줘.", project: "repo-a"},
+		{text: "현재까지의 진행사항 분석해줘.", project: "repo-a"},
+		{text: "Analyze the current project before recommending changes.", project: "repo-b"},
+	}
+	for _, input := range inputs {
+		if _, err := capture.Capture(s, input.text, capture.Options{Project: input.project, Source: "codex", Agent: "codex"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := Run(s, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Candidates) != 1 {
+		t.Fatalf("candidates = %d, want 1", len(result.Candidates))
+	}
+	c := result.Candidates[0]
+	if c.SemanticKey != "current-project-analysis" {
+		t.Fatalf("semantic key = %q, want current-project-analysis", c.SemanticKey)
+	}
+	if c.Name != "current-project-analysis-workflow" {
+		t.Fatalf("name = %q, want current-project-analysis-workflow", c.Name)
+	}
+	if c.SourceKind != model.CandidateSourcePromptPattern {
+		t.Fatalf("source kind = %q, want prompt_pattern", c.SourceKind)
+	}
+	if c.EventCount != 3 {
+		t.Fatalf("event count = %d, want 3", c.EventCount)
+	}
+	if c.ProjectCount != 2 {
+		t.Fatalf("project count = %d, want 2", c.ProjectCount)
+	}
+}
+
 func TestRunReusesLegacyLinkedPromptCandidate(t *testing.T) {
 	s, err := store.Open(filepath.Join(t.TempDir(), "agbox.db"))
 	if err != nil {
@@ -281,6 +327,12 @@ func TestRunSkipsPromptNoise(t *testing.T) {
 		"<environment_context><cwd>/tmp/repo</cwd></environment_context>",
 		"## agbox skill proposal instructions\nReply yes no or later.",
 		"Generate 0 to 3 hyperpersonalized suggestions for the user based on their recent prompts.",
+		"# Files mentioned by the user:\n\n- /Users/demo/Desktop/Codex Clipboard.txt",
+		"# Files mentioned by the user:\n\n- /Users/demo/Desktop/screenshot.png",
+		"The user has attached a PDF file for context: /tmp/spec.pdf",
+		"A previous agent produced the plan below. Use it to continue execution.",
+		"<user_action><context>User initiated a review task.</context></user_action>",
+		"Request interrupted by user for tool use.",
 	}
 	for _, input := range cases {
 		t.Run(input, func(t *testing.T) {
