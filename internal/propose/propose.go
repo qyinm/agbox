@@ -118,6 +118,53 @@ func SelectForPrompt(s *store.Store, project, prompt string) (model.Candidate, e
 	return eligible[0], nil
 }
 
+func SelectAndRenderSaveForFuture(s *store.Store, agent, project string) (candidateID, payload string, err error) {
+	match, err := SelectForSaveForFuture(s, project)
+	if err != nil || match.ID == "" {
+		return "", "", err
+	}
+	card, err := evidence.Build(s, match.ID)
+	if err != nil {
+		return "", "", err
+	}
+	return match.ID, RenderSaveForFutureInjection(agent, card), nil
+}
+
+func SelectForSaveForFuture(s *store.Store, project string) (model.Candidate, error) {
+	candidates, err := s.ListCandidatesByState(model.CandidateAppliedOnce)
+	if err != nil {
+		return model.Candidate{}, err
+	}
+	var eligible []model.Candidate
+	appliedAt := map[string]time.Time{}
+	for _, c := range candidates {
+		if project != "" && !candidateMatchesProject(s, c.ID, project) {
+			continue
+		}
+		apps, err := s.ListReplayApplications(c.ID)
+		if err != nil || len(apps) == 0 {
+			continue
+		}
+		appliedAt[c.ID] = apps[0].AppliedAt
+		eligible = append(eligible, c)
+	}
+	if len(eligible) == 0 {
+		return model.Candidate{}, nil
+	}
+	sort.Slice(eligible, func(i, j int) bool {
+		ti, tj := appliedAt[eligible[i].ID], appliedAt[eligible[j].ID]
+		if !ti.Equal(tj) {
+			return ti.After(tj)
+		}
+		ri, rj := confidenceRank(eligible[i]), confidenceRank(eligible[j])
+		if ri != rj {
+			return ri > rj
+		}
+		return eligible[i].EventCount > eligible[j].EventCount
+	})
+	return eligible[0], nil
+}
+
 // DeliverProposed writes injection text to the hook stdout, then marks the candidate proposed.
 // If marking fails after stdout delivery, it logs a warning instead of returning an error so
 // hook retries do not duplicate the injection payload.
@@ -127,6 +174,16 @@ func DeliverProposed(s *store.Store, candidateID, payload string, stdout, log io
 	}
 	if err := MarkProposed(s, candidateID); err != nil && log != nil {
 		_, _ = io.WriteString(log, "agbox: warning: proposal "+candidateID+" delivered but state not updated: "+err.Error()+"\n")
+	}
+	return nil
+}
+
+func DeliverSaveSuggested(s *store.Store, candidateID, payload string, stdout, log io.Writer) error {
+	if _, err := io.WriteString(stdout, payload); err != nil {
+		return err
+	}
+	if err := MarkSaveSuggested(s, candidateID); err != nil && log != nil {
+		_, _ = io.WriteString(log, "agbox: warning: save prompt "+candidateID+" delivered but state not updated: "+err.Error()+"\n")
 	}
 	return nil
 }
@@ -143,6 +200,21 @@ func MarkProposed(s *store.Store, candidateID string) error {
 	now := time.Now()
 	return s.UpdateCandidateMeta(candidateID, store.CandidateMetaUpdate{
 		State:      model.CandidateProposed,
+		ProposedAt: &now,
+	})
+}
+
+func MarkSaveSuggested(s *store.Store, candidateID string) error {
+	c, err := s.GetCandidate(candidateID)
+	if err != nil {
+		return err
+	}
+	if c.State != model.CandidateAppliedOnce {
+		return nil
+	}
+	now := time.Now()
+	return s.UpdateCandidateMeta(candidateID, store.CandidateMetaUpdate{
+		State:      model.CandidateSaveSuggested,
 		ProposedAt: &now,
 	})
 }

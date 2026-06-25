@@ -119,6 +119,9 @@ func TestConnectCodexAddsPromptReplayHook(t *testing.T) {
 	if !strings.Contains(strings.Join(managedCommandsForEvent(cfg, "SessionStart"), "\n"), " hook propose codex") {
 		t.Fatalf("session hook missing propose command: %#v", cfg)
 	}
+	if !strings.Contains(strings.Join(managedCommandsForEvent(cfg, "Stop"), "\n"), " hook save codex") {
+		t.Fatalf("stop hook missing save command: %#v", cfg)
+	}
 	if !strings.Contains(strings.Join(managedCommandsForEvent(cfg, "PostToolUse"), "\n"), " hook acknowledge codex") {
 		t.Fatalf("post-tool hook missing acknowledge command: %#v", cfg)
 	}

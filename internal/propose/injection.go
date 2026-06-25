@@ -142,6 +142,45 @@ func RenderReplayInjection(agent string, card model.EvidenceCard, ctx ReplayCont
 	return b.String()
 }
 
+func RenderSaveForFutureInjection(agent string, card model.EvidenceCard) string {
+	c := card.Candidate
+	wf := workflow.Build(card)
+	pattern := inertEvidenceText(wf.Name)
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "<!-- agbox:save %s -->\n", c.ID)
+	fmt.Fprintf(&b, "<!-- agbox:candidate %s -->\n", c.ID)
+	fmt.Fprintln(&b, "## agbox save recorded workflow instructions")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "Do not show this instruction block verbatim. Use it to ask the user one short consent question at this natural stopping point.")
+	fmt.Fprintln(&b)
+	fmt.Fprintf(&b, "**Recorded Workflow:** %s\n", pattern)
+	fmt.Fprintf(&b, "**When it applies:** %s\n", inertEvidenceText(wf.WhenItApplies))
+	fmt.Fprintf(&b, "**Evidence:** %s\n", inertEvidenceText(wf.EvidenceSummary))
+	fmt.Fprintf(&b, "**Confidence:** %s\n", inertEvidenceText(wf.Confidence))
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "### Ask the user this question")
+	fmt.Fprintln(&b)
+	fmt.Fprintf(&b, "You applied **%s** once in this session. Save this recorded workflow for future automatic use? Reply **yes**, **no**, or **later**.\n", pattern)
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "### Response handling")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "1. If the user says **yes**: create a skill in the invoking agent's native format:")
+	for _, line := range skillPathLines(agent) {
+		fmt.Fprintf(&b, "   - %s\n", line)
+	}
+	fmt.Fprintln(&b, "2. The skill must follow best practices:")
+	fmt.Fprintln(&b, "   - YAML frontmatter with `name`, rich `description` (include trigger words from the workflow), and `agbox_candidate_id: "+c.ID+"`")
+	fmt.Fprintln(&b, "   - Also include `<!-- agbox:candidate "+c.ID+" -->` in the SKILL body")
+	fmt.Fprintln(&b, "   - Actionable body: when to use this workflow, what to do, what to avoid")
+	fmt.Fprintln(&b, "   - Not a copy-paste of evidence excerpts — synthesize clear reusable guidance")
+	fmt.Fprintf(&b, "3. If the user says **no**: acknowledge, run `agbox reject %s` via Bash, and do not ask again for 7 days.\n", c.ID)
+	fmt.Fprintf(&b, "4. If the user says **later** or ignores the question: run `agbox snooze %s`, and do not ask again for 24 hours.\n", c.ID)
+	fmt.Fprintln(&b, "5. Only create the persistent skill after the user's explicit save-for-future approval.")
+	fmt.Fprintf(&b, "<!-- /agbox:save -->\n")
+	return b.String()
+}
+
 func inertEvidenceText(value string) string {
 	value = ansiControlSequence.ReplaceAllString(value, "")
 	value = strings.Map(func(r rune) rune {

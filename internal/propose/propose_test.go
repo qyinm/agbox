@@ -230,6 +230,35 @@ func TestRenderReplayInjectionTreatsEvidenceAsInertData(t *testing.T) {
 	}
 }
 
+func TestRenderSaveForFutureInjectionUsesNativeSkillAfterApproval(t *testing.T) {
+	card := model.EvidenceCard{
+		Candidate: model.Candidate{
+			ID:           "cand_savefuture",
+			Name:         "current-project-analysis-workflow",
+			SemanticKey:  "current-project-analysis",
+			SourceKind:   model.CandidateSourcePromptPattern,
+			State:        model.CandidateAppliedOnce,
+			EventCount:   3,
+			ProjectCount: 1,
+			SourceCount:  1,
+			Confidence:   "high",
+		},
+		Excerpts: []string{"현재 프로젝트 분석해줘"},
+	}
+	out := propose.RenderSaveForFutureInjection("codex", card)
+	for _, want := range []string{
+		"agbox save recorded workflow instructions",
+		"Save this recorded workflow for future automatic use?",
+		"create a skill in the invoking agent's native format",
+		"agbox_candidate_id: cand_savefuture",
+		"Only create the persistent skill after the user's explicit save-for-future approval",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("save injection missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestMatchesSkillPath(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -421,6 +450,124 @@ func TestSelectForPromptRejectsUnrelatedAndLowConfidenceWorkflows(t *testing.T) 
 	}
 }
 
+func TestSelectForSaveForFutureRequiresAppliedOnceApplication(t *testing.T) {
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now()
+	applied := seedPromptCandidate(t, s, model.Candidate{
+		ID:           "cand_appliedsave",
+		Fingerprint:  "fp_appliedsave",
+		Name:         "current-project-analysis-workflow",
+		SemanticKey:  "current-project-analysis",
+		State:        model.CandidateAppliedOnce,
+		EventCount:   3,
+		ProjectCount: 1,
+		SourceCount:  1,
+		Confidence:   "high",
+		FirstSeen:    now,
+		LastSeen:     now,
+		UpdatedAt:    now,
+	})
+	older := seedPromptCandidate(t, s, model.Candidate{
+		ID:           "cand_oldappliedsave",
+		Fingerprint:  "fp_oldappliedsave",
+		Name:         "older-workflow",
+		SemanticKey:  "pr-format:summary-tests-risk",
+		State:        model.CandidateAppliedOnce,
+		EventCount:   20,
+		ProjectCount: 1,
+		SourceCount:  1,
+		Confidence:   "high",
+		FirstSeen:    now.Add(-time.Hour),
+		LastSeen:     now.Add(time.Hour),
+		UpdatedAt:    now,
+	})
+	seedPromptCandidate(t, s, model.Candidate{
+		ID:           "cand_notappliedsave",
+		Fingerprint:  "fp_notappliedsave",
+		Name:         "pr-format-workflow",
+		SemanticKey:  "pr-format:summary-tests-risk",
+		State:        model.CandidateProposalReady,
+		EventCount:   10,
+		ProjectCount: 1,
+		SourceCount:  1,
+		Confidence:   "high",
+		FirstSeen:    now,
+		LastSeen:     now.Add(time.Minute),
+		UpdatedAt:    now,
+	})
+	if _, err := s.RecordReplayApplication(model.ReplayApplication{
+		ID:          "rapp_appliedsave",
+		CandidateID: applied.ID,
+		Agent:       "codex",
+		Project:     "agbox",
+		AppliedAt:   now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordReplayApplication(model.ReplayApplication{
+		ID:          "rapp_oldappliedsave",
+		CandidateID: older.ID,
+		Agent:       "codex",
+		Project:     "agbox",
+		AppliedAt:   now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := propose.SelectForSaveForFuture(s, "agbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != applied.ID {
+		t.Fatalf("selected = %s, want %s", got.ID, applied.ID)
+	}
+}
+
+func TestDeliverSaveSuggestedMarksSaveSuggested(t *testing.T) {
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now()
+	c := seedPromptCandidate(t, s, model.Candidate{
+		ID:           "cand_marksave",
+		Fingerprint:  "fp_marksave",
+		Name:         "current-project-analysis-workflow",
+		SemanticKey:  "current-project-analysis",
+		State:        model.CandidateAppliedOnce,
+		EventCount:   3,
+		ProjectCount: 1,
+		SourceCount:  1,
+		Confidence:   "high",
+		FirstSeen:    now,
+		LastSeen:     now,
+		UpdatedAt:    now,
+	})
+	var out strings.Builder
+	if err := propose.DeliverSaveSuggested(s, c.ID, "payload", &out, nil); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "payload" {
+		t.Fatalf("payload = %q", out.String())
+	}
+	got, err := s.GetCandidate(c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != model.CandidateSaveSuggested {
+		t.Fatalf("state = %s, want save_suggested", got.State)
+	}
+}
+
 func TestPromptFromHookParsesNestedPromptAndIgnoresMalformedJSON(t *testing.T) {
 	got := propose.PromptFromHook([]byte(`{"payload":{"userPrompt":"  현재   프로젝트 분석해줘  "}}`))
 	if got != "현재 프로젝트 분석해줘" {
@@ -467,6 +614,51 @@ func TestAcknowledgeReadsCandidateIDFromFrontmatter(t *testing.T) {
 
 	hookData := []byte(`{"tool_input":{"file_path":"` + skillPath + `"},"cwd":"` + dir + `"}`)
 	if err := propose.Acknowledge(s, "grok", hookData); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetCandidate(c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != model.CandidateAccepted {
+		t.Fatalf("state = %s, want accepted", got.State)
+	}
+}
+
+func TestAcknowledgeAcceptsSaveSuggestedCandidate(t *testing.T) {
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now()
+	c := model.Candidate{
+		ID:          "cand_acksave",
+		Fingerprint: "fp_acksave",
+		Name:        "test-skill",
+		State:       model.CandidateSaveSuggested,
+		EventCount:  3,
+		ProposedAt:  now,
+		FirstSeen:   now,
+		LastSeen:    now,
+		UpdatedAt:   now,
+	}
+	if err := s.UpsertCandidate(c, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	skillDir := filepath.Join(dir, ".agents", "skills", "test-skill")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	skillPath := filepath.Join(skillDir, "SKILL.md")
+	if err := os.WriteFile(skillPath, []byte("---\nname: test\nagbox_candidate_id: cand_acksave\n---\nbody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hookData := []byte(`{"tool_input":{"file_path":"` + skillPath + `"},"cwd":"` + dir + `"}`)
+	if err := propose.Acknowledge(s, "codex", hookData); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.GetCandidate(c.ID)

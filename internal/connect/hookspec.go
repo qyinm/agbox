@@ -67,8 +67,10 @@ func managedHookGroup(agent, command, event string) map[string]any {
 
 func managedHookCommand(agent, command, event string) string {
 	switch event {
-	case "SessionStart", "Stop":
+	case "SessionStart":
 		return managedMarker + " " + shellQuote(command) + " hook propose " + agent
+	case "Stop":
+		return managedMarker + " " + shellQuote(command) + " hook save " + agent
 	case "UserPromptSubmit":
 		return managedMarker + " " + shellQuote(command) + " hook replay " + agent
 	case "PostToolUse":

@@ -726,6 +726,61 @@ func TestApplyRecordsAppliedOnce(t *testing.T) {
 	}
 }
 
+func TestHookSavePromptsAfterAppliedOnce(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+
+	s, err := store.Open(filepath.Join(root, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := seedBetaCandidate(t, s, model.Candidate{
+		Name:         "current-project-analysis-workflow",
+		RuleText:     "현재 프로젝트 분석해줘.",
+		SemanticKey:  "current-project-analysis",
+		SourceKind:   model.CandidateSourcePromptPattern,
+		State:        model.CandidateAppliedOnce,
+		EventCount:   3,
+		ProjectCount: 1,
+		SourceCount:  1,
+		Confidence:   "high",
+	})
+	if _, err := s.RecordReplayApplication(model.ReplayApplication{
+		ID:          "rapp_hooksave",
+		CandidateID: c.ID,
+		Agent:       "codex",
+		Project:     "agbox",
+		AppliedAt:   time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := Execute([]string{"hook", "save", "codex"}, strings.NewReader(`{"cwd":"`+filepath.Join(root, "agbox")+`"}`), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "agbox save recorded workflow instructions") {
+		t.Fatalf("save hook output missing save instructions:\n%s", got)
+	}
+	s, err = store.Open(filepath.Join(root, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	stored, err := s.GetCandidate(c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != model.CandidateSaveSuggested {
+		t.Fatalf("state = %s, want save_suggested", stored.State)
+	}
+}
+
 func TestHookReplayWithoutPromptEmitsNothing(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
