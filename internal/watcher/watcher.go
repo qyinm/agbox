@@ -2,6 +2,9 @@ package watcher
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -14,12 +17,18 @@ import (
 
 const DefaultPollInterval = 5 * time.Minute
 
+var (
+	ingestAllBestEffort = session.IngestAllBestEffort
+	ingestSource        = session.IngestSource
+	allAdapters         = session.All
+)
+
 func Run(ctx context.Context, s *store.Store, pollInterval time.Duration) error {
 	if pollInterval <= 0 {
 		pollInterval = DefaultPollInterval
 	}
-	if _, err := session.IngestAll(s); err != nil {
-		return err
+	if _, err := ingestAllBestEffort(s); err != nil {
+		logError("initial ingest", err)
 	}
 
 	fw, err := fsnotify.NewWatcher()
@@ -30,7 +39,7 @@ func Run(ctx context.Context, s *store.Store, pollInterval time.Duration) error 
 
 	state := &watchState{}
 	if err := state.refresh(fw); err != nil {
-		return err
+		logError("refresh sources", err)
 	}
 
 	pollTicker := time.NewTicker(pollInterval)
@@ -47,20 +56,29 @@ func Run(ctx context.Context, s *store.Store, pollInterval time.Duration) error 
 			debounce.Stop()
 		}
 		debounce = time.AfterFunc(300*time.Millisecond, func() {
-			_, _ = session.IngestAll(s)
+			if _, err := ingestAllBestEffort(s); err != nil {
+				logError("debounced ingest", err)
+			}
 		})
 	}
+	defer func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if debounce != nil {
+			debounce.Stop()
+		}
+	}()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-pollTicker.C:
-			if _, err := session.IngestAll(s); err != nil {
-				return err
+			if _, err := ingestAllBestEffort(s); err != nil {
+				logError("poll ingest", err)
 			}
 			if err := state.refresh(fw); err != nil {
-				return err
+				logError("refresh sources", err)
 			}
 		case event, ok := <-fw.Events:
 			if !ok {
@@ -71,8 +89,9 @@ func Run(ctx context.Context, s *store.Store, pollInterval time.Duration) error 
 			}
 			path := event.Name
 			if src, adapter, ok := state.match(path); ok {
-				if err := session.IngestSource(s, adapter, src); err != nil {
-					return err
+				if err := ingestSource(s, adapter, src); err != nil {
+					logError("source ingest", err)
+					scheduleIngest()
 				}
 				continue
 			}
@@ -88,6 +107,13 @@ func Run(ctx context.Context, s *store.Store, pollInterval time.Duration) error 
 	}
 }
 
+func logError(context string, err error) {
+	if err == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "agbox watcher: %s: %v\n", context, err)
+}
+
 type watchState struct {
 	dirs    map[string]struct{}
 	sources map[string]sourceRef
@@ -101,10 +127,12 @@ type sourceRef struct {
 func (st *watchState) refresh(fw *fsnotify.Watcher) error {
 	nextDirs := make(map[string]struct{})
 	nextSources := make(map[string]sourceRef)
-	for _, adapter := range session.All() {
+	var errs []error
+	for _, adapter := range allAdapters() {
 		srcs, err := adapter.DiscoverSources()
 		if err != nil {
-			return err
+			errs = append(errs, fmt.Errorf("%s: %w", adapter.Agent(), err))
+			continue
 		}
 		for _, src := range srcs {
 			nextSources[src.Path] = sourceRef{source: src, adapter: adapter}
@@ -128,7 +156,7 @@ func (st *watchState) refresh(fw *fsnotify.Watcher) error {
 	}
 	st.dirs = nextDirs
 	st.sources = nextSources
-	return nil
+	return errors.Join(errs...)
 }
 
 func (st *watchState) match(path string) (session.Source, session.Adapter, bool) {

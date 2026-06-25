@@ -33,6 +33,7 @@ func TestInstallWritesLaunchAgentPlist(t *testing.T) {
 		agboxBin,
 		"RunAtLoad",
 		"KeepAlive",
+		"<key>KeepAlive</key>\n\t<true/>",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("plist missing %q:\n%s", want, got)

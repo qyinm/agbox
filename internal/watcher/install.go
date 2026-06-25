@@ -144,7 +144,7 @@ func renderPlist(agboxBin, logPath string) string {
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
-	<false/>
+	<true/>
 	<key>StandardOutPath</key>
 	<string>%s</string>
 	<key>StandardErrorPath</key>
