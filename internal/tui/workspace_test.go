@@ -300,6 +300,55 @@ func TestWorkspaceModelEmbedsReviewModel(t *testing.T) {
 	}
 }
 
+func TestWorkspaceModelRendersHelpCommandBrowser(t *testing.T) {
+	m := NewWorkspaceModel(WorkspaceOptions{
+		InitialScreen: WorkspaceHelp,
+		CommandHelp: map[string]string{
+			"status": "Usage:\n  agbox status\n\nShow watcher state.",
+			"sync":   "Usage:\n  agbox sync\n\nForce ingest.",
+			"inbox":  "Usage:\n  agbox inbox\n\nShow Recorded Workflow cards.",
+		},
+	})
+	got := stripANSI(m.Render())
+	for _, want := range []string{
+		"Command Browser",
+		"Workspace",
+		"agbox status",
+		"Workflow",
+		"agbox inbox",
+		"Automation",
+		"agbox sync",
+		"Shortcuts",
+		"r refresh",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("help browser missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestWorkspaceModelRendersCommandHelpDetail(t *testing.T) {
+	m := NewWorkspaceModel(WorkspaceOptions{
+		InitialScreen: WorkspaceHelp,
+		HelpCommand:   "status",
+		CommandHelp: map[string]string{
+			"status": "Usage:\n  agbox status\n\nShow watcher state, store path, last sync, and correction/candidate counts.",
+		},
+	})
+	got := stripANSI(m.Render())
+	for _, want := range []string{
+		"agbox status",
+		"Show watcher state",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("command help detail missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "Command Browser") {
+		t.Fatalf("command detail included browser list:\n%s", got)
+	}
+}
+
 func TestWorkspaceModelNavigationChangesActiveScreen(t *testing.T) {
 	s := openTestStore(t)
 	defer s.Close()

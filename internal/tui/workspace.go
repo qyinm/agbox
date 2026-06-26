@@ -191,7 +191,7 @@ func (m WorkspaceModel) renderDetail() string {
 	case WorkspaceRepair:
 		return m.renderRepair()
 	case WorkspaceHelp:
-		return m.renderHelpPlaceholder()
+		return m.renderHelp()
 	default:
 		return m.renderPlaceholder("Workspace", "Select a screen from the left navigation.")
 	}
@@ -448,17 +448,27 @@ func (m WorkspaceModel) workflowData() ([]model.Candidate, map[string]model.Evid
 	return candidates, cards, nil
 }
 
-func (m WorkspaceModel) renderHelpPlaceholder() string {
+func (m WorkspaceModel) renderHelp() string {
 	var b strings.Builder
 	fmt.Fprintln(&b, sectionTitleStyle.Render("Help"))
 	if m.opts.HelpCommand != "" {
 		fmt.Fprintf(&b, "%s\n", detailTitleStyle.Render("agbox "+m.opts.HelpCommand))
 		if text, ok := m.opts.CommandHelp[m.opts.HelpCommand]; ok {
-			fmt.Fprintln(&b, bodyStyle.Render(firstLine(text)))
+			fmt.Fprintln(&b, bodyStyle.Render(strings.TrimSpace(text)))
 			return b.String()
 		}
 	}
-	fmt.Fprintln(&b, bodyStyle.Render("Browse agbox commands and workspace shortcuts."))
+	fmt.Fprintln(&b, detailTitleStyle.Render("Command Browser"))
+	for _, group := range helpCommandGroups {
+		fmt.Fprintln(&b)
+		fmt.Fprintln(&b, labelStyle.Render(group.title))
+		for _, command := range group.commands {
+			fmt.Fprintf(&b, "  %-18s %s\n", "agbox "+command, commandSummary(command, m.opts.CommandHelp))
+		}
+	}
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, labelStyle.Render("Shortcuts"))
+	fmt.Fprintln(&b, bodyStyle.Render("  tab/shift+tab navigate  1-6 jump  r refresh  ? help  q quit"))
 	return b.String()
 }
 
@@ -687,6 +697,37 @@ func firstLine(s string) string {
 		return s[:idx]
 	}
 	return s
+}
+
+type helpCommandGroup struct {
+	title    string
+	commands []string
+}
+
+var helpCommandGroups = []helpCommandGroup{
+	{"Workspace", []string{"status", "sources", "inbox", "review", "doctor", "repair", "help"}},
+	{"Workflow", []string{"evidence", "apply", "accept", "reject", "snooze", "approve"}},
+	{"Setup / demos", []string{"init", "connect", "disconnect", "beta", "demo"}},
+	{"Automation", []string{"capture", "scan", "discover", "sync", "hook", "compile", "export", "manifest", "impact", "audit", "telemetry"}},
+}
+
+func commandSummary(command string, help map[string]string) string {
+	text, ok := help[command]
+	if !ok {
+		if command == "help" {
+			return "Open this command browser."
+		}
+		return ""
+	}
+	lines := strings.Split(strings.TrimSpace(text), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "Usage:") || strings.HasPrefix(line, "agbox ") {
+			continue
+		}
+		return line
+	}
+	return firstLine(text)
 }
 
 func formatWorkspaceTime(t time.Time) string {
