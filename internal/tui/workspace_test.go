@@ -9,6 +9,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/hippoom/agbox/internal/pipeline"
+	"github.com/hippoom/agbox/internal/scan"
 	"github.com/hippoom/agbox/internal/store"
 )
 
@@ -194,8 +195,115 @@ func TestWorkspaceModelRendersRepairScreen(t *testing.T) {
 	}
 }
 
+func TestWorkspaceModelRendersWorkflowCards(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := storeWithCandidates(t, "현재 프로젝트 분석해줘.", "현재 프로젝트 분석해줘.")
+	defer s.Close()
+
+	m := NewWorkspaceModel(WorkspaceOptions{
+		InitialScreen: WorkspaceWorkflows,
+		Store:         s,
+	})
+	got := stripANSI(m.Render())
+	for _, want := range []string{
+		"Workflows",
+		"Recorded Workflow",
+		"Replay Plan",
+		"Evidence",
+		"Safety",
+		"does not re-run prior commands",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("workflow screen missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestWorkspaceModelRendersEmptyWorkflowState(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := openTestStore(t)
+	defer s.Close()
+
+	m := NewWorkspaceModel(WorkspaceOptions{
+		InitialScreen: WorkspaceWorkflows,
+		Store:         s,
+	})
+	got := stripANSI(m.Render())
+	for _, want := range []string{
+		"No Recorded Workflows yet.",
+		"Keep using your agents",
+		"repeated prompts and corrections",
+		"agbox demo",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("empty workflow screen missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestWorkspaceModelRendersEvidenceDetail(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := storeWithCandidates(t, "Use bun, not npm.", "Use bun, not npm.")
+	defer s.Close()
+	if _, err := scan.Run(s, 2); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := s.ListCandidates("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) == 0 {
+		t.Fatal("expected candidate")
+	}
+
+	m := NewWorkspaceModel(WorkspaceOptions{
+		InitialScreen: WorkspaceEvidence,
+		Store:         s,
+		EvidenceID:    candidates[0].ID,
+	})
+	got := stripANSI(m.Render())
+	for _, want := range []string{
+		"Evidence",
+		"Package Manager Preference",
+		"privacy:",
+		"Reason",
+		"Safety",
+		"does not re-run prior commands",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("evidence screen missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestWorkspaceModelEmbedsReviewModel(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := storeWithCandidates(t, "Use bun, not npm.", "Use bun, not npm.")
+	defer s.Close()
+
+	m := NewWorkspaceModel(WorkspaceOptions{
+		InitialScreen: WorkspaceReview,
+		Store:         s,
+	})
+	got := stripANSI(m.Render())
+	for _, want := range []string{
+		"agbox review",
+		"Package Manager Preference",
+		"Replay Plan",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("review workspace missing %q:\n%s", want, got)
+		}
+	}
+	if !strings.Contains(got, "4 Workflows") {
+		t.Fatalf("review workspace did not keep Workflows nav context:\n%s", got)
+	}
+}
+
 func TestWorkspaceModelNavigationChangesActiveScreen(t *testing.T) {
-	m := NewWorkspaceModel(WorkspaceOptions{InitialScreen: WorkspaceOverview})
+	s := openTestStore(t)
+	defer s.Close()
+	m := NewWorkspaceModel(WorkspaceOptions{InitialScreen: WorkspaceOverview, Store: s})
 	updated, _ := m.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyTab}))
 	m = updated.(WorkspaceModel)
 	if m.active != WorkspaceStatus {
@@ -207,7 +315,7 @@ func TestWorkspaceModelNavigationChangesActiveScreen(t *testing.T) {
 		t.Fatalf("active after 4 = %s, want %s", m.active, WorkspaceWorkflows)
 	}
 	got := stripANSI(m.Render())
-	if !strings.Contains(got, "Recorded Workflow inbox") {
+	if !strings.Contains(got, "No Recorded Workflows") {
 		t.Fatalf("workflows detail missing:\n%s", got)
 	}
 }

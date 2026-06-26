@@ -12,10 +12,14 @@ import (
 
 	"github.com/hippoom/agbox/internal/connect"
 	"github.com/hippoom/agbox/internal/doctor"
+	"github.com/hippoom/agbox/internal/evidence"
+	"github.com/hippoom/agbox/internal/model"
 	"github.com/hippoom/agbox/internal/pipeline"
+	"github.com/hippoom/agbox/internal/scan"
 	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/store"
 	"github.com/hippoom/agbox/internal/watcher"
+	"github.com/hippoom/agbox/internal/workflow"
 )
 
 var workspaceSyncBestEffort = pipeline.SyncBestEffort
@@ -46,14 +50,16 @@ type WorkspaceOptions struct {
 }
 
 type WorkspaceModel struct {
-	opts          WorkspaceOptions
-	active        WorkspaceScreen
-	width         int
-	height        int
-	navCursor     int
-	help          bool
-	refreshing    bool
-	statusMessage string
+	opts           WorkspaceOptions
+	active         WorkspaceScreen
+	width          int
+	height         int
+	navCursor      int
+	workflowCursor int
+	help           bool
+	refreshing     bool
+	statusMessage  string
+	review         ReviewModel
 }
 
 func NewWorkspaceModel(opts WorkspaceOptions) WorkspaceModel {
@@ -62,6 +68,9 @@ func NewWorkspaceModel(opts WorkspaceOptions) WorkspaceModel {
 	}
 	m := WorkspaceModel{opts: opts, active: opts.InitialScreen, width: 100, help: true}
 	m.navCursor = navIndex(opts.InitialScreen)
+	if opts.Store != nil {
+		m.review = NewReviewModel(NewReviewService(opts.Store, opts.ReviewOptions)).Refresh()
+	}
 	return m
 }
 
@@ -90,6 +99,8 @@ func (m WorkspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshing = true
 			m.statusMessage = "syncing"
 			return m, m.refreshCmd()
+		default:
+			m = m.handleActiveKey(msg.String())
 		}
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -97,6 +108,7 @@ func (m WorkspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case workspaceRefreshMsg:
 		m.refreshing = false
 		m.statusMessage = refreshStatusMessage(msg)
+		m.refreshActiveScreen()
 	}
 	return m, nil
 }
@@ -147,7 +159,7 @@ func (m WorkspaceModel) renderNav() string {
 	fmt.Fprintln(&b)
 	for i, item := range workspaceNavItems {
 		line := fmt.Sprintf("%d %s", i+1, item.label)
-		if item.screen == m.active {
+		if item.screen == m.navActiveScreen() {
 			fmt.Fprintln(&b, workspaceNavActiveStyle.Render(line))
 			continue
 		}
@@ -171,13 +183,46 @@ func (m WorkspaceModel) renderDetail() string {
 	case WorkspaceSources:
 		return m.renderSources()
 	case WorkspaceWorkflows:
-		return m.renderPlaceholder("Workflows", "Recorded Workflow inbox and replay-plan decisions.")
+		return m.renderWorkflows()
+	case WorkspaceReview:
+		return m.renderReview()
+	case WorkspaceEvidence:
+		return m.renderEvidence()
 	case WorkspaceRepair:
 		return m.renderRepair()
 	case WorkspaceHelp:
 		return m.renderHelpPlaceholder()
 	default:
 		return m.renderPlaceholder("Workspace", "Select a screen from the left navigation.")
+	}
+}
+
+func (m WorkspaceModel) handleActiveKey(key string) WorkspaceModel {
+	switch m.active {
+	case WorkspaceWorkflows:
+		candidates, _, err := m.workflowData()
+		if err != nil {
+			return m
+		}
+		switch key {
+		case "j", "down":
+			if m.workflowCursor < len(candidates)-1 {
+				m.workflowCursor++
+			}
+		case "k", "up":
+			if m.workflowCursor > 0 {
+				m.workflowCursor--
+			}
+		}
+	case WorkspaceReview:
+		m.review = m.review.HandleKey(key)
+	}
+	return m
+}
+
+func (m *WorkspaceModel) refreshActiveScreen() {
+	if m.active == WorkspaceReview && m.opts.Store != nil {
+		m.review = m.review.Refresh()
 	}
 }
 
@@ -281,6 +326,126 @@ func (m WorkspaceModel) renderRepair() string {
 		fmt.Fprintln(&b, bodyStyle.Render(line))
 	}
 	return b.String()
+}
+
+func (m WorkspaceModel) renderWorkflows() string {
+	var b strings.Builder
+	fmt.Fprintln(&b, sectionTitleStyle.Render("Workflows"))
+	candidates, cards, err := m.workflowData()
+	if err != nil {
+		fmt.Fprintln(&b, bodyStyle.Render("error: "+err.Error()))
+		return b.String()
+	}
+	if len(candidates) == 0 {
+		fmt.Fprintln(&b, detailTitleStyle.Render("No Recorded Workflows"))
+		fmt.Fprintln(&b, bodyStyle.Render("No Recorded Workflows yet."))
+		fmt.Fprintln(&b, mutedStyle.Render("Keep using your agents; agbox records repeated prompts and corrections automatically."))
+		fmt.Fprintln(&b, mutedStyle.Render("Try agbox demo, or run doctor if setup looks wrong."))
+		return b.String()
+	}
+	fmt.Fprintln(&b, detailTitleStyle.Render("Recorded Workflows"))
+	fmt.Fprintf(&b, "%s\n", mutedStyle.Render(fmt.Sprintf("showing %d %s recorded workflows", len(candidates), displayState(m.opts.WorkflowState))))
+	cursor := m.workflowCursor
+	if cursor >= len(candidates) {
+		cursor = len(candidates) - 1
+	}
+	for i, c := range candidates {
+		card := workflow.Build(cards[c.ID])
+		line := fmt.Sprintf("%-30s %s %s", truncate(card.Name, 30), card.Lifecycle, metric("repeats", fmt.Sprintf("%d", c.EventCount)))
+		if i == cursor {
+			fmt.Fprintln(&b, selectedRowStyle.Render("  "+line))
+			continue
+		}
+		fmt.Fprintln(&b, rowStyle.Render("  "+line))
+	}
+	selected := candidates[cursor]
+	evidenceCard := cards[selected.ID]
+	card := workflow.Build(evidenceCard)
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, detailTitleStyle.Render(card.Name))
+	fmt.Fprintf(&b, "%s  %s  %s\n", kv("id", selected.ID), kv("lifecycle", card.Lifecycle), kv("confidence", selected.Confidence))
+	fmt.Fprintf(&b, "\n%s\n%s\n", labelStyle.Render("When It Applies"), bodyStyle.Render(card.WhenItApplies))
+	fmt.Fprintf(&b, "\n%s\n", labelStyle.Render("Replay Plan"))
+	for i, step := range card.ReplayPlan {
+		fmt.Fprintf(&b, "%s\n", bodyStyle.Render(fmt.Sprintf("  %d. %s", i+1, step)))
+	}
+	fmt.Fprintf(&b, "\n%s\n%s\n", labelStyle.Render("Evidence"), bodyStyle.Render(card.EvidenceSummary))
+	fmt.Fprintf(&b, "\n%s\n%s\n", labelStyle.Render("Safety"), bodyStyle.Render(card.SafetyNote))
+	fmt.Fprintln(&b, helpStyle.Render("j/k navigate  r refresh  q quit"))
+	return b.String()
+}
+
+func (m WorkspaceModel) renderReview() string {
+	if m.opts.Store == nil {
+		return m.renderPlaceholder("Review", "store unavailable")
+	}
+	return m.review.Render()
+}
+
+func (m WorkspaceModel) renderEvidence() string {
+	var b strings.Builder
+	fmt.Fprintln(&b, sectionTitleStyle.Render("Evidence"))
+	if m.opts.Store == nil {
+		fmt.Fprintln(&b, bodyStyle.Render("store unavailable"))
+		return b.String()
+	}
+	if strings.TrimSpace(m.opts.EvidenceID) == "" {
+		fmt.Fprintln(&b, bodyStyle.Render("Select a Recorded Workflow from Workflows, or run agbox evidence <candidate-id>."))
+		return b.String()
+	}
+	card, err := evidence.Build(m.opts.Store, m.opts.EvidenceID)
+	if err != nil {
+		fmt.Fprintln(&b, bodyStyle.Render("error: "+err.Error()))
+		return b.String()
+	}
+	workflowCard := workflow.Build(card)
+	c := card.Candidate
+	fmt.Fprintln(&b, detailTitleStyle.Render(workflowCard.Name))
+	fmt.Fprintf(&b, "%s  %s  %s\n", kv("id", c.ID), kv("state", string(c.State)), kv("privacy", card.Privacy))
+	fmt.Fprintf(&b, "%s  %s  %s\n", kv("source", string(c.SourceKind)), kv("repeats", fmt.Sprintf("%d", c.EventCount)), kv("confidence", c.Confidence))
+	fmt.Fprintf(&b, "\n%s\n%s\n", labelStyle.Render("Reason"), bodyStyle.Render(card.Reason))
+	fmt.Fprintf(&b, "\n%s\n%s\n", labelStyle.Render("Safety"), bodyStyle.Render(workflowCard.SafetyNote))
+	if len(card.Excerpts) > 0 {
+		fmt.Fprintln(&b)
+		fmt.Fprintln(&b, labelStyle.Render("Excerpts"))
+		for _, excerpt := range card.Excerpts {
+			fmt.Fprintln(&b, excerptStyle.Render("  "+excerpt))
+		}
+	}
+	if len(card.Occurrences) > 0 {
+		fmt.Fprintln(&b)
+		fmt.Fprintln(&b, labelStyle.Render("Occurrences"))
+		for i, occurrence := range card.Occurrences {
+			if i >= 5 {
+				break
+			}
+			fmt.Fprintln(&b, bodyStyle.Render(fmt.Sprintf("  %d. %s", i+1, occurrence.SummaryLine())))
+		}
+	}
+	return b.String()
+}
+
+func (m WorkspaceModel) workflowData() ([]model.Candidate, map[string]model.EvidenceCard, error) {
+	if m.opts.Store == nil {
+		return nil, nil, fmt.Errorf("store unavailable")
+	}
+	if _, err := scan.Run(m.opts.Store, 2); err != nil {
+		return nil, nil, err
+	}
+	state := normalizeState(m.opts.WorkflowState)
+	candidates, err := m.opts.Store.ListCandidates(state)
+	if err != nil {
+		return nil, nil, err
+	}
+	cards := make(map[string]model.EvidenceCard, len(candidates))
+	for _, c := range candidates {
+		card, err := evidence.Build(m.opts.Store, c.ID)
+		if err != nil {
+			return nil, nil, err
+		}
+		cards[c.ID] = card
+	}
+	return candidates, cards, nil
 }
 
 func (m WorkspaceModel) renderHelpPlaceholder() string {
@@ -487,12 +652,22 @@ var workspaceNavItems = []workspaceNavItem{
 }
 
 func navIndex(screen WorkspaceScreen) int {
+	if screen == WorkspaceReview || screen == WorkspaceEvidence {
+		screen = WorkspaceWorkflows
+	}
 	for i, item := range workspaceNavItems {
 		if item.screen == screen {
 			return i
 		}
 	}
 	return 0
+}
+
+func (m WorkspaceModel) navActiveScreen() WorkspaceScreen {
+	if m.active == WorkspaceReview || m.active == WorkspaceEvidence {
+		return WorkspaceWorkflows
+	}
+	return m.active
 }
 
 func navWidth(total int) int {
