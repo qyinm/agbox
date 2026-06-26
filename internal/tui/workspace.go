@@ -22,7 +22,10 @@ import (
 	"github.com/hippoom/agbox/internal/workflow"
 )
 
-var workspaceSyncBestEffort = pipeline.SyncBestEffort
+var (
+	workspaceSyncBestEffort        = pipeline.SyncBestEffort
+	workspacePassiveSyncBestEffort = pipeline.SyncBestEffortIfStale
+)
 
 type WorkspaceScreen string
 
@@ -69,6 +72,7 @@ func NewWorkspaceModel(opts WorkspaceOptions) WorkspaceModel {
 	}
 	m := WorkspaceModel{opts: opts, active: opts.InitialScreen, width: 100, help: true}
 	m.navCursor = navIndex(opts.InitialScreen)
+	m.passiveSyncInitialScreen()
 	m.refreshSnapshot()
 	if opts.Store != nil {
 		m.review = NewReviewModel(NewReviewService(opts.Store, opts.ReviewOptions)).Refresh()
@@ -455,6 +459,23 @@ func (m *WorkspaceModel) refreshSnapshot() {
 		snapshot.workflowCards = cards
 	}
 	m.snapshot = snapshot
+}
+
+func (m *WorkspaceModel) passiveSyncInitialScreen() {
+	if m.opts.Store == nil {
+		return
+	}
+	if m.active != WorkspaceWorkflows && m.active != WorkspaceReview {
+		return
+	}
+	result, err := workspacePassiveSyncBestEffort(m.opts.Store)
+	if err != nil {
+		m.statusMessage = "sync check failed: " + err.Error()
+		return
+	}
+	if result.Warning != nil {
+		m.statusMessage = "partial sync: " + result.Warning.Error()
+	}
 }
 
 func (m WorkspaceModel) workflowData() ([]model.Candidate, map[string]model.EvidenceCard, error) {

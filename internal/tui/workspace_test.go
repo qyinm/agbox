@@ -8,6 +8,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/hippoom/agbox/internal/capture"
 	"github.com/hippoom/agbox/internal/pipeline"
 	"github.com/hippoom/agbox/internal/scan"
 	"github.com/hippoom/agbox/internal/store"
@@ -94,6 +95,13 @@ func withWorkspaceSync(t *testing.T, fn func(*store.Store) (pipeline.BestEffortS
 	old := workspaceSyncBestEffort
 	workspaceSyncBestEffort = fn
 	t.Cleanup(func() { workspaceSyncBestEffort = old })
+}
+
+func withWorkspacePassiveSync(t *testing.T, fn func(*store.Store) (pipeline.BestEffortSyncResult, error)) {
+	t.Helper()
+	old := workspacePassiveSyncBestEffort
+	workspacePassiveSyncBestEffort = fn
+	t.Cleanup(func() { workspacePassiveSyncBestEffort = old })
 }
 
 func TestWorkspaceModelRendersOverviewShell(t *testing.T) {
@@ -216,6 +224,37 @@ func TestWorkspaceModelRendersWorkflowCards(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("workflow screen missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestWorkspaceModelPassiveSyncsWorkflowInitialScreen(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := openTestStore(t)
+	defer s.Close()
+	called := false
+	withWorkspacePassiveSync(t, func(got *store.Store) (pipeline.BestEffortSyncResult, error) {
+		if got != s {
+			t.Fatal("passive sync used unexpected store")
+		}
+		called = true
+		for i := 0; i < 2; i++ {
+			if _, err := capture.Capture(s, "Use bun, not npm.", capture.Options{Source: "test", Agent: "codex", Project: "repo"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return pipeline.BestEffortSyncResult{Ingested: 2}, nil
+	})
+
+	m := NewWorkspaceModel(WorkspaceOptions{
+		InitialScreen: WorkspaceWorkflows,
+		Store:         s,
+	})
+	if !called {
+		t.Fatal("workflow workspace did not run passive sync")
+	}
+	got := stripANSI(m.Render())
+	if !strings.Contains(got, "Package Manager Preference") {
+		t.Fatalf("workflow screen did not render passive-sync candidates:\n%s", got)
 	}
 }
 
