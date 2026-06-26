@@ -2,6 +2,23 @@
 
 Shared domain vocabulary for this project - entities, named processes, and status concepts with project-specific meaning. Seeded with core domain vocabulary, then accretes as ce-compound and ce-compound-refresh process learnings; direct edits are fine. Glossary only, not a spec or catch-all.
 
+## Workspace Command Surface
+
+### Workspace
+The interactive agbox command surface that presents command-specific screens for reviewing status, sources, recorded workflows, evidence, repair guidance, and help.
+
+The Workspace is a TUI alternative to line-oriented command output. It must preserve command contracts: scripts and pipes continue to receive plain output, and command-specific parsing still owns unsupported flags.
+
+### Plain Mode
+The line-oriented command path that bypasses the Workspace for commands that also have an interactive screen.
+
+Plain Mode is not a universal flag accepted by every agbox command. It is scoped to workspace-routed commands so automation commands retain their own flag validation and error behavior.
+
+### Accepted Skill Reconciliation
+The process of detecting persisted skill files that correspond to previously proposed Recorded Workflows and marking those workflows as accepted in agbox's local state.
+
+Reconciliation is a status-side effect: both plain status and interactive Status workspace views should preserve it so the local workflow state reflects skill files the user already has.
+
 ## Recorded Workflow Replay
 
 ### Recorded Workflow
