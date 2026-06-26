@@ -1,6 +1,6 @@
 {
   "name": "@agboxhq/cli",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Local-first CLI for recording and replaying repeated AI-agent workflows.",
   "license": "MIT",
   "homepage": "https://github.com/qyinm/agbox#readme",
