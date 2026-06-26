@@ -281,9 +281,11 @@ func TestHelpDocumentsReplayWorkflowCommands(t *testing.T) {
 	got := out.String()
 	for _, want := range []string{
 		"agbox records and replays repeated AI-agent workflows.",
-		"agbox inbox [--state pending|proposal_ready|proposed|applied_once|save_suggested",
+		"agbox                         # open the interactive workspace",
+		"agbox inbox [--plain] [--state pending|proposal_ready|proposed|applied_once|save_suggested",
 		"agbox apply <candidate-id>",
 		"agbox review [--state pending|proposal_ready|proposed|applied_once|save_suggested",
+		"Use --plain for existing",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("root help missing %q:\n%s", want, got)
@@ -587,9 +589,9 @@ func TestHelpCommandShowsCommandHelp(t *testing.T) {
 	}
 	got := out.String()
 	for _, want := range []string{
-		"agbox status",
-		"watcher state",
-		"last sync",
+		"agbox status [--plain]",
+		"Status workspace screen",
+		"watcher, store, sync, and count summary",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("status help missing %q:\n%s", want, got)
