@@ -24,6 +24,7 @@ import (
 var (
 	workspaceSyncBestEffort        = pipeline.SyncBestEffort
 	workspacePassiveSyncBestEffort = pipeline.SyncBestEffortIfStale
+	workspaceSources               = discoverWorkspaceSources
 )
 
 type WorkspaceScreen string
@@ -48,6 +49,8 @@ type WorkspaceOptions struct {
 	HelpCommand   string
 	CommandHelp   map[string]string
 	ReviewOptions ReviewOptions
+
+	AcceptedSkillsReconciled int
 }
 
 type WorkspaceModel struct {
@@ -71,7 +74,7 @@ func NewWorkspaceModel(opts WorkspaceOptions) WorkspaceModel {
 	m := WorkspaceModel{opts: opts, active: opts.InitialScreen, width: 100, help: true}
 	m.navCursor = navIndex(opts.InitialScreen)
 	m.passiveSyncInitialScreen()
-	m.refreshSnapshot()
+	m.refreshSnapshotWithSources(true)
 	if opts.Store != nil && opts.InitialScreen == WorkspaceReview {
 		m.refreshReviewModel()
 	}
@@ -85,7 +88,12 @@ func (m WorkspaceModel) Init() tea.Cmd {
 func (m WorkspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
-		switch msg.String() {
+		key := msg.String()
+		if m.reviewCapturesKey(key) {
+			m = m.handleActiveKey(key)
+			return m, nil
+		}
+		switch key {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "?", "shift+/":
@@ -112,10 +120,25 @@ func (m WorkspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case workspaceRefreshMsg:
 		m.refreshing = false
 		m.statusMessage = refreshStatusMessage(msg)
-		m.refreshSnapshot()
+		m.refreshSnapshotWithSources(true)
 		m.refreshActiveScreen()
 	}
 	return m, nil
+}
+
+func (m WorkspaceModel) reviewCapturesKey(key string) bool {
+	if m.active != WorkspaceReview || m.review.service.store == nil {
+		return false
+	}
+	if m.review.view != viewExportTarget {
+		return false
+	}
+	for _, item := range exportTargets {
+		if key == item.key {
+			return true
+		}
+	}
+	return key == "esc"
 }
 
 func (m WorkspaceModel) View() tea.View {
@@ -276,19 +299,26 @@ func (m WorkspaceModel) renderStatus() string {
 		return b.String()
 	}
 	if m.snapshot.statsErr != nil {
-		fmt.Fprintln(&b, bodyStyle.Render("store unavailable: "+m.snapshot.statsErr.Error()))
-		return b.String()
+		fmt.Fprintf(&b, "%s\n", kv("store", "FAIL "+m.snapshot.statsErr.Error()))
+	} else {
+		fmt.Fprintf(&b, "%s\n", kv("store", m.snapshot.storePath))
 	}
 	if m.snapshot.correctionsErr != nil {
-		fmt.Fprintln(&b, bodyStyle.Render("corrections unavailable: "+m.snapshot.correctionsErr.Error()))
-		return b.String()
+		fmt.Fprintf(&b, "%s\n", kv("corrections", "FAIL "+m.snapshot.correctionsErr.Error()))
+	} else {
+		fmt.Fprintf(&b, "%s\n", kv("corrections", fmt.Sprintf("%d", m.snapshot.corrections)))
 	}
-	fmt.Fprintf(&b, "%s\n", kv("store", m.snapshot.storePath))
 	fmt.Fprintf(&b, "%s\n", kv("last sync", m.lastSyncValue()))
-	fmt.Fprintf(&b, "%s\n", kv("corrections", fmt.Sprintf("%d", m.snapshot.corrections)))
-	fmt.Fprintf(&b, "%s\n", kv("recorded workflows", fmt.Sprintf("%d", m.snapshot.stats.Candidates)))
-	fmt.Fprintf(&b, "%s\n", kv("events", fmt.Sprintf("%d", m.snapshot.stats.Events)))
-	fmt.Fprintf(&b, "%s\n", kv("exports", fmt.Sprintf("%d", m.snapshot.stats.Exports)))
+	if m.snapshot.statsErr == nil {
+		fmt.Fprintf(&b, "%s\n", kv("recorded workflows", fmt.Sprintf("%d", m.snapshot.stats.Candidates)))
+	}
+	if m.opts.AcceptedSkillsReconciled > 0 {
+		fmt.Fprintf(&b, "%s\n", kv("accepted skills", fmt.Sprintf("%d reconciled", m.opts.AcceptedSkillsReconciled)))
+	}
+	if m.snapshot.statsErr == nil {
+		fmt.Fprintf(&b, "%s\n", kv("events", fmt.Sprintf("%d", m.snapshot.stats.Events)))
+		fmt.Fprintf(&b, "%s\n", kv("exports", fmt.Sprintf("%d", m.snapshot.stats.Exports)))
+	}
 	return b.String()
 }
 
@@ -413,13 +443,13 @@ func (m WorkspaceModel) renderEvidence() string {
 	fmt.Fprintln(&b, detailTitleStyle.Render(workflowCard.Name))
 	fmt.Fprintf(&b, "%s  %s  %s\n", kv("id", c.ID), kv("state", string(c.State)), kv("privacy", card.Privacy))
 	fmt.Fprintf(&b, "%s  %s  %s\n", kv("source", string(c.SourceKind)), kv("repeats", fmt.Sprintf("%d", c.EventCount)), kv("confidence", c.Confidence))
-	fmt.Fprintf(&b, "\n%s\n%s\n", labelStyle.Render("Reason"), bodyStyle.Render(card.Reason))
+	fmt.Fprintf(&b, "\n%s\n%s\n", labelStyle.Render("Reason"), bodyStyle.Render(workflow.SanitizeDisplayText(card.Reason)))
 	fmt.Fprintf(&b, "\n%s\n%s\n", labelStyle.Render("Safety"), bodyStyle.Render(workflowCard.SafetyNote))
 	if len(card.Excerpts) > 0 {
 		fmt.Fprintln(&b)
 		fmt.Fprintln(&b, labelStyle.Render("Excerpts"))
 		for _, excerpt := range card.Excerpts {
-			fmt.Fprintln(&b, excerptStyle.Render("  "+excerpt))
+			fmt.Fprintln(&b, excerptStyle.Render("  "+workflow.SanitizeDisplayText(excerpt)))
 		}
 	}
 	if len(card.Occurrences) > 0 {
@@ -429,20 +459,28 @@ func (m WorkspaceModel) renderEvidence() string {
 			if i >= 5 {
 				break
 			}
-			fmt.Fprintln(&b, bodyStyle.Render(fmt.Sprintf("  %d. %s", i+1, occurrence.SummaryLine())))
+			fmt.Fprintln(&b, bodyStyle.Render(fmt.Sprintf("  %d. %s", i+1, workflow.SanitizeDisplayText(occurrence.SummaryLine()))))
 		}
 	}
 	return b.String()
 }
 
 func (m *WorkspaceModel) refreshSnapshot() {
+	m.refreshSnapshotWithSources(m.active == WorkspaceSources)
+}
+
+func (m *WorkspaceModel) refreshSnapshotWithSources(loadSources bool) {
 	snapshot := workspaceSnapshot{
 		watcher:       workspaceWatcherState(),
 		hooks:         workspaceHookSummary(),
-		sources:       workspaceSources(),
+		sources:       m.snapshot.sources,
+		sourceSummary: m.snapshot.sourceSummary,
 		workflowCards: map[string]model.EvidenceCard{},
 	}
-	snapshot.sourceSummary = summarizeWorkspaceSources(snapshot.sources)
+	if loadSources || snapshot.sourceSummary == "" {
+		snapshot.sources = workspaceSources()
+		snapshot.sourceSummary = summarizeWorkspaceSources(snapshot.sources)
+	}
 	if m.opts.Store == nil {
 		m.snapshot = snapshot
 		return
@@ -678,7 +716,7 @@ func workspaceHookSummary() string {
 	return out
 }
 
-func workspaceSources() []workspaceSource {
+func discoverWorkspaceSources() []workspaceSource {
 	var entries []workspaceSource
 	for _, adapter := range session.All() {
 		sources, err := adapter.DiscoverSources()

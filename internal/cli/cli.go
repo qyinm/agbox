@@ -42,7 +42,7 @@ func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 }
 
 func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
-	args, plain := stripPlainFlag(args)
+	args, plain := stripWorkspacePlainFlag(args)
 	if !plain {
 		if routed, err := maybeRunWorkspace(args, stdin, stdout); routed || err != nil {
 			return err
@@ -72,6 +72,12 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) error 
 			return nil
 		}
 		return fmt.Errorf("unknown command %q", args[0])
+	}
+	if plain && args[0] == "review" {
+		if _, err := parseReviewOptions(args[1:]); err != nil {
+			return err
+		}
+		return reviewRequiresTerminalError()
 	}
 	switch args[0] {
 	case "init":
@@ -298,7 +304,7 @@ func runReview(args []string, stdin io.Reader, stdout io.Writer) error {
 		return err
 	}
 	if !interactiveTerminal(stdin) || !interactiveTerminal(stdout) {
-		return errors.New("agbox review requires an interactive terminal; use agbox discover or agbox inbox instead")
+		return reviewRequiresTerminalError()
 	}
 	s, err := store.Open("")
 	if err != nil {
@@ -312,6 +318,10 @@ func runReview(args []string, stdin io.Reader, stdout io.Writer) error {
 		return nil
 	}
 	return err
+}
+
+func reviewRequiresTerminalError() error {
+	return errors.New("agbox review requires an interactive terminal; use agbox discover or agbox inbox instead")
 }
 
 func validReviewState(state string) bool {

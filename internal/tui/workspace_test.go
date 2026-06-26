@@ -2,6 +2,7 @@ package tui
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/hippoom/agbox/internal/capture"
+	"github.com/hippoom/agbox/internal/model"
 	"github.com/hippoom/agbox/internal/pipeline"
 	"github.com/hippoom/agbox/internal/scan"
 	"github.com/hippoom/agbox/internal/store"
@@ -156,6 +158,34 @@ func TestWorkspaceModelRendersStatusScreen(t *testing.T) {
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("status screen missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestWorkspaceModelRendersPartialStatusErrors(t *testing.T) {
+	m := WorkspaceModel{
+		opts:   WorkspaceOptions{InitialScreen: WorkspaceStatus, AcceptedSkillsReconciled: 1},
+		active: WorkspaceStatus,
+		width:  100,
+		snapshot: workspaceSnapshot{
+			watcher:        "running",
+			hooks:          "3/3 connected",
+			storeAvailable: true,
+			statsErr:       errors.New("stats failed"),
+			corrections:    2,
+		},
+	}
+	got := stripANSI(m.Render())
+	for _, want := range []string{
+		"watcher: running",
+		"managed hooks: 3/3 connected",
+		"store: FAIL stats failed",
+		"corrections: 2",
+		"last sync: never",
+		"accepted skills: 1 reconciled",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("partial status missing %q:\n%s", want, got)
 		}
 	}
 }
@@ -314,6 +344,48 @@ func TestWorkspaceModelRendersEvidenceDetail(t *testing.T) {
 	}
 }
 
+func TestWorkspaceModelSanitizesEvidenceDetail(t *testing.T) {
+	s := openTestStore(t)
+	defer s.Close()
+	card := model.EvidenceCard{
+		Candidate: model.Candidate{
+			ID:         "cand_sanitize",
+			Name:       "sanitize-workflow",
+			EventCount: 2,
+			Confidence: "medium",
+		},
+		Reason:   "reason \x1b]52;c;SGVsbG8=\x07secret",
+		Excerpts: []string{"copy\x1b]52;c;SGVsbG8=\x07secret \x1b[31mred\x1b[0m"},
+		Occurrences: []model.Occurrence{
+			{AgentAction: "run \x1b]52;c;SGVsbG8=\x07secret", UserCorrection: "use \x1b[31mbun\x1b[0m"},
+		},
+	}
+	m := WorkspaceModel{
+		opts:   WorkspaceOptions{InitialScreen: WorkspaceEvidence, Store: s, EvidenceID: card.Candidate.ID},
+		active: WorkspaceEvidence,
+		width:  100,
+		snapshot: workspaceSnapshot{
+			watcher:        "not installed",
+			hooks:          "0/0 connected",
+			sourceSummary:  "0 discovered",
+			storeAvailable: true,
+			evidenceCard:   &card,
+		},
+	}
+	raw := m.Render()
+	for _, bad := range []string{"\x1b]52", "SGVsbG8=", "\x07", "\x1b[31m"} {
+		if strings.Contains(raw, bad) {
+			t.Fatalf("evidence render contains terminal control payload %q:\n%s", bad, raw)
+		}
+	}
+	got := stripANSI(raw)
+	for _, want := range []string{"reason secret", "copysecret red", "run secret", "use bun"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("sanitized evidence missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestWorkspaceModelEmbedsReviewModel(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	s := storeWithCandidates(t, "Use bun, not npm.", "Use bun, not npm.")
@@ -404,6 +476,78 @@ func TestWorkspaceModelNavigationChangesActiveScreen(t *testing.T) {
 	got := stripANSI(m.Render())
 	if !strings.Contains(got, "No Recorded Workflows") {
 		t.Fatalf("workflows detail missing:\n%s", got)
+	}
+}
+
+func TestWorkspaceReviewExportTargetKeepsNumericKeysInReview(t *testing.T) {
+	root := t.TempDir()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(wd)
+
+	s := storeWithCandidates(t, "Use bun, not npm.", "Use bun, not npm.")
+	defer s.Close()
+	m := NewWorkspaceModel(WorkspaceOptions{InitialScreen: WorkspaceReview, Store: s})
+
+	for _, key := range []string{"a", "y", "e", "1"} {
+		updated, cmd := m.Update(tea.KeyPressMsg(tea.Key{Text: key, Code: rune(key[0])}))
+		if cmd != nil {
+			t.Fatalf("unexpected command for key %q", key)
+		}
+		m = updated.(WorkspaceModel)
+	}
+
+	if m.active != WorkspaceReview {
+		t.Fatalf("active screen = %s, want %s", m.active, WorkspaceReview)
+	}
+	got := stripANSI(m.Render())
+	for _, want := range []string{
+		"exported exp_",
+		"path=AGENTS.md",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("review export missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestWorkspaceModelCachesSourceDiscoveryAcrossNavigation(t *testing.T) {
+	old := workspaceSources
+	calls := 0
+	workspaceSources = func() []workspaceSource {
+		calls++
+		return []workspaceSource{{agent: "codex", path: "/tmp/codex.jsonl"}}
+	}
+	t.Cleanup(func() { workspaceSources = old })
+
+	m := NewWorkspaceModel(WorkspaceOptions{InitialScreen: WorkspaceOverview})
+	if calls != 1 {
+		t.Fatalf("source discovery calls after init = %d, want 1", calls)
+	}
+	updated, _ := m.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyTab}))
+	m = updated.(WorkspaceModel)
+	if calls != 1 {
+		t.Fatalf("source discovery calls after status nav = %d, want 1", calls)
+	}
+	updated, _ = m.Update(tea.KeyPressMsg(tea.Key{Text: "3", Code: '3'}))
+	m = updated.(WorkspaceModel)
+	if calls != 2 {
+		t.Fatalf("source discovery calls after sources nav = %d, want 2", calls)
+	}
+	updated, cmd := m.Update(tea.KeyPressMsg(tea.Key{Text: "r", Code: 'r'}))
+	m = updated.(WorkspaceModel)
+	if cmd == nil {
+		t.Fatal("refresh did not return command")
+	}
+	updated, _ = m.Update(cmd())
+	m = updated.(WorkspaceModel)
+	if calls != 3 {
+		t.Fatalf("source discovery calls after explicit refresh = %d, want 3", calls)
 	}
 }
 

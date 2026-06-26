@@ -360,6 +360,76 @@ func TestWorkspaceRoutesInteractiveStatusUnlessPlain(t *testing.T) {
 	})
 }
 
+func TestWorkspaceStatusReconcilesAcceptedSkills(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "agbox.db")
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", dbPath)
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(wd)
+
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	c := model.Candidate{
+		ID:          "cand_workspace_status",
+		Fingerprint: "fp_workspace_status",
+		Name:        "workspace-status-skill",
+		State:       model.CandidateProposed,
+		EventCount:  3,
+		ProposedAt:  now,
+		FirstSeen:   now,
+		LastSeen:    now,
+		UpdatedAt:   now,
+	}
+	if err := s.UpsertCandidate(c, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	skillDir := filepath.Join(root, ".agents", "skills", "workspace-status-skill")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: workspace-status-skill\nagbox_candidate_id: cand_workspace_status\n---\nbody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	withInteractiveWorkspace(t, func(calls *[]tui.WorkspaceOptions) {
+		if err := Execute([]string{"status"}, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("workspace calls = %d, want 1", len(*calls))
+		}
+		if got := (*calls)[0].AcceptedSkillsReconciled; got != 1 {
+			t.Fatalf("accepted reconciled = %d, want 1", got)
+		}
+	})
+
+	s, err = store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	got, err := s.GetCandidate(c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != model.CandidateAccepted {
+		t.Fatalf("state = %s, want accepted", got.State)
+	}
+}
+
 func TestWorkspaceRoutesInteractiveHelpWithoutOpeningStore(t *testing.T) {
 	root := t.TempDir()
 	dbPath := filepath.Join(root, "agbox.db")
@@ -384,6 +454,47 @@ func TestWorkspaceRoutesInteractiveHelpWithoutOpeningStore(t *testing.T) {
 			t.Fatalf("help workspace created store: %v", err)
 		}
 	})
+}
+
+func TestWorkspacePlainDoesNotMaskAutomationFlags(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+	withInteractiveWorkspace(t, func(calls *[]tui.WorkspaceOptions) {
+		err := Execute([]string{"capture", "--plain", "Use bun, not npm."}, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
+		if err == nil {
+			t.Fatal("capture --plain succeeded")
+		}
+		if !strings.Contains(err.Error(), "flag provided but not defined") {
+			t.Fatalf("capture --plain error = %q", err.Error())
+		}
+		if len(*calls) != 0 {
+			t.Fatalf("capture --plain routed to workspace; calls = %d", len(*calls))
+		}
+	})
+}
+
+func TestWorkspacePlainReviewReturnsGuidance(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "agbox.db")
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", dbPath)
+	withInteractiveWorkspace(t, func(calls *[]tui.WorkspaceOptions) {
+		err := Execute([]string{"review", "--plain"}, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
+		if err == nil {
+			t.Fatal("review --plain succeeded")
+		}
+		want := "agbox review requires an interactive terminal; use agbox discover or agbox inbox instead"
+		if err.Error() != want {
+			t.Fatalf("review --plain error = %q, want %q", err.Error(), want)
+		}
+		if len(*calls) != 0 {
+			t.Fatalf("review --plain routed to workspace; calls = %d", len(*calls))
+		}
+	})
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("review --plain opened store: %v", err)
+	}
 }
 
 func TestWorkspaceDoesNotRouteHelpFlagsOrAutomationCommands(t *testing.T) {

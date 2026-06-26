@@ -9,6 +9,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/hippoom/agbox/internal/propose"
 	"github.com/hippoom/agbox/internal/store"
 	"github.com/hippoom/agbox/internal/tui"
 )
@@ -39,6 +40,13 @@ func maybeRunWorkspace(args []string, stdin io.Reader, stdout io.Writer) (bool, 
 	}
 	return true, withStore(func(s *store.Store) error {
 		opts.Store = s
+		if opts.InitialScreen == tui.WorkspaceStatus {
+			result, err := propose.ReconcileAcceptedSkills(s)
+			if err != nil {
+				return err
+			}
+			opts.AcceptedSkillsReconciled = result.Accepted
+		}
 		return launchWorkspaceProgram(opts, stdin, stdout)
 	})
 }
@@ -126,6 +134,29 @@ func stripPlainFlag(args []string) ([]string, bool) {
 		}
 	}
 	return out, plain
+}
+
+func stripWorkspacePlainFlag(args []string) ([]string, bool) {
+	stripped, plain := stripPlainFlag(args)
+	if !plain {
+		return args, false
+	}
+	if workspacePlainCommand(stripped) {
+		return stripped, true
+	}
+	return args, false
+}
+
+func workspacePlainCommand(args []string) bool {
+	if len(args) == 0 {
+		return true
+	}
+	switch args[0] {
+	case "help", "status", "sources", "doctor", "repair", "inbox", "review", "evidence":
+		return true
+	default:
+		return false
+	}
 }
 
 func parseReviewOptions(args []string) (tui.ReviewOptions, error) {
