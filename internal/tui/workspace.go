@@ -59,6 +59,7 @@ type WorkspaceModel struct {
 	help           bool
 	refreshing     bool
 	statusMessage  string
+	snapshot       workspaceSnapshot
 	review         ReviewModel
 }
 
@@ -68,6 +69,7 @@ func NewWorkspaceModel(opts WorkspaceOptions) WorkspaceModel {
 	}
 	m := WorkspaceModel{opts: opts, active: opts.InitialScreen, width: 100, help: true}
 	m.navCursor = navIndex(opts.InitialScreen)
+	m.refreshSnapshot()
 	if opts.Store != nil {
 		m.review = NewReviewModel(NewReviewService(opts.Store, opts.ReviewOptions)).Refresh()
 	}
@@ -108,6 +110,7 @@ func (m WorkspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case workspaceRefreshMsg:
 		m.refreshing = false
 		m.statusMessage = refreshStatusMessage(msg)
+		m.refreshSnapshot()
 		m.refreshActiveScreen()
 	}
 	return m, nil
@@ -200,13 +203,9 @@ func (m WorkspaceModel) renderDetail() string {
 func (m WorkspaceModel) handleActiveKey(key string) WorkspaceModel {
 	switch m.active {
 	case WorkspaceWorkflows:
-		candidates, _, err := m.workflowData()
-		if err != nil {
-			return m
-		}
 		switch key {
 		case "j", "down":
-			if m.workflowCursor < len(candidates)-1 {
+			if m.workflowCursor < len(m.snapshot.workflowCandidates)-1 {
 				m.workflowCursor++
 			}
 		case "k", "up":
@@ -235,14 +234,15 @@ func (m WorkspaceModel) renderOverview() string {
 	fmt.Fprintln(&b, bodyStyle.Render("  Watcher and managed hooks are summarized in the status bar."))
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, labelStyle.Render("Workflow queue"))
-	stats, err := m.storeStats()
-	if err != nil {
-		fmt.Fprintln(&b, bodyStyle.Render("  unavailable: "+err.Error()))
+	if m.snapshot.statsErr != nil {
+		fmt.Fprintln(&b, bodyStyle.Render("  unavailable: "+m.snapshot.statsErr.Error()))
+	} else if !m.snapshot.storeAvailable {
+		fmt.Fprintln(&b, bodyStyle.Render("  store unavailable"))
 	} else {
 		fmt.Fprintf(&b, "  %s  %s  %s\n",
-			kv("recorded workflows", fmt.Sprintf("%d", stats.Candidates)),
-			kv("events", fmt.Sprintf("%d", stats.Events)),
-			kv("exports", fmt.Sprintf("%d", stats.Exports)),
+			kv("recorded workflows", fmt.Sprintf("%d", m.snapshot.stats.Candidates)),
+			kv("events", fmt.Sprintf("%d", m.snapshot.stats.Events)),
+			kv("exports", fmt.Sprintf("%d", m.snapshot.stats.Exports)),
 		)
 	}
 	fmt.Fprintln(&b)
@@ -265,28 +265,26 @@ func (m WorkspaceModel) renderStatus() string {
 	var b strings.Builder
 	fmt.Fprintln(&b, sectionTitleStyle.Render("Status"))
 	fmt.Fprintln(&b, detailTitleStyle.Render("Health summary"))
-	fmt.Fprintf(&b, "%s\n", kv("watcher", workspaceWatcherState()))
-	fmt.Fprintf(&b, "%s\n", kv("managed hooks", workspaceHookSummary()))
-	if m.opts.Store == nil {
+	fmt.Fprintf(&b, "%s\n", kv("watcher", m.snapshot.watcher))
+	fmt.Fprintf(&b, "%s\n", kv("managed hooks", m.snapshot.hooks))
+	if !m.snapshot.storeAvailable {
 		fmt.Fprintln(&b, bodyStyle.Render("store unavailable"))
 		return b.String()
 	}
-	stats, err := m.opts.Store.Stats()
-	if err != nil {
-		fmt.Fprintln(&b, bodyStyle.Render("store unavailable: "+err.Error()))
+	if m.snapshot.statsErr != nil {
+		fmt.Fprintln(&b, bodyStyle.Render("store unavailable: "+m.snapshot.statsErr.Error()))
 		return b.String()
 	}
-	corrections, err := m.opts.Store.CountCorrections()
-	if err != nil {
-		fmt.Fprintln(&b, bodyStyle.Render("corrections unavailable: "+err.Error()))
+	if m.snapshot.correctionsErr != nil {
+		fmt.Fprintln(&b, bodyStyle.Render("corrections unavailable: "+m.snapshot.correctionsErr.Error()))
 		return b.String()
 	}
-	fmt.Fprintf(&b, "%s\n", kv("store", stats.Path))
+	fmt.Fprintf(&b, "%s\n", kv("store", m.snapshot.storePath))
 	fmt.Fprintf(&b, "%s\n", kv("last sync", m.lastSyncValue()))
-	fmt.Fprintf(&b, "%s\n", kv("corrections", fmt.Sprintf("%d", corrections)))
-	fmt.Fprintf(&b, "%s\n", kv("recorded workflows", fmt.Sprintf("%d", stats.Candidates)))
-	fmt.Fprintf(&b, "%s\n", kv("events", fmt.Sprintf("%d", stats.Events)))
-	fmt.Fprintf(&b, "%s\n", kv("exports", fmt.Sprintf("%d", stats.Exports)))
+	fmt.Fprintf(&b, "%s\n", kv("corrections", fmt.Sprintf("%d", m.snapshot.corrections)))
+	fmt.Fprintf(&b, "%s\n", kv("recorded workflows", fmt.Sprintf("%d", m.snapshot.stats.Candidates)))
+	fmt.Fprintf(&b, "%s\n", kv("events", fmt.Sprintf("%d", m.snapshot.stats.Events)))
+	fmt.Fprintf(&b, "%s\n", kv("exports", fmt.Sprintf("%d", m.snapshot.stats.Exports)))
 	return b.String()
 }
 
@@ -294,7 +292,7 @@ func (m WorkspaceModel) renderSources() string {
 	var b strings.Builder
 	fmt.Fprintln(&b, sectionTitleStyle.Render("Sources"))
 	fmt.Fprintln(&b, detailTitleStyle.Render("Local session paths"))
-	entries := workspaceSources()
+	entries := m.snapshot.sources
 	if len(entries) == 0 {
 		fmt.Fprintln(&b, bodyStyle.Render("No session sources discovered."))
 		return b.String()
@@ -312,11 +310,11 @@ func (m WorkspaceModel) renderSources() string {
 func (m WorkspaceModel) renderRepair() string {
 	var b strings.Builder
 	fmt.Fprintln(&b, sectionTitleStyle.Render("Repair"))
-	if m.opts.Store == nil {
+	if !m.snapshot.storeAvailable {
 		fmt.Fprintln(&b, bodyStyle.Render("store unavailable"))
 		return b.String()
 	}
-	report := doctor.Run(m.opts.Store)
+	report := m.snapshot.repairReport
 	if report.OK {
 		fmt.Fprintln(&b, hintStyle.Render("All checks passed."))
 	} else {
@@ -331,11 +329,12 @@ func (m WorkspaceModel) renderRepair() string {
 func (m WorkspaceModel) renderWorkflows() string {
 	var b strings.Builder
 	fmt.Fprintln(&b, sectionTitleStyle.Render("Workflows"))
-	candidates, cards, err := m.workflowData()
-	if err != nil {
-		fmt.Fprintln(&b, bodyStyle.Render("error: "+err.Error()))
+	if m.snapshot.workflowErr != nil {
+		fmt.Fprintln(&b, bodyStyle.Render("error: "+m.snapshot.workflowErr.Error()))
 		return b.String()
 	}
+	candidates := m.snapshot.workflowCandidates
+	cards := m.snapshot.workflowCards
 	if len(candidates) == 0 {
 		fmt.Fprintln(&b, detailTitleStyle.Render("No Recorded Workflows"))
 		fmt.Fprintln(&b, bodyStyle.Render("No Recorded Workflows yet."))
@@ -425,6 +424,39 @@ func (m WorkspaceModel) renderEvidence() string {
 	return b.String()
 }
 
+func (m *WorkspaceModel) refreshSnapshot() {
+	snapshot := workspaceSnapshot{
+		watcher:       workspaceWatcherState(),
+		hooks:         workspaceHookSummary(),
+		sources:       workspaceSources(),
+		workflowCards: map[string]model.EvidenceCard{},
+	}
+	snapshot.sourceSummary = summarizeWorkspaceSources(snapshot.sources)
+	if m.opts.Store == nil {
+		m.snapshot = snapshot
+		return
+	}
+	snapshot.storeAvailable = true
+	stats, err := m.opts.Store.Stats()
+	if err != nil {
+		snapshot.statsErr = err
+	} else {
+		snapshot.storePath = stats.Path
+		snapshot.stats = storeStats{Events: stats.Events, Candidates: stats.Candidates, Exports: stats.Exports}
+	}
+	snapshot.corrections, snapshot.correctionsErr = m.opts.Store.CountCorrections()
+	snapshot.lastSync, snapshot.lastSyncErr = m.opts.Store.LatestCursorSync()
+	snapshot.repairReport = doctor.Run(m.opts.Store)
+	candidates, cards, err := m.workflowData()
+	if err != nil {
+		snapshot.workflowErr = err
+	} else {
+		snapshot.workflowCandidates = candidates
+		snapshot.workflowCards = cards
+	}
+	m.snapshot = snapshot
+}
+
 func (m WorkspaceModel) workflowData() ([]model.Candidate, map[string]model.EvidenceCard, error) {
 	if m.opts.Store == nil {
 		return nil, nil, fmt.Errorf("store unavailable")
@@ -446,6 +478,25 @@ func (m WorkspaceModel) workflowData() ([]model.Candidate, map[string]model.Evid
 		cards[c.ID] = card
 	}
 	return candidates, cards, nil
+}
+
+type workspaceSnapshot struct {
+	watcher            string
+	hooks              string
+	sources            []workspaceSource
+	sourceSummary      string
+	storeAvailable     bool
+	storePath          string
+	stats              storeStats
+	statsErr           error
+	corrections        int
+	correctionsErr     error
+	lastSync           time.Time
+	lastSyncErr        error
+	repairReport       doctor.Report
+	workflowCandidates []model.Candidate
+	workflowCards      map[string]model.EvidenceCard
+	workflowErr        error
 }
 
 func (m WorkspaceModel) renderHelp() string {
@@ -478,7 +529,7 @@ func (m WorkspaceModel) renderStatusBar() string {
 		message = "ready"
 	}
 	line := fmt.Sprintf("sync: %s | watcher: %s | hooks: %s | sources: %s | r refresh | q quit",
-		message, workspaceWatcherState(), workspaceHookSummary(), workspaceSourceSummary())
+		message, m.snapshot.watcher, m.snapshot.hooks, m.snapshot.sourceSummary)
 	if m.width > 0 && m.width < 70 {
 		line = fmt.Sprintf("sync: %s | r refresh | q quit", message)
 	}
@@ -520,43 +571,30 @@ func refreshStatusMessage(msg workspaceRefreshMsg) string {
 	return fmt.Sprintf("synced %d corrections", msg.result.Ingested)
 }
 
-func (m WorkspaceModel) storeStats() (storeStats, error) {
-	if m.opts.Store == nil {
-		return storeStats{}, nil
-	}
-	stats, err := m.opts.Store.Stats()
-	if err != nil {
-		return storeStats{}, err
-	}
-	return storeStats{Events: stats.Events, Candidates: stats.Candidates, Exports: stats.Exports}, nil
-}
-
 func (m WorkspaceModel) lastSyncLine() string {
-	if m.opts.Store == nil {
+	if !m.snapshot.storeAvailable {
 		return "last sync unavailable in this screen"
 	}
-	t, err := m.opts.Store.LatestCursorSync()
-	if err != nil {
-		return "last sync unavailable: " + err.Error()
+	if m.snapshot.lastSyncErr != nil {
+		return "last sync unavailable: " + m.snapshot.lastSyncErr.Error()
 	}
-	if t.IsZero() {
+	if m.snapshot.lastSync.IsZero() {
 		return "last sync: never"
 	}
-	return "last sync: " + formatWorkspaceTime(t)
+	return "last sync: " + formatWorkspaceTime(m.snapshot.lastSync)
 }
 
 func (m WorkspaceModel) lastSyncValue() string {
-	if m.opts.Store == nil {
+	if !m.snapshot.storeAvailable {
 		return "unavailable"
 	}
-	t, err := m.opts.Store.LatestCursorSync()
-	if err != nil {
-		return "FAIL " + err.Error()
+	if m.snapshot.lastSyncErr != nil {
+		return "FAIL " + m.snapshot.lastSyncErr.Error()
 	}
-	if t.IsZero() {
+	if m.snapshot.lastSync.IsZero() {
 		return "never"
 	}
-	return formatWorkspaceTime(t)
+	return formatWorkspaceTime(m.snapshot.lastSync)
 }
 
 type workspaceSource struct {
@@ -624,8 +662,7 @@ func workspaceSources() []workspaceSource {
 	return entries
 }
 
-func workspaceSourceSummary() string {
-	entries := workspaceSources()
+func summarizeWorkspaceSources(entries []workspaceSource) string {
 	failed := 0
 	count := 0
 	for _, entry := range entries {
