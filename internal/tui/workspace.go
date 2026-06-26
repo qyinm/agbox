@@ -2,13 +2,19 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"sort"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
+	"github.com/hippoom/agbox/internal/connect"
+	"github.com/hippoom/agbox/internal/doctor"
+	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/store"
+	"github.com/hippoom/agbox/internal/watcher"
 )
 
 type WorkspaceScreen string
@@ -149,13 +155,13 @@ func (m WorkspaceModel) renderDetail() string {
 	case WorkspaceOverview:
 		return m.renderOverview()
 	case WorkspaceStatus:
-		return m.renderPlaceholder("Status", "Watcher, managed hooks, store, sync, and workflow health.")
+		return m.renderStatus()
 	case WorkspaceSources:
-		return m.renderPlaceholder("Sources", "Discovered local agent session sources.")
+		return m.renderSources()
 	case WorkspaceWorkflows:
 		return m.renderPlaceholder("Workflows", "Recorded Workflow inbox and replay-plan decisions.")
 	case WorkspaceRepair:
-		return m.renderPlaceholder("Repair", "Doctor checks and repair guidance.")
+		return m.renderRepair()
 	case WorkspaceHelp:
 		return m.renderHelpPlaceholder()
 	default:
@@ -198,6 +204,73 @@ func (m WorkspaceModel) renderPlaceholder(title, body string) string {
 	return b.String()
 }
 
+func (m WorkspaceModel) renderStatus() string {
+	var b strings.Builder
+	fmt.Fprintln(&b, sectionTitleStyle.Render("Status"))
+	fmt.Fprintln(&b, detailTitleStyle.Render("Health summary"))
+	fmt.Fprintf(&b, "%s\n", kv("watcher", workspaceWatcherState()))
+	fmt.Fprintf(&b, "%s\n", kv("managed hooks", workspaceHookSummary()))
+	if m.opts.Store == nil {
+		fmt.Fprintln(&b, bodyStyle.Render("store unavailable"))
+		return b.String()
+	}
+	stats, err := m.opts.Store.Stats()
+	if err != nil {
+		fmt.Fprintln(&b, bodyStyle.Render("store unavailable: "+err.Error()))
+		return b.String()
+	}
+	corrections, err := m.opts.Store.CountCorrections()
+	if err != nil {
+		fmt.Fprintln(&b, bodyStyle.Render("corrections unavailable: "+err.Error()))
+		return b.String()
+	}
+	fmt.Fprintf(&b, "%s\n", kv("store", stats.Path))
+	fmt.Fprintf(&b, "%s\n", kv("last sync", m.lastSyncValue()))
+	fmt.Fprintf(&b, "%s\n", kv("corrections", fmt.Sprintf("%d", corrections)))
+	fmt.Fprintf(&b, "%s\n", kv("recorded workflows", fmt.Sprintf("%d", stats.Candidates)))
+	fmt.Fprintf(&b, "%s\n", kv("events", fmt.Sprintf("%d", stats.Events)))
+	fmt.Fprintf(&b, "%s\n", kv("exports", fmt.Sprintf("%d", stats.Exports)))
+	return b.String()
+}
+
+func (m WorkspaceModel) renderSources() string {
+	var b strings.Builder
+	fmt.Fprintln(&b, sectionTitleStyle.Render("Sources"))
+	fmt.Fprintln(&b, detailTitleStyle.Render("Local session paths"))
+	entries := workspaceSources()
+	if len(entries) == 0 {
+		fmt.Fprintln(&b, bodyStyle.Render("No session sources discovered."))
+		return b.String()
+	}
+	for _, entry := range entries {
+		if entry.err != "" {
+			fmt.Fprintf(&b, "%s\n", kv(entry.agent, entry.err))
+			continue
+		}
+		fmt.Fprintf(&b, "%-8s %s\n", entry.agent, entry.path)
+	}
+	return b.String()
+}
+
+func (m WorkspaceModel) renderRepair() string {
+	var b strings.Builder
+	fmt.Fprintln(&b, sectionTitleStyle.Render("Repair"))
+	if m.opts.Store == nil {
+		fmt.Fprintln(&b, bodyStyle.Render("store unavailable"))
+		return b.String()
+	}
+	report := doctor.Run(m.opts.Store)
+	if report.OK {
+		fmt.Fprintln(&b, hintStyle.Render("All checks passed."))
+	} else {
+		fmt.Fprintln(&b, confirmStyle.Render("Attention needed"))
+	}
+	for _, line := range report.Lines {
+		fmt.Fprintln(&b, bodyStyle.Render(line))
+	}
+	return b.String()
+}
+
 func (m WorkspaceModel) renderHelpPlaceholder() string {
 	var b strings.Builder
 	fmt.Fprintln(&b, sectionTitleStyle.Render("Help"))
@@ -217,7 +290,8 @@ func (m WorkspaceModel) renderStatusBar() string {
 	if message == "" {
 		message = "ready"
 	}
-	line := fmt.Sprintf("watcher: pending | hooks: pending | sources: pending | sync: %s | r refresh | q quit", message)
+	line := fmt.Sprintf("watcher: %s | hooks: %s | sources: %s | sync: %s | r refresh | q quit",
+		workspaceWatcherState(), workspaceHookSummary(), workspaceSourceSummary(), message)
 	if m.width > 0 {
 		line = truncate(line, m.width)
 	}
@@ -247,6 +321,102 @@ func (m WorkspaceModel) lastSyncLine() string {
 		return "last sync: never"
 	}
 	return "last sync: " + formatWorkspaceTime(t)
+}
+
+func (m WorkspaceModel) lastSyncValue() string {
+	if m.opts.Store == nil {
+		return "unavailable"
+	}
+	t, err := m.opts.Store.LatestCursorSync()
+	if err != nil {
+		return "FAIL " + err.Error()
+	}
+	if t.IsZero() {
+		return "never"
+	}
+	return formatWorkspaceTime(t)
+}
+
+type workspaceSource struct {
+	agent string
+	path  string
+	err   string
+}
+
+func workspaceWatcherState() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "unknown"
+	}
+	ws := watcher.Status(home)
+	if ws.Running {
+		if ws.PID > 0 {
+			return fmt.Sprintf("running pid=%d", ws.PID)
+		}
+		return "running"
+	}
+	if ws.Installed {
+		return "installed"
+	}
+	return "not installed"
+}
+
+func workspaceHookSummary() string {
+	statuses := connect.StatusAll()
+	connected := 0
+	var needs []string
+	for _, status := range statuses {
+		if status.State == "connected" {
+			connected++
+			continue
+		}
+		if !status.OK {
+			needs = append(needs, status.Agent)
+		}
+	}
+	out := fmt.Sprintf("%d/%d connected", connected, len(statuses))
+	if len(needs) > 0 {
+		out += " (" + strings.Join(needs, ", ") + " need attention)"
+	}
+	return out
+}
+
+func workspaceSources() []workspaceSource {
+	var entries []workspaceSource
+	for _, adapter := range session.All() {
+		sources, err := adapter.DiscoverSources()
+		if err != nil {
+			entries = append(entries, workspaceSource{agent: adapter.Agent(), err: err.Error()})
+			continue
+		}
+		for _, source := range sources {
+			entries = append(entries, workspaceSource{agent: source.Agent, path: source.Path})
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].agent == entries[j].agent {
+			return entries[i].path < entries[j].path
+		}
+		return entries[i].agent < entries[j].agent
+	})
+	return entries
+}
+
+func workspaceSourceSummary() string {
+	entries := workspaceSources()
+	failed := 0
+	count := 0
+	for _, entry := range entries {
+		if entry.err != "" {
+			failed++
+			continue
+		}
+		count++
+	}
+	if failed > 0 {
+		return fmt.Sprintf("%d discovered, %d failed", count, failed)
+	}
+	return fmt.Sprintf("%d discovered", count)
 }
 
 type storeStats struct {

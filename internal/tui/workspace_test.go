@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -8,6 +9,7 @@ import (
 )
 
 func TestWorkspaceModelRendersOverviewShell(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	s := openTestStore(t)
 	defer s.Close()
 
@@ -33,6 +35,74 @@ func TestWorkspaceModelRendersOverviewShell(t *testing.T) {
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("workspace render missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestWorkspaceModelRendersStatusScreen(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := openTestStore(t)
+	defer s.Close()
+
+	m := NewWorkspaceModel(WorkspaceOptions{
+		InitialScreen: WorkspaceStatus,
+		Store:         s,
+	})
+	got := stripANSI(m.Render())
+	for _, want := range []string{
+		"Status",
+		"watcher:",
+		"managed hooks:",
+		"store:",
+		"last sync: never",
+		"recorded workflows: 0",
+		"events: 0",
+		"exports: 0",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("status screen missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestWorkspaceModelRendersSourcesScreen(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	m := NewWorkspaceModel(WorkspaceOptions{InitialScreen: WorkspaceSources})
+	got := stripANSI(m.Render())
+	for _, want := range []string{
+		"Sources",
+		"Local session paths",
+		"No session sources discovered.",
+		"sources: 0 discovered",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("sources screen missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestWorkspaceModelRendersRepairScreen(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := openTestStore(t)
+	defer s.Close()
+
+	m := NewWorkspaceModel(WorkspaceOptions{
+		InitialScreen: WorkspaceRepair,
+		Store:         s,
+	})
+	got := stripANSI(m.Render())
+	for _, want := range []string{
+		"Repair",
+		"store: OK",
+		"events: 0",
+		"recorded workflows: 0",
+		"watcher:",
+		"next: agbox init",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("repair screen missing %q:\n%s", want, got)
 		}
 	}
 }
