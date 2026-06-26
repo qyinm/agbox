@@ -12,10 +12,13 @@ import (
 
 	"github.com/hippoom/agbox/internal/connect"
 	"github.com/hippoom/agbox/internal/doctor"
+	"github.com/hippoom/agbox/internal/pipeline"
 	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/store"
 	"github.com/hippoom/agbox/internal/watcher"
 )
+
+var workspaceSyncBestEffort = pipeline.SyncBestEffort
 
 type WorkspaceScreen string
 
@@ -49,6 +52,7 @@ type WorkspaceModel struct {
 	height        int
 	navCursor     int
 	help          bool
+	refreshing    bool
 	statusMessage string
 }
 
@@ -80,11 +84,19 @@ func (m WorkspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "1", "2", "3", "4", "5", "6":
 			m.selectNav(msg.String())
 		case "r":
-			m.statusMessage = "refresh queued"
+			if m.refreshing {
+				return m, nil
+			}
+			m.refreshing = true
+			m.statusMessage = "syncing"
+			return m, m.refreshCmd()
 		}
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+	case workspaceRefreshMsg:
+		m.refreshing = false
+		m.statusMessage = refreshStatusMessage(msg)
 	}
 	return m, nil
 }
@@ -290,12 +302,47 @@ func (m WorkspaceModel) renderStatusBar() string {
 	if message == "" {
 		message = "ready"
 	}
-	line := fmt.Sprintf("watcher: %s | hooks: %s | sources: %s | sync: %s | r refresh | q quit",
-		workspaceWatcherState(), workspaceHookSummary(), workspaceSourceSummary(), message)
-	if m.width > 0 {
+	line := fmt.Sprintf("sync: %s | watcher: %s | hooks: %s | sources: %s | r refresh | q quit",
+		message, workspaceWatcherState(), workspaceHookSummary(), workspaceSourceSummary())
+	if m.width > 0 && m.width < 70 {
+		line = fmt.Sprintf("sync: %s | r refresh | q quit", message)
+	}
+	if m.width >= 70 {
 		line = truncate(line, m.width)
 	}
 	return workspaceStatusStyle.Render(line)
+}
+
+func (m WorkspaceModel) refreshCmd() tea.Cmd {
+	s := m.opts.Store
+	return func() tea.Msg {
+		if s == nil {
+			return workspaceRefreshMsg{err: fmt.Errorf("store unavailable")}
+		}
+		result, err := workspaceSyncBestEffort(s)
+		return workspaceRefreshMsg{result: result, err: err}
+	}
+}
+
+type workspaceRefreshMsg struct {
+	result pipeline.BestEffortSyncResult
+	err    error
+}
+
+func refreshStatusMessage(msg workspaceRefreshMsg) string {
+	if msg.err != nil {
+		return "refresh failed: " + msg.err.Error()
+	}
+	if msg.result.Warning != nil {
+		return "partial sync: " + msg.result.Warning.Error()
+	}
+	if msg.result.IngestSkipped {
+		return "synced recently"
+	}
+	if msg.result.Ingested == 1 {
+		return "synced 1 correction"
+	}
+	return fmt.Sprintf("synced %d corrections", msg.result.Ingested)
 }
 
 func (m WorkspaceModel) storeStats() (storeStats, error) {

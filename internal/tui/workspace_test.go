@@ -1,12 +1,99 @@
 package tui
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+
+	"github.com/hippoom/agbox/internal/pipeline"
+	"github.com/hippoom/agbox/internal/store"
 )
+
+func TestWorkspaceModelRefreshRunsSyncAndSettlesStatus(t *testing.T) {
+	s := openTestStore(t)
+	defer s.Close()
+	withWorkspaceSync(t, func(got *store.Store) (pipeline.BestEffortSyncResult, error) {
+		if got != s {
+			t.Fatal("refresh used unexpected store")
+		}
+		return pipeline.BestEffortSyncResult{Ingested: 2}, nil
+	})
+
+	m := NewWorkspaceModel(WorkspaceOptions{InitialScreen: WorkspaceOverview, Store: s})
+	updated, cmd := m.Update(tea.KeyPressMsg(tea.Key{Text: "r", Code: 'r'}))
+	m = updated.(WorkspaceModel)
+	if cmd == nil {
+		t.Fatal("refresh did not return command")
+	}
+	if !m.refreshing {
+		t.Fatal("refreshing flag not set")
+	}
+	if got := stripANSI(m.Render()); !strings.Contains(got, "sync: syncing") {
+		t.Fatalf("syncing status missing:\n%s", got)
+	}
+	updated, _ = m.Update(cmd())
+	m = updated.(WorkspaceModel)
+	if m.refreshing {
+		t.Fatal("refreshing flag not cleared")
+	}
+	if got := stripANSI(m.Render()); !strings.Contains(got, "sync: synced 2 corrections") {
+		t.Fatalf("synced status missing:\n%s", got)
+	}
+}
+
+func TestWorkspaceModelRefreshShowsPartialAndFailure(t *testing.T) {
+	s := openTestStore(t)
+	defer s.Close()
+	withWorkspaceSync(t, func(*store.Store) (pipeline.BestEffortSyncResult, error) {
+		return pipeline.BestEffortSyncResult{Warning: errors.New("one source failed")}, nil
+	})
+	m := NewWorkspaceModel(WorkspaceOptions{InitialScreen: WorkspaceOverview, Store: s})
+	updated, cmd := m.Update(tea.KeyPressMsg(tea.Key{Text: "r", Code: 'r'}))
+	m = updated.(WorkspaceModel)
+	updated, _ = m.Update(cmd())
+	m = updated.(WorkspaceModel)
+	if got := stripANSI(m.Render()); !strings.Contains(got, "sync: partial sync: one source failed") {
+		t.Fatalf("partial sync status missing:\n%s", got)
+	}
+
+	withWorkspaceSync(t, func(*store.Store) (pipeline.BestEffortSyncResult, error) {
+		return pipeline.BestEffortSyncResult{}, errors.New("database locked")
+	})
+	m = NewWorkspaceModel(WorkspaceOptions{InitialScreen: WorkspaceOverview, Store: s})
+	updated, cmd = m.Update(tea.KeyPressMsg(tea.Key{Text: "r", Code: 'r'}))
+	m = updated.(WorkspaceModel)
+	updated, _ = m.Update(cmd())
+	m = updated.(WorkspaceModel)
+	got := stripANSI(m.Render())
+	if !strings.Contains(got, "sync: refresh failed: database locked") || !strings.Contains(got, "Overview") {
+		t.Fatalf("refresh failure status missing or screen lost:\n%s", got)
+	}
+}
+
+func TestWorkspaceModelRefreshDoesNotOverlap(t *testing.T) {
+	s := openTestStore(t)
+	defer s.Close()
+	m := NewWorkspaceModel(WorkspaceOptions{InitialScreen: WorkspaceOverview, Store: s})
+	updated, cmd := m.Update(tea.KeyPressMsg(tea.Key{Text: "r", Code: 'r'}))
+	if cmd == nil {
+		t.Fatal("first refresh did not return command")
+	}
+	m = updated.(WorkspaceModel)
+	_, second := m.Update(tea.KeyPressMsg(tea.Key{Text: "r", Code: 'r'}))
+	if second != nil {
+		t.Fatal("second refresh returned command while first was still running")
+	}
+}
+
+func withWorkspaceSync(t *testing.T, fn func(*store.Store) (pipeline.BestEffortSyncResult, error)) {
+	t.Helper()
+	old := workspaceSyncBestEffort
+	workspaceSyncBestEffort = fn
+	t.Cleanup(func() { workspaceSyncBestEffort = old })
+}
 
 func TestWorkspaceModelRendersOverviewShell(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
@@ -130,7 +217,7 @@ func TestWorkspaceModelRefreshStatusBar(t *testing.T) {
 	updated, _ := m.Update(tea.KeyPressMsg(tea.Key{Text: "r", Code: 'r'}))
 	m = updated.(WorkspaceModel)
 	got := stripANSI(m.Render())
-	if !strings.Contains(got, "sync: refresh queued") {
+	if !strings.Contains(got, "sync: syncing") {
 		t.Fatalf("refresh status missing:\n%s", got)
 	}
 }
