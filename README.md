@@ -86,6 +86,7 @@ That's the whole product: **record the workflow automatically, replay it once, t
 
 ```bash
 npm install -g @agboxhq/cli
+agbox
 agbox beta
 ```
 
@@ -100,6 +101,13 @@ See the entire loop in a throwaway store, without touching anything real:
 agbox demo
 ```
 
+Run bare `agbox` in an interactive terminal to open the workspace dashboard.
+Human-facing commands such as `agbox status`, `agbox inbox`, `agbox sources`,
+`agbox doctor`, `agbox repair`, `agbox evidence <id>`, and `agbox help` open the
+matching workspace screen. Pipes, redirected output, and scripts keep the
+line-oriented output automatically; use `--plain` when you want that output from
+an interactive shell.
+
 Then just work:
 
 ```bash
@@ -109,17 +117,22 @@ Then just work:
 #    If a hook misses a SKILL.md write, agbox reconciles files with agbox_candidate_id
 #    when you run status, beta, doctor, or sync.
 
-# 2. See setup + a curated workflow summary
+# 2. Open the workspace dashboard
+agbox                           # overview, status bar, workflows, sources, repair, help
+
+# 3. See setup + a curated workflow summary
 agbox beta                      # best first beta command
 agbox beta --sync               # force a refresh when you want one
 
-# 3. Review what it learned
-agbox inbox                     # Recorded Workflow cards and replay plans
+# 4. Review what it learned
+agbox inbox                     # workspace screen for Recorded Workflow cards and replay plans
+agbox inbox --plain             # line-oriented output for scripts or copy/paste
 agbox review                    # interactive TUI: evidence, replay plan, approve, export
 
-# 4. Check watcher and managed hook health anytime
-agbox status                    # watcher state, last sync, correction/event counts
-agbox doctor                    # full health check
+# 5. Check watcher and managed hook health anytime
+agbox status                    # workspace screen for watcher state, sync, and counts
+agbox status --plain            # line-oriented watcher state, sync, and counts
+agbox doctor                    # workspace screen for full health check
 ```
 
 ---
@@ -208,7 +221,7 @@ rules). agbox never silently installs a detected workflow.
 | **Automatic ingest** | A background watcher reads Claude Code, Codex, Cursor, and Grok session files. No manual commits, no copy-paste-into-a-fresh-chat. |
 | **In-context replay** | Managed hooks can suggest an apply-once replay plan when the current prompt matches a Recorded Workflow. At session stop, agbox can separately ask whether to save that workflow for future use. |
 | **Smart clustering** | Repeated instructions get normalized, grouped, and confidence-scored — directional prefs like `bun-over-npm` included. |
-| **Inbox + Review TUI** | `agbox inbox` shows Recorded Workflow cards with replay plans; `agbox review` drills into evidence, approval, and export. |
+| **Workspace + Review TUI** | Bare `agbox` opens a workspace with status, sources, workflows, repair, and help. `agbox inbox` opens Recorded Workflow cards with replay plans; `agbox review` drills into evidence, approval, and export. |
 | **Vendor-neutral export** | A saved workflow can be exported to `CLAUDE.md`, `AGENTS.md`, Cursor, and Cline formats when you want durable agent behavior. |
 | **Always reversible** | Every export is backed up and wrapped in markers. `agbox export rollback` undoes it cleanly. |
 | **Local-first & private** | Sessions and workflow data stay in `~/.agbox/`. Redacted excerpts + hashes by default — raw prompts stay local. Anonymous usage counters only (opt-out: `agbox telemetry off`). |
@@ -282,22 +295,24 @@ files shipped — repetition eliminated.
 ## Command Reference
 
 ```text
+agbox                               open the interactive workspace dashboard
 agbox init [--quiet]                initialize ~/.agbox/, install watcher + managed hooks, ingest sessions
 agbox beta [--limit 5] [--sync]     setup health + curated workflow summary
 agbox demo                          run the full loop in a throwaway store
-agbox status                        watcher state, last sync, correction/event counts
-agbox sources                       list discovered session source paths
+agbox status [--plain]              workspace status screen; --plain for line output
+agbox sources [--plain]             workspace sources screen; --plain for line output
 agbox sync --once                   force a standalone session ingestion pass
 agbox watch                         internal daemon (used by LaunchAgent)
 
 agbox capture --agent <a> "text"    record a workflow signal manually
 
 agbox scan                          detect repeated normalized signals
-agbox inbox [--state …|all]         show Recorded Workflow cards and replay plans
+agbox inbox [--plain] [--state …|all]
+                                    workspace workflow cards; --plain for line output
 agbox discover                      scan + evidence + next-step commands
 agbox review                        interactive TUI review (primary interface)
 
-agbox evidence <id>                 explain why a Recorded Workflow exists
+agbox evidence [--plain] <id>       workspace evidence detail; --plain for line output
 agbox apply <id> [--agent …]        record that replay was applied once
 agbox approve <id> [--name …]       approve a Recorded Workflow for export
 agbox reject  <id>                  reject a Recorded Workflow
@@ -314,8 +329,8 @@ agbox hook propose|replay|save|acknowledge …
 agbox impact <id>                   repeat counts before vs after export
 agbox audit  [--profile …]          generate a workflow audit pack
 agbox manifest verify               verify .agbox/skill-pack.json hashes
-agbox doctor                        local health check
-agbox repair                        repair exported files from manifest state
+agbox doctor [--plain]              workspace health check; --plain for line output
+agbox repair [--plain]              workspace repair screen; --plain for line output
 agbox debug-bundle [--out …]        write a local debug bundle for troubleshooting
 
 agbox telemetry off                 disable anonymous usage stats (default: on)

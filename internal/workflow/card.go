@@ -231,6 +231,10 @@ func oneLine(value string) string {
 	return value
 }
 
+func SanitizeDisplayText(value string) string {
+	return sanitizeDisplayText(value)
+}
+
 func sanitizeDisplayText(value string) string {
 	value = terminalControlSequence.ReplaceAllString(value, "")
 	value = strings.Map(func(r rune) rune {

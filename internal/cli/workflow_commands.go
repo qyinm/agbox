@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"strings"
 
 	"github.com/hippoom/agbox/internal/evidence"
 	"github.com/hippoom/agbox/internal/pipeline"
@@ -26,12 +25,9 @@ func runInbox(s *store.Store, args []string, stdout io.Writer) error {
 	if syncResult.Warning != nil {
 		fmt.Fprintf(stdout, "warning: partial sync before inbox: %s\n\n", syncResult.Warning)
 	}
-	stateFilter := strings.ToLower(strings.TrimSpace(*state))
-	if stateFilter == "all" {
-		stateFilter = ""
-	}
-	if stateFilter != "" && !validReviewState(stateFilter) {
-		return fmt.Errorf("--state must be %s", reviewStateHelp)
+	stateFilter, err := normalizeCandidateStateFilter(*state)
+	if err != nil {
+		return err
 	}
 	candidates, err := s.ListCandidates(stateFilter)
 	if err != nil {

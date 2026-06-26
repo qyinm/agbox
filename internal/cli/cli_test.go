@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/hippoom/agbox/internal/scan"
 	"github.com/hippoom/agbox/internal/store"
 	"github.com/hippoom/agbox/internal/telemetry"
+	"github.com/hippoom/agbox/internal/tui"
 )
 
 func TestExecuteEndToEndPromotionLoop(t *testing.T) {
@@ -279,9 +281,11 @@ func TestHelpDocumentsReplayWorkflowCommands(t *testing.T) {
 	got := out.String()
 	for _, want := range []string{
 		"agbox records and replays repeated AI-agent workflows.",
-		"agbox inbox [--state pending|proposal_ready|proposed|applied_once|save_suggested",
+		"agbox                         # open the interactive workspace",
+		"agbox inbox [--plain] [--state pending|proposal_ready|proposed|applied_once|save_suggested",
 		"agbox apply <candidate-id>",
 		"agbox review [--state pending|proposal_ready|proposed|applied_once|save_suggested",
+		"Use --plain for existing",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("root help missing %q:\n%s", want, got)
@@ -304,6 +308,240 @@ func TestHelpDocumentsReplayWorkflowCommands(t *testing.T) {
 	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
 		t.Fatalf("help opened store: %v", err)
 	}
+}
+
+func TestWorkspaceRoutesInteractiveBareAgbox(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+	withInteractiveWorkspace(t, func(calls *[]tui.WorkspaceOptions) {
+		var out bytes.Buffer
+		if err := Execute(nil, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("workspace calls = %d, want 1", len(*calls))
+		}
+		if got := (*calls)[0].InitialScreen; got != tui.WorkspaceOverview {
+			t.Fatalf("initial screen = %s, want %s", got, tui.WorkspaceOverview)
+		}
+		if !strings.Contains(out.String(), "workspace:overview") {
+			t.Fatalf("workspace launcher did not write marker: %q", out.String())
+		}
+	})
+}
+
+func TestWorkspaceRoutesInteractiveStatusUnlessPlain(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+	withInteractiveWorkspace(t, func(calls *[]tui.WorkspaceOptions) {
+		var out bytes.Buffer
+		if err := Execute([]string{"status"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("workspace calls = %d, want 1", len(*calls))
+		}
+		if got := (*calls)[0].InitialScreen; got != tui.WorkspaceStatus {
+			t.Fatalf("initial screen = %s, want %s", got, tui.WorkspaceStatus)
+		}
+
+		out.Reset()
+		if err := Execute([]string{"status", "--plain"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("--plain routed to workspace; calls = %d", len(*calls))
+		}
+		if !strings.Contains(out.String(), "watcher:") {
+			t.Fatalf("plain status missing watcher output:\n%s", out.String())
+		}
+	})
+}
+
+func TestWorkspaceStatusReconcilesAcceptedSkills(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "agbox.db")
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", dbPath)
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(wd)
+
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	c := model.Candidate{
+		ID:          "cand_workspace_status",
+		Fingerprint: "fp_workspace_status",
+		Name:        "workspace-status-skill",
+		State:       model.CandidateProposed,
+		EventCount:  3,
+		ProposedAt:  now,
+		FirstSeen:   now,
+		LastSeen:    now,
+		UpdatedAt:   now,
+	}
+	if err := s.UpsertCandidate(c, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	skillDir := filepath.Join(root, ".agents", "skills", "workspace-status-skill")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: workspace-status-skill\nagbox_candidate_id: cand_workspace_status\n---\nbody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	withInteractiveWorkspace(t, func(calls *[]tui.WorkspaceOptions) {
+		if err := Execute([]string{"status"}, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("workspace calls = %d, want 1", len(*calls))
+		}
+		if got := (*calls)[0].AcceptedSkillsReconciled; got != 1 {
+			t.Fatalf("accepted reconciled = %d, want 1", got)
+		}
+	})
+
+	s, err = store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	got, err := s.GetCandidate(c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != model.CandidateAccepted {
+		t.Fatalf("state = %s, want accepted", got.State)
+	}
+}
+
+func TestWorkspaceRoutesInteractiveHelpWithoutOpeningStore(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "agbox.db")
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", dbPath)
+	withInteractiveWorkspace(t, func(calls *[]tui.WorkspaceOptions) {
+		var out bytes.Buffer
+		if err := Execute([]string{"help", "status"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("workspace calls = %d, want 1", len(*calls))
+		}
+		got := (*calls)[0]
+		if got.InitialScreen != tui.WorkspaceHelp || got.HelpCommand != "status" {
+			t.Fatalf("help workspace = (%s, %q), want (%s, status)", got.InitialScreen, got.HelpCommand, tui.WorkspaceHelp)
+		}
+		if got.Store != nil {
+			t.Fatal("help workspace opened store")
+		}
+		if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+			t.Fatalf("help workspace created store: %v", err)
+		}
+	})
+}
+
+func TestWorkspacePlainDoesNotMaskAutomationFlags(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+	withInteractiveWorkspace(t, func(calls *[]tui.WorkspaceOptions) {
+		err := Execute([]string{"capture", "--plain", "Use bun, not npm."}, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
+		if err == nil {
+			t.Fatal("capture --plain succeeded")
+		}
+		if !strings.Contains(err.Error(), "flag provided but not defined") {
+			t.Fatalf("capture --plain error = %q", err.Error())
+		}
+		if len(*calls) != 0 {
+			t.Fatalf("capture --plain routed to workspace; calls = %d", len(*calls))
+		}
+	})
+}
+
+func TestWorkspacePlainReviewReturnsGuidance(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "agbox.db")
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", dbPath)
+	withInteractiveWorkspace(t, func(calls *[]tui.WorkspaceOptions) {
+		err := Execute([]string{"review", "--plain"}, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
+		if err == nil {
+			t.Fatal("review --plain succeeded")
+		}
+		want := "agbox review requires an interactive terminal; use agbox discover or agbox inbox instead"
+		if err.Error() != want {
+			t.Fatalf("review --plain error = %q, want %q", err.Error(), want)
+		}
+		if len(*calls) != 0 {
+			t.Fatalf("review --plain routed to workspace; calls = %d", len(*calls))
+		}
+	})
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("review --plain opened store: %v", err)
+	}
+}
+
+func TestWorkspaceDoesNotRouteHelpFlagsOrAutomationCommands(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
+	withInteractiveWorkspace(t, func(calls *[]tui.WorkspaceOptions) {
+		var out bytes.Buffer
+		if err := Execute([]string{"status", "--help"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(*calls) != 0 {
+			t.Fatalf("help flag routed to workspace; calls = %d", len(*calls))
+		}
+		if !strings.Contains(out.String(), "agbox status") {
+			t.Fatalf("status help missing plain output:\n%s", out.String())
+		}
+
+		out.Reset()
+		if err := Execute([]string{"sync", "--once"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(*calls) != 0 {
+			t.Fatalf("sync routed to workspace; calls = %d", len(*calls))
+		}
+		if !strings.Contains(out.String(), "synced") {
+			t.Fatalf("sync plain output missing:\n%s", out.String())
+		}
+	})
+}
+
+func withInteractiveWorkspace(t *testing.T, fn func(*[]tui.WorkspaceOptions)) {
+	t.Helper()
+	oldInteractive := interactiveTerminalHook
+	oldLauncher := launchWorkspaceProgram
+	var calls []tui.WorkspaceOptions
+	interactiveTerminalHook = func(any) bool { return true }
+	launchWorkspaceProgram = func(opts tui.WorkspaceOptions, stdin io.Reader, stdout io.Writer) error {
+		calls = append(calls, opts)
+		_, err := stdout.Write([]byte("workspace:" + string(opts.InitialScreen)))
+		return err
+	}
+	t.Cleanup(func() {
+		interactiveTerminalHook = oldInteractive
+		launchWorkspaceProgram = oldLauncher
+	})
+	fn(&calls)
 }
 
 func TestReviewProposalStateIsValidBeforeTerminalCheck(t *testing.T) {
@@ -462,9 +700,9 @@ func TestHelpCommandShowsCommandHelp(t *testing.T) {
 	}
 	got := out.String()
 	for _, want := range []string{
-		"agbox status",
-		"watcher state",
-		"last sync",
+		"agbox status [--plain]",
+		"Status workspace screen",
+		"watcher, store, sync, and count summary",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("status help missing %q:\n%s", want, got)

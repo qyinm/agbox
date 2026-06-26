@@ -42,6 +42,12 @@ func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 }
 
 func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	args, plain := stripWorkspacePlainFlag(args)
+	if !plain {
+		if routed, err := maybeRunWorkspace(args, stdin, stdout); routed || err != nil {
+			return err
+		}
+	}
 	if len(args) == 0 {
 		printUsage(stdout)
 		return nil
@@ -66,6 +72,12 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) error 
 			return nil
 		}
 		return fmt.Errorf("unknown command %q", args[0])
+	}
+	if plain && args[0] == "review" {
+		if _, err := parseReviewOptions(args[1:]); err != nil {
+			return err
+		}
+		return reviewRequiresTerminalError()
 	}
 	switch args[0] {
 	case "init":
@@ -287,40 +299,29 @@ func runDiscover(s *store.Store, args []string, stdout io.Writer) error {
 }
 
 func runReview(args []string, stdin io.Reader, stdout io.Writer) error {
-	fs := flag.NewFlagSet("review", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	state := fs.String("state", string(model.CandidatePending), "candidate state filter, or all")
-	minRepeats := fs.Int("min-repeats", 2, "minimum repeated signals")
-	limit := fs.Int("limit", 20, "maximum workflows to show")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{"state": true, "min-repeats": true, "limit": true})); err != nil {
+	opts, err := parseReviewOptions(args)
+	if err != nil {
 		return err
 	}
-	if *limit < 0 {
-		return errors.New("--limit must be 0 or greater")
-	}
-	if !validReviewState(*state) {
-		return fmt.Errorf("--state must be %s", reviewStateHelp)
-	}
 	if !interactiveTerminal(stdin) || !interactiveTerminal(stdout) {
-		return errors.New("agbox review requires an interactive terminal; use agbox discover or agbox inbox instead")
+		return reviewRequiresTerminalError()
 	}
 	s, err := store.Open("")
 	if err != nil {
 		return err
 	}
 	defer s.Close()
-	service := tui.NewReviewService(s, tui.ReviewOptions{
-		State:      *state,
-		MinRepeats: *minRepeats,
-		Limit:      *limit,
-		Project:    defaultProject(),
-	})
+	service := tui.NewReviewService(s, opts)
 	m := tui.NewReviewModel(service).Refresh()
 	_, err = tea.NewProgram(m, tea.WithInput(stdin), tea.WithOutput(stdout)).Run()
 	if errors.Is(err, tea.ErrInterrupted) {
 		return nil
 	}
 	return err
+}
+
+func reviewRequiresTerminalError() error {
+	return errors.New("agbox review requires an interactive terminal; use agbox discover or agbox inbox instead")
 }
 
 func validReviewState(state string) bool {
@@ -737,11 +738,12 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `agbox records and replays repeated AI-agent workflows.
 
 Usage:
+  agbox                         # open the interactive workspace
   agbox init
   agbox capture [--source manual] [--agent codex] "Use bun, not npm"
   agbox scan
-  agbox inbox [--state pending|proposal_ready|proposed|applied_once|save_suggested|accepted|snoozed|approved|rejected|exported|all]
-  agbox evidence <candidate-id>
+  agbox inbox [--plain] [--state pending|proposal_ready|proposed|applied_once|save_suggested|accepted|snoozed|approved|rejected|exported|all]
+  agbox evidence [--plain] <candidate-id>
   agbox apply <candidate-id> [--agent codex] [--project name]
   agbox approve <candidate-id> [--name api-change-workflow]
   agbox compile <candidate-id> [--target agents-md|claude|codex|cursor|cline]
@@ -754,12 +756,16 @@ Usage:
   agbox impact <candidate-id>
   agbox audit [--profile private|shareable|client] [--out audit.md]
   agbox manifest verify
-  agbox doctor
-  agbox repair
-  agbox status
-  agbox sources
+  agbox doctor [--plain]
+  agbox repair [--plain]
+  agbox status [--plain]
+  agbox sources [--plain]
   agbox sync --once
   agbox telemetry on|off|status
+
+In an interactive terminal, agbox status, inbox, sources, doctor, repair,
+evidence, help, and bare agbox open the workspace. Use --plain for existing
+line-oriented output. Pipes and scripts use plain output automatically.
 
 Run agbox <command> --help for command-specific help.`)
 }
@@ -783,13 +789,15 @@ create .agbox/, and ensure .agbox/ is ignored by Git.
 Options:
   --quiet          Suppress status output`,
 	"status": `Usage:
-  agbox status
+  agbox status [--plain]
 
-Show watcher state, store path, last sync, and correction/candidate counts.`,
+Open the Status workspace screen in an interactive terminal. Use --plain, pipes,
+or redirected output for the line-oriented watcher, store, sync, and count summary.`,
 	"sources": `Usage:
-  agbox sources
+  agbox sources [--plain]
 
-List discovered session source paths per agent.`,
+Open the Sources workspace screen in an interactive terminal. Use --plain, pipes,
+or redirected output to list discovered session source paths per agent.`,
 	"sync": `Usage:
   agbox sync [--once]
 
@@ -846,16 +854,18 @@ Scan captured events for repeated workflow signals.
 Options:
   --min-repeats n  Minimum repeated signals. Default: 2`,
 	"inbox": `Usage:
-  agbox inbox [--state pending|proposal_ready|proposed|applied_once|save_suggested|accepted|snoozed|approved|rejected|exported|all]
+  agbox inbox [--plain] [--state pending|proposal_ready|proposed|applied_once|save_suggested|accepted|snoozed|approved|rejected|exported|all]
 
-Show Recorded Workflow cards with replay plans and safe next actions.
+Open the Workflows workspace screen in an interactive terminal. Use --plain,
+pipes, or redirected output to show line-oriented Recorded Workflow cards.
 
 Options:
   --state state    Recorded Workflow state filter, or all`,
 	"evidence": `Usage:
-  agbox evidence <candidate-id>
+  agbox evidence [--plain] <candidate-id>
 
-Show evidence, privacy status, and excerpts for a Recorded Workflow.`,
+Open the Evidence workspace screen in an interactive terminal. Use --plain, pipes,
+or redirected output to show evidence, privacy status, and excerpts.`,
 	"apply": `Usage:
   agbox apply <candidate-id> [--agent agent] [--project project] [--prompt-hash hash] [--prompt-excerpt text]
 
@@ -944,9 +954,10 @@ Options:
   --profile name   Audit profile. Default: private
   --out path       Write markdown to a file instead of stdout`,
 	"doctor": `Usage:
-  agbox doctor
+  agbox doctor [--plain]
 
-Check agbox store, watcher, and session source health.`,
+Open the health and repair workspace screen in an interactive terminal. Use --plain, pipes,
+or redirected output to check agbox store, watcher, and session source health.`,
 	"debug-bundle": `Usage:
   agbox debug-bundle [--out agbox-debug-bundle.txt]
 
@@ -955,9 +966,10 @@ Write a local debug bundle for troubleshooting.
 Options:
   --out path       Debug bundle output path`,
 	"repair": `Usage:
-  agbox repair
+  agbox repair [--plain]
 
-Repair exported files from agbox manifest state.`,
+Open the Repair workspace screen in an interactive terminal. Use --plain, pipes,
+or redirected output to repair exported files from agbox manifest state.`,
 	"telemetry": `Usage:
   agbox telemetry on|off|status
 

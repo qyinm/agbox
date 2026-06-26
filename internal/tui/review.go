@@ -426,6 +426,10 @@ func (m ReviewModel) handleKey(key string) ReviewModel {
 	}
 }
 
+func (m ReviewModel) HandleKey(key string) ReviewModel {
+	return m.handleKey(key)
+}
+
 func (m ReviewModel) runExport(target string) ReviewModel {
 	c, ok := m.selected()
 	if !ok {
@@ -649,5 +653,5 @@ func (m ReviewModel) selectedOccurrence(card model.EvidenceCard) (model.Occurren
 }
 
 func KeyForTest(m ReviewModel, key string) ReviewModel {
-	return m.handleKey(key)
+	return m.HandleKey(key)
 }
