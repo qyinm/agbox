@@ -42,6 +42,12 @@ func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 }
 
 func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	args, plain := stripPlainFlag(args)
+	if !plain {
+		if routed, err := maybeRunWorkspace(args, stdin, stdout); routed || err != nil {
+			return err
+		}
+	}
 	if len(args) == 0 {
 		printUsage(stdout)
 		return nil
@@ -287,19 +293,9 @@ func runDiscover(s *store.Store, args []string, stdout io.Writer) error {
 }
 
 func runReview(args []string, stdin io.Reader, stdout io.Writer) error {
-	fs := flag.NewFlagSet("review", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	state := fs.String("state", string(model.CandidatePending), "candidate state filter, or all")
-	minRepeats := fs.Int("min-repeats", 2, "minimum repeated signals")
-	limit := fs.Int("limit", 20, "maximum workflows to show")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{"state": true, "min-repeats": true, "limit": true})); err != nil {
+	opts, err := parseReviewOptions(args)
+	if err != nil {
 		return err
-	}
-	if *limit < 0 {
-		return errors.New("--limit must be 0 or greater")
-	}
-	if !validReviewState(*state) {
-		return fmt.Errorf("--state must be %s", reviewStateHelp)
 	}
 	if !interactiveTerminal(stdin) || !interactiveTerminal(stdout) {
 		return errors.New("agbox review requires an interactive terminal; use agbox discover or agbox inbox instead")
@@ -309,12 +305,7 @@ func runReview(args []string, stdin io.Reader, stdout io.Writer) error {
 		return err
 	}
 	defer s.Close()
-	service := tui.NewReviewService(s, tui.ReviewOptions{
-		State:      *state,
-		MinRepeats: *minRepeats,
-		Limit:      *limit,
-		Project:    defaultProject(),
-	})
+	service := tui.NewReviewService(s, opts)
 	m := tui.NewReviewModel(service).Refresh()
 	_, err = tea.NewProgram(m, tea.WithInput(stdin), tea.WithOutput(stdout)).Run()
 	if errors.Is(err, tea.ErrInterrupted) {
