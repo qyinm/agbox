@@ -112,7 +112,6 @@ func TestWorkspaceModelRendersOverviewShell(t *testing.T) {
 	m := NewWorkspaceModel(WorkspaceOptions{
 		InitialScreen: WorkspaceOverview,
 		Store:         s,
-		Project:       "repo",
 	})
 	got := stripANSI(m.Render())
 	for _, want := range []string{

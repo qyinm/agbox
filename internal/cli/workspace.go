@@ -46,7 +46,6 @@ func maybeRunWorkspace(args []string, stdin io.Reader, stdout io.Writer) (bool, 
 func workspaceOptions(args []string) (tui.WorkspaceOptions, bool, bool, error) {
 	opts := tui.WorkspaceOptions{
 		InitialScreen: tui.WorkspaceOverview,
-		Project:       defaultProject(),
 		CommandHelp:   commandHelp,
 	}
 	if len(args) == 0 {
@@ -159,7 +158,15 @@ func parseInboxState(args []string) (string, error) {
 	if err := fs.Parse(reorderFlags(args, map[string]bool{"state": true})); err != nil {
 		return "", err
 	}
-	stateFilter := strings.ToLower(strings.TrimSpace(*state))
+	return normalizeCandidateStateFilter(*state)
+}
+
+func stringDefaultReviewState() string {
+	return "pending"
+}
+
+func normalizeCandidateStateFilter(state string) (string, error) {
+	stateFilter := strings.ToLower(strings.TrimSpace(state))
 	if stateFilter == "all" {
 		stateFilter = ""
 	}
@@ -167,8 +174,4 @@ func parseInboxState(args []string) (string, error) {
 		return "", fmt.Errorf("--state must be %s", reviewStateHelp)
 	}
 	return stateFilter, nil
-}
-
-func stringDefaultReviewState() string {
-	return "pending"
 }

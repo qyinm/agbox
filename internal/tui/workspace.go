@@ -15,7 +15,6 @@ import (
 	"github.com/hippoom/agbox/internal/evidence"
 	"github.com/hippoom/agbox/internal/model"
 	"github.com/hippoom/agbox/internal/pipeline"
-	"github.com/hippoom/agbox/internal/scan"
 	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/store"
 	"github.com/hippoom/agbox/internal/watcher"
@@ -43,7 +42,6 @@ const (
 type WorkspaceOptions struct {
 	InitialScreen WorkspaceScreen
 	Store         *store.Store
-	Project       string
 
 	WorkflowState string
 	EvidenceID    string
@@ -74,8 +72,8 @@ func NewWorkspaceModel(opts WorkspaceOptions) WorkspaceModel {
 	m.navCursor = navIndex(opts.InitialScreen)
 	m.passiveSyncInitialScreen()
 	m.refreshSnapshot()
-	if opts.Store != nil {
-		m.review = NewReviewModel(NewReviewService(opts.Store, opts.ReviewOptions)).Refresh()
+	if opts.Store != nil && opts.InitialScreen == WorkspaceReview {
+		m.refreshReviewModel()
 	}
 	return m
 }
@@ -147,6 +145,7 @@ func (m *WorkspaceModel) moveNav(delta int) {
 	}
 	m.active = workspaceNavItems[m.navCursor].screen
 	m.statusMessage = ""
+	m.refreshSnapshot()
 }
 
 func (m *WorkspaceModel) selectNav(key string) {
@@ -157,6 +156,7 @@ func (m *WorkspaceModel) selectNav(key string) {
 	m.navCursor = idx
 	m.active = workspaceNavItems[idx].screen
 	m.statusMessage = ""
+	m.refreshSnapshot()
 }
 
 func (m WorkspaceModel) renderNav() string {
@@ -225,7 +225,7 @@ func (m WorkspaceModel) handleActiveKey(key string) WorkspaceModel {
 
 func (m *WorkspaceModel) refreshActiveScreen() {
 	if m.active == WorkspaceReview && m.opts.Store != nil {
-		m.review = m.review.Refresh()
+		m.refreshReviewModel()
 	}
 }
 
@@ -382,6 +382,9 @@ func (m WorkspaceModel) renderReview() string {
 	if m.opts.Store == nil {
 		return m.renderPlaceholder("Review", "store unavailable")
 	}
+	if m.review.service.store == nil {
+		return m.renderPlaceholder("Review", "review unavailable")
+	}
 	return m.review.Render()
 }
 
@@ -396,11 +399,15 @@ func (m WorkspaceModel) renderEvidence() string {
 		fmt.Fprintln(&b, bodyStyle.Render("Select a Recorded Workflow from Workflows, or run agbox evidence <candidate-id>."))
 		return b.String()
 	}
-	card, err := evidence.Build(m.opts.Store, m.opts.EvidenceID)
-	if err != nil {
-		fmt.Fprintln(&b, bodyStyle.Render("error: "+err.Error()))
+	if m.snapshot.evidenceErr != nil {
+		fmt.Fprintln(&b, bodyStyle.Render("error: "+m.snapshot.evidenceErr.Error()))
 		return b.String()
 	}
+	if m.snapshot.evidenceCard == nil {
+		fmt.Fprintln(&b, bodyStyle.Render("No evidence loaded. Press r to refresh."))
+		return b.String()
+	}
+	card := *m.snapshot.evidenceCard
 	workflowCard := workflow.Build(card)
 	c := card.Candidate
 	fmt.Fprintln(&b, detailTitleStyle.Render(workflowCard.Name))
@@ -450,15 +457,31 @@ func (m *WorkspaceModel) refreshSnapshot() {
 	}
 	snapshot.corrections, snapshot.correctionsErr = m.opts.Store.CountCorrections()
 	snapshot.lastSync, snapshot.lastSyncErr = m.opts.Store.LatestCursorSync()
-	snapshot.repairReport = doctor.Run(m.opts.Store)
-	candidates, cards, err := m.workflowData()
-	if err != nil {
-		snapshot.workflowErr = err
-	} else {
-		snapshot.workflowCandidates = candidates
-		snapshot.workflowCards = cards
+	if m.active == WorkspaceRepair {
+		snapshot.repairReport = doctor.Run(m.opts.Store)
+	}
+	if m.active == WorkspaceWorkflows {
+		data, err := m.workflowData()
+		if err != nil {
+			snapshot.workflowErr = err
+		} else {
+			snapshot.workflowCandidates = data.Candidates
+			snapshot.workflowCards = data.Cards
+		}
+	}
+	if m.active == WorkspaceEvidence && strings.TrimSpace(m.opts.EvidenceID) != "" {
+		card, err := evidence.Build(m.opts.Store, m.opts.EvidenceID)
+		if err != nil {
+			snapshot.evidenceErr = err
+		} else {
+			snapshot.evidenceCard = &card
+		}
 	}
 	m.snapshot = snapshot
+}
+
+func (m *WorkspaceModel) refreshReviewModel() {
+	m.review = NewReviewModel(NewReviewService(m.opts.Store, m.opts.ReviewOptions)).Refresh()
 }
 
 func (m *WorkspaceModel) passiveSyncInitialScreen() {
@@ -478,27 +501,18 @@ func (m *WorkspaceModel) passiveSyncInitialScreen() {
 	}
 }
 
-func (m WorkspaceModel) workflowData() ([]model.Candidate, map[string]model.EvidenceCard, error) {
+func (m WorkspaceModel) workflowData() (ReviewData, error) {
 	if m.opts.Store == nil {
-		return nil, nil, fmt.Errorf("store unavailable")
+		return ReviewData{}, fmt.Errorf("store unavailable")
 	}
-	if _, err := scan.Run(m.opts.Store, 2); err != nil {
-		return nil, nil, err
+	state := m.opts.WorkflowState
+	if strings.TrimSpace(state) == "" {
+		state = "all"
 	}
-	state := normalizeState(m.opts.WorkflowState)
-	candidates, err := m.opts.Store.ListCandidates(state)
-	if err != nil {
-		return nil, nil, err
-	}
-	cards := make(map[string]model.EvidenceCard, len(candidates))
-	for _, c := range candidates {
-		card, err := evidence.Build(m.opts.Store, c.ID)
-		if err != nil {
-			return nil, nil, err
-		}
-		cards[c.ID] = card
-	}
-	return candidates, cards, nil
+	return NewReviewService(m.opts.Store, ReviewOptions{
+		State:      state,
+		MinRepeats: 2,
+	}).Load()
 }
 
 type workspaceSnapshot struct {
@@ -518,6 +532,8 @@ type workspaceSnapshot struct {
 	workflowCandidates []model.Candidate
 	workflowCards      map[string]model.EvidenceCard
 	workflowErr        error
+	evidenceCard       *model.EvidenceCard
+	evidenceErr        error
 }
 
 func (m WorkspaceModel) renderHelp() string {
