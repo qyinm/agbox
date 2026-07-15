@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/hippoom/agbox/internal/model"
 )
 
 var (
@@ -135,6 +137,24 @@ type IngestionReceipt struct {
 	CompletedAt  time.Time
 }
 
+// ParsedSlice is the normalized, bounded output of one parser slice. Keeping
+// this type in store avoids coupling the durable queue to a concrete adapter.
+type ParsedSlice struct {
+	Session     model.Session
+	Turns       []model.Turn
+	Actions     []model.Action
+	Corrections []model.Correction
+	CursorHash  string
+}
+
+// RunnableIngestion joins the durable work identity with its immutable source
+// reference. It is returned only after the caller proves it owns the current
+// scheduler fence.
+type RunnableIngestion struct {
+	Work   IngestionWork
+	Source SourceGeneration
+}
+
 func (s *Store) UpsertSourceGeneration(source SourceGeneration) error {
 	if strings.TrimSpace(source.SourceID) == "" || source.Generation <= 0 || strings.TrimSpace(source.Agent) == "" || strings.TrimSpace(source.SourceRef) == "" {
 		return fmt.Errorf("%w: incomplete source identity", ErrGenerationMismatch)
@@ -217,6 +237,12 @@ func (s *Store) EnqueueIngestionWork(input EnqueueWork) (IngestionWork, error) {
 		if err != nil {
 			return IngestionWork{}, err
 		}
+		_, err = tx.Exec(`UPDATE ingestion_receipts SET status='completed', completed_at=?
+			WHERE receipt_id=? AND target_offset <= COALESCE((SELECT committed_offset FROM ingestion_checkpoints
+				WHERE source_id=? AND generation=?), 0)`, formatTime(input.Now), input.ReceiptID, input.SourceID, input.Generation)
+		if err != nil {
+			return IngestionWork{}, err
+		}
 	}
 	work, err := getIngestionWork(tx, input.SourceID, input.Generation)
 	if err != nil {
@@ -226,6 +252,149 @@ func (s *Store) EnqueueIngestionWork(input EnqueueWork) (IngestionWork, error) {
 		return IngestionWork{}, err
 	}
 	return work, nil
+}
+
+// InitializeIngestionCheckpoint installs the structural baseline for a newly
+// observed generation. It is intentionally compare-and-set: reconciliation
+// may race across processes but can never move an established checkpoint.
+func (s *Store) InitializeIngestionCheckpoint(sourceID string, generation, offset int64, parserVersion int, parserState []byte, now time.Time) error {
+	if generation <= 0 || offset < 0 || parserVersion < 0 || len(parserState) > MaxParserStateBytes {
+		return ErrStateConflict
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	result, err := s.db.Exec(`UPDATE ingestion_checkpoints SET committed_offset=?, parser_state_version=?, parser_state=?, updated_at=?
+		WHERE source_id=? AND generation=? AND committed_offset=0 AND parser_state_version=0 AND length(parser_state)=0`,
+		offset, parserVersion, parserState, formatTime(now), sourceID, generation)
+	if err != nil {
+		return err
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		cp, getErr := s.GetIngestionCheckpoint(sourceID, generation)
+		if getErr != nil {
+			return getErr
+		}
+		if cp.CommittedOffset != offset && cp.CommittedOffset == 0 {
+			return ErrStateConflict
+		}
+	}
+	return nil
+}
+
+// ClaimNextIngestionWork chooses exactly one runnable row in strict class
+// order. The lease and the claim are checked in the same transaction so a
+// stale process cannot begin new work after losing ownership.
+func (s *Store) ClaimNextIngestionWork(owner string, fence int64, now time.Time) (RunnableIngestion, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return RunnableIngestion{}, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE scheduler_lease SET fencing_token=fencing_token WHERE singleton=1`); err != nil {
+		return RunnableIngestion{}, err
+	}
+	if err := requireFence(tx, owner, fence, now); err != nil {
+		return RunnableIngestion{}, err
+	}
+	var item RunnableIngestion
+	var workState, sourceState, workCreated, workUpdated, sourceCreated, sourceUpdated string
+	err = tx.QueryRow(`SELECT w.source_id, w.generation, w.work_class, w.target_offset, w.state,
+		w.retry_count, w.failure_class, w.active_fence, w.created_at, w.updated_at,
+		s.agent, s.source_ref, s.state, s.created_at, s.updated_at
+		FROM ingestion_work w JOIN ingestion_sources s USING(source_id, generation)
+		WHERE w.state='pending' AND s.state='active'
+		ORDER BY w.work_class ASC, w.updated_at ASC, w.source_id ASC LIMIT 1`).Scan(
+		&item.Work.SourceID, &item.Work.Generation, &item.Work.Class, &item.Work.TargetOffset, &workState,
+		&item.Work.RetryCount, &item.Work.FailureClass, &item.Work.ActiveFence, &workCreated, &workUpdated,
+		&item.Source.Agent, &item.Source.SourceRef, &sourceState, &sourceCreated, &sourceUpdated)
+	if err != nil {
+		return RunnableIngestion{}, err
+	}
+	item.Work.State = WorkRunning
+	item.Work.CreatedAt, item.Work.UpdatedAt = parseTime(workCreated), parseTime(workUpdated)
+	item.Source.SourceID, item.Source.Generation = item.Work.SourceID, item.Work.Generation
+	item.Source.State = SourceState(sourceState)
+	item.Source.CreatedAt, item.Source.UpdatedAt = parseTime(sourceCreated), parseTime(sourceUpdated)
+	result, err := tx.Exec(`UPDATE ingestion_work SET state='running', active_fence=?, updated_at=?
+		WHERE source_id=? AND generation=? AND state='pending'`, fence, formatTime(now), item.Work.SourceID, item.Work.Generation)
+	if err != nil {
+		return RunnableIngestion{}, err
+	}
+	if n, _ := result.RowsAffected(); n != 1 {
+		return RunnableIngestion{}, ErrStateConflict
+	}
+	return item, tx.Commit()
+}
+
+func (s *Store) HasPendingLiveWork() (bool, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM ingestion_work WHERE state='pending' AND work_class=?`, WorkLive).Scan(&n)
+	return n > 0, err
+}
+
+func (s *Store) RecoverStaleRunningWork(owner string, fence int64, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := requireFence(tx, owner, fence, now); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE ingestion_work SET state='pending', updated_at=?
+		WHERE state='running' AND active_fence<>?`, formatTime(now), fence); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// CommitParsedIngestionSlice persists normalized records, checkpoint/parser
+// state, visibility watermark, receipt completion, and queue state atomically.
+func (s *Store) CommitParsedIngestionSlice(input SliceCommit, parsed ParsedSlice) error {
+	return s.CommitIngestionSlice(input, func(tx *sql.Tx) error {
+		sess := parsed.Session
+		if sess.ID != "" {
+			if _, err := tx.Exec(`INSERT INTO sessions(id, agent, project, source_path, source_hash, started_at, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET source_hash=excluded.source_hash, updated_at=excluded.updated_at`,
+				sess.ID, sess.Agent, sess.Project, sess.SourcePath, sess.SourceHash, formatTime(sess.StartedAt), formatTime(sess.UpdatedAt)); err != nil {
+				return err
+			}
+		}
+		for _, turn := range parsed.Turns {
+			if _, err := tx.Exec(`INSERT OR IGNORE INTO turns(id, session_id, turn_index, role, event_type, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+				turn.ID, turn.SessionID, turn.TurnIndex, turn.Role, turn.EventType, formatTime(turn.CreatedAt)); err != nil {
+				return err
+			}
+		}
+		for _, action := range parsed.Actions {
+			if _, err := tx.Exec(`INSERT OR IGNORE INTO actions(id, turn_id, tool_name, command, file_path, excerpt) VALUES (?, ?, ?, ?, ?, ?)`,
+				action.ID, action.TurnID, action.ToolName, action.Command, action.FilePath, action.Excerpt); err != nil {
+				return err
+			}
+		}
+		for _, correction := range parsed.Corrections {
+			if _, err := tx.Exec(`INSERT OR IGNORE INTO corrections(id, session_id, turn_id, action_id, hash, normalized, excerpt, agent, project, created_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, correction.ID, correction.SessionID, correction.TurnID, correction.ActionID,
+				correction.Hash, correction.Normalized, correction.Excerpt, correction.Agent, correction.Project, formatTime(correction.CreatedAt)); err != nil {
+				return err
+			}
+		}
+		if sess.SourcePath != "" {
+			_, err := tx.Exec(`INSERT INTO source_cursors(source_path, agent, last_offset, last_hash, last_synced_at)
+				VALUES (?, ?, ?, ?, ?) ON CONFLICT(source_path) DO UPDATE SET agent=excluded.agent, last_offset=excluded.last_offset,
+				last_hash=excluded.last_hash, last_synced_at=excluded.last_synced_at`, sess.SourcePath, sess.Agent, input.NextOffset,
+				parsed.CursorHash, formatTime(input.Now))
+			return err
+		}
+		return nil
+	})
 }
 
 func (s *Store) GetIngestionWork(sourceID string, generation int64) (IngestionWork, error) {

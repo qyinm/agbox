@@ -5,12 +5,9 @@ import (
 	"io"
 	"os"
 
-	"github.com/hippoom/agbox/internal/pipeline"
 	"github.com/hippoom/agbox/internal/propose"
 	"github.com/hippoom/agbox/internal/store"
 )
-
-var syncBestEffortIfStale = pipeline.SyncBestEffortIfStale
 
 func runHook(s *store.Store, args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) == 0 {
@@ -38,13 +35,6 @@ func runHookPropose(s *store.Store, args []string, stdin io.Reader, stdout io.Wr
 	hookData, err := io.ReadAll(stdin)
 	if err != nil {
 		return err
-	}
-	syncResult, err := syncBestEffortIfStale(s)
-	if err != nil {
-		return err
-	}
-	if syncResult.Warning != nil {
-		fmt.Fprintf(os.Stderr, "agbox: warning: partial sync before proposal: %s\n", syncResult.Warning)
 	}
 	project := propose.ProjectFromHook(hookData)
 	if project == "" {
@@ -92,13 +82,6 @@ func runHookSave(s *store.Store, args []string, stdin io.Reader, stdout io.Write
 	hookData, err := io.ReadAll(stdin)
 	if err != nil {
 		return err
-	}
-	syncResult, err := syncBestEffortIfStale(s)
-	if err != nil {
-		return err
-	}
-	if syncResult.Warning != nil {
-		fmt.Fprintf(os.Stderr, "agbox: warning: partial sync before save prompt: %s\n", syncResult.Warning)
 	}
 	project := propose.ProjectFromHook(hookData)
 	if project == "" {

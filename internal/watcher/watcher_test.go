@@ -111,11 +111,16 @@ func TestRunIngestsOnFileChange(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	ready := make(chan struct{})
 	go func() {
-		_ = watcher.Run(ctx, s, 200*time.Millisecond)
+		_ = watcher.RunWithReady(ctx, s, 200*time.Millisecond, ready)
 	}()
 
-	time.Sleep(300 * time.Millisecond)
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watcher readiness barrier did not close")
+	}
 	if err := os.WriteFile(srcPath, sample, 0o600); err != nil {
 		t.Fatal(err)
 	}
