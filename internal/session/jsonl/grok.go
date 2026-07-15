@@ -73,7 +73,7 @@ func (GrokHandler) ProcessRecord(record Record, ctx *Context, acc *Accum, meta M
 			TurnIndex: ctx.TurnIndex, Role: "user", EventType: "message", CreatedAt: createdAt}
 		if acc != nil {
 			acc.Turns = append(acc.Turns, turn)
-			PairCorrection(acc, meta, turn.ID, text, ctx.LastAction)
+			PairCorrection(acc, meta, turn.ID, text, ctx.LastAction, createdAt)
 		}
 	}
 	return nil
@@ -167,7 +167,7 @@ func applyGrokLine(line string, ctx *Context, acc *Accum, meta Meta) {
 		}
 		if acc != nil {
 			acc.Turns = append(acc.Turns, turn)
-			PairCorrection(acc, meta, turn.ID, text, ctx.LastAction)
+			PairCorrection(acc, meta, turn.ID, text, ctx.LastAction, meta.Now)
 		}
 	}
 }

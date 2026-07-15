@@ -94,7 +94,15 @@ func (s *Store) GetCursor(sourcePath string) (CursorRow, error) {
 }
 
 func (s *Store) UpsertCursor(row CursorRow) error {
-	_, err := s.db.Exec(`INSERT INTO source_cursors
+	return upsertCursorTx(s.db, row)
+}
+
+type cursorExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func upsertCursorTx(exec cursorExecer, row CursorRow) error {
+	_, err := exec.Exec(`INSERT INTO source_cursors
 		(source_path, agent, last_offset, last_hash, last_synced_at)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(source_path) DO UPDATE SET
@@ -104,6 +112,23 @@ func (s *Store) UpsertCursor(row CursorRow) error {
 			last_synced_at=excluded.last_synced_at`,
 		row.SourcePath, row.Agent, row.LastOffset, row.LastHash, formatTime(row.LastSyncedAt))
 	return err
+}
+
+// CommitSessionDelta keeps the legacy synthetic/demo ingestion helper atomic.
+// Production discovery and sync use the fenced scheduler commit instead.
+func (s *Store) CommitSessionDelta(parsed ParsedSlice, cursor CursorRow) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := writeParsedEntities(tx, parsed); err != nil {
+		return err
+	}
+	if err := upsertCursorTx(tx, cursor); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) ListCorrections() ([]model.Correction, error) {

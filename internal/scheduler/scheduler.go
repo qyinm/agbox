@@ -244,7 +244,7 @@ func (c *Controller) ProcessOne(ctx context.Context) (bool, int, error) {
 		_ = c.quarantine(item, cp, lease, "no_progress")
 		return true, 0, err
 	}
-	complete := parsed.NewOffset >= item.Work.TargetOffset || parsed.Incomplete
+	complete := parsed.NewOffset >= item.Work.TargetOffset
 	watermark := time.Now().UnixNano()
 	if watermark <= cp.VisibilityWatermark {
 		watermark = cp.VisibilityWatermark + 1
@@ -254,7 +254,7 @@ func (c *Controller) ProcessOne(ctx context.Context) (bool, int, error) {
 		ExpectedOffset: cp.CommittedOffset, NextOffset: parsed.NewOffset,
 		ParserStateVersion: parsed.ParserStateVersion, ParserState: parsed.ParserState,
 		VisibilityWatermark: watermark, LeaseOwner: c.OwnerID,
-		FencingToken: lease.FencingToken, Now: time.Now(), Complete: complete,
+		FencingToken: lease.FencingToken, Now: time.Now(), Complete: complete, AwaitingAppend: parsed.Incomplete,
 	}, store.ParsedSlice{Session: parsed.Session, Turns: parsed.Turns, Actions: parsed.Actions,
 		Corrections: parsed.Corrections, CursorHash: parsed.NewHash})
 	return true, len(parsed.Corrections), err

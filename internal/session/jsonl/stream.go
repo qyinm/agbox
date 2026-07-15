@@ -90,10 +90,11 @@ type StreamResult struct {
 }
 
 type persistedContext struct {
-	TurnIndex      int    `json:"t"`
-	LastActionID   string `json:"a,omitempty"`
-	LastActionTurn string `json:"r,omitempty"`
-	RequireAction  bool   `json:"n,omitempty"`
+	TurnIndex         int    `json:"t"`
+	LastActionID      string `json:"a,omitempty"`
+	LastActionTurn    string `json:"r,omitempty"`
+	RequireAction     bool   `json:"n,omitempty"`
+	LastUserSignature string `json:"u,omitempty"`
 }
 
 func decodeContext(state []byte) (*Context, error) {
@@ -107,6 +108,7 @@ func decodeContext(state []byte) (*Context, error) {
 	}
 	ctx.TurnIndex = saved.TurnIndex
 	ctx.RequireLastAction = saved.RequireAction
+	ctx.LastUserSignature = saved.LastUserSignature
 	if saved.LastActionID != "" {
 		ctx.LastAction = &model.Action{ID: saved.LastActionID, TurnID: saved.LastActionTurn}
 	}
@@ -114,7 +116,7 @@ func decodeContext(state []byte) (*Context, error) {
 }
 
 func encodeContext(ctx *Context) ([]byte, error) {
-	saved := persistedContext{TurnIndex: ctx.TurnIndex, RequireAction: ctx.RequireLastAction}
+	saved := persistedContext{TurnIndex: ctx.TurnIndex, RequireAction: ctx.RequireLastAction, LastUserSignature: ctx.LastUserSignature}
 	if ctx.LastAction != nil {
 		saved.LastActionID = ctx.LastAction.ID
 		saved.LastActionTurn = ctx.LastAction.TurnID

@@ -207,6 +207,61 @@ func TestRestartRecoversClaimFromExpiredFence(t *testing.T) {
 	}
 }
 
+func TestIncompleteTailWaitsForAppendWithoutCompletingReceipt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "source.jsonl")
+	if err := os.WriteFile(path, []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(dir, "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.UpsertSourceGeneration(store.SourceGeneration{SourceID: "src_partial", Generation: 1, Agent: "test", SourceRef: path, State: store.SourceActive}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnqueueIngestionWork(store.EnqueueWork{SourceID: "src_partial", Generation: 1, Class: store.WorkLive, TargetOffset: 7, ReceiptID: "receipt-partial"}); err != nil {
+		t.Fatal(err)
+	}
+	adapter := &testAdapter{agent: "test", parse: func(src session.Source, cur session.Cursor) (session.ParseResult, error) {
+		if src.Size == 7 {
+			return session.ParseResult{NewOffset: cur.LastOffset, ParserStateVersion: 1, ParserState: []byte(`{"t":0}`), Incomplete: true}, nil
+		}
+		return parsedTo(src, cur, src.Size), nil
+	}}
+	c := New(s)
+	c.Adapters = []session.Adapter{adapter}
+	if worked, _, err := c.ProcessOne(context.Background()); !worked || err != nil {
+		t.Fatalf("incomplete ProcessOne = %v, %v", worked, err)
+	}
+	work, err := s.GetIngestionWork("src_partial", 1)
+	if err != nil || work.State != store.WorkWaitingAppend {
+		t.Fatalf("incomplete work = %+v, err=%v", work, err)
+	}
+	receipt, err := s.GetIngestionReceipt("receipt-partial")
+	if err != nil || receipt.Status != store.ReceiptAccepted {
+		t.Fatalf("incomplete receipt = %+v, err=%v", receipt, err)
+	}
+	if worked, _, err := c.ProcessOne(context.Background()); worked || err != nil {
+		t.Fatalf("waiting source re-ran without append = %v, %v", worked, err)
+	}
+	if err := os.WriteFile(path, []byte("complete\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnqueueIngestionWork(store.EnqueueWork{SourceID: "src_partial", Generation: 1, Class: store.WorkLive, TargetOffset: 9}); err != nil {
+		t.Fatal(err)
+	}
+	if worked, _, err := c.ProcessOne(context.Background()); !worked || err != nil {
+		t.Fatalf("appended ProcessOne = %v, %v", worked, err)
+	}
+	work, _ = s.GetIngestionWork("src_partial", 1)
+	receipt, _ = s.GetIngestionReceipt("receipt-partial")
+	if work.State != store.WorkComplete || receipt.Status != store.ReceiptCompleted {
+		t.Fatalf("completed work/receipt = %+v / %+v", work, receipt)
+	}
+}
+
 func parsedTo(src session.Source, cur session.Cursor, next int64) session.ParseResult {
 	now := time.Now()
 	return session.ParseResult{Session: model.Session{ID: "ses_" + src.SourceID, Agent: src.Agent, Project: src.Project,

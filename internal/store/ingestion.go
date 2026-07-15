@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -38,10 +39,11 @@ const (
 type WorkState string
 
 const (
-	WorkPending     WorkState = "pending"
-	WorkRunning     WorkState = "running"
-	WorkComplete    WorkState = "complete"
-	WorkQuarantined WorkState = "quarantined"
+	WorkPending       WorkState = "pending"
+	WorkRunning       WorkState = "running"
+	WorkComplete      WorkState = "complete"
+	WorkWaitingAppend WorkState = "waiting_append"
+	WorkQuarantined   WorkState = "quarantined"
 )
 
 type ReceiptStatus string
@@ -114,6 +116,7 @@ type SliceCommit struct {
 	FencingToken        int64
 	Now                 time.Time
 	Complete            bool
+	AwaitingAppend      bool
 }
 
 type QuarantineRequest struct {
@@ -135,6 +138,11 @@ type IngestionReceipt struct {
 	FailureClass string
 	CreatedAt    time.Time
 	CompletedAt  time.Time
+}
+
+type ConsumerVisibility struct {
+	Watermark   int64
+	CommittedAt time.Time
 }
 
 // ParsedSlice is the normalized, bounded output of one parser slice. Keeping
@@ -222,6 +230,7 @@ func (s *Store) EnqueueIngestionWork(input EnqueueWork) (IngestionWork, error) {
 			target_offset=MAX(ingestion_work.target_offset, excluded.target_offset),
 			state=CASE
 				WHEN ingestion_work.state = 'quarantined' THEN 'quarantined'
+				WHEN ingestion_work.state = 'waiting_append' AND excluded.target_offset <= ingestion_work.target_offset THEN 'waiting_append'
 				WHEN excluded.target_offset > COALESCE((SELECT committed_offset FROM ingestion_checkpoints WHERE source_id=excluded.source_id AND generation=excluded.generation), 0) THEN 'pending'
 				ELSE ingestion_work.state END,
 			updated_at=excluded.updated_at`,
@@ -359,42 +368,47 @@ func (s *Store) RecoverStaleRunningWork(owner string, fence int64, now time.Time
 // state, visibility watermark, receipt completion, and queue state atomically.
 func (s *Store) CommitParsedIngestionSlice(input SliceCommit, parsed ParsedSlice) error {
 	return s.CommitIngestionSlice(input, func(tx *sql.Tx) error {
-		sess := parsed.Session
-		if sess.ID != "" {
-			if _, err := tx.Exec(`INSERT INTO sessions(id, agent, project, source_path, source_hash, started_at, updated_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET source_hash=excluded.source_hash, updated_at=excluded.updated_at`,
-				sess.ID, sess.Agent, sess.Project, sess.SourcePath, sess.SourceHash, formatTime(sess.StartedAt), formatTime(sess.UpdatedAt)); err != nil {
-				return err
-			}
-		}
-		for _, turn := range parsed.Turns {
-			if _, err := tx.Exec(`INSERT OR IGNORE INTO turns(id, session_id, turn_index, role, event_type, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-				turn.ID, turn.SessionID, turn.TurnIndex, turn.Role, turn.EventType, formatTime(turn.CreatedAt)); err != nil {
-				return err
-			}
-		}
-		for _, action := range parsed.Actions {
-			if _, err := tx.Exec(`INSERT OR IGNORE INTO actions(id, turn_id, tool_name, command, file_path, excerpt) VALUES (?, ?, ?, ?, ?, ?)`,
-				action.ID, action.TurnID, action.ToolName, action.Command, action.FilePath, action.Excerpt); err != nil {
-				return err
-			}
-		}
-		for _, correction := range parsed.Corrections {
-			if _, err := tx.Exec(`INSERT OR IGNORE INTO corrections(id, session_id, turn_id, action_id, hash, normalized, excerpt, agent, project, created_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, correction.ID, correction.SessionID, correction.TurnID, correction.ActionID,
-				correction.Hash, correction.Normalized, correction.Excerpt, correction.Agent, correction.Project, formatTime(correction.CreatedAt)); err != nil {
-				return err
-			}
-		}
-		if sess.SourcePath != "" {
-			_, err := tx.Exec(`INSERT INTO source_cursors(source_path, agent, last_offset, last_hash, last_synced_at)
-				VALUES (?, ?, ?, ?, ?) ON CONFLICT(source_path) DO UPDATE SET agent=excluded.agent, last_offset=excluded.last_offset,
-				last_hash=excluded.last_hash, last_synced_at=excluded.last_synced_at`, sess.SourcePath, sess.Agent, input.NextOffset,
-				parsed.CursorHash, formatTime(input.Now))
+		if err := writeParsedEntities(tx, parsed); err != nil {
 			return err
+		}
+		sess := parsed.Session
+		if sess.SourcePath != "" {
+			return upsertCursorTx(tx, CursorRow{SourcePath: sess.SourcePath, Agent: sess.Agent, LastOffset: input.NextOffset,
+				LastHash: parsed.CursorHash, LastSyncedAt: input.Now})
 		}
 		return nil
 	})
+}
+
+func writeParsedEntities(tx *sql.Tx, parsed ParsedSlice) error {
+	sess := parsed.Session
+	if sess.ID != "" {
+		if _, err := tx.Exec(`INSERT INTO sessions(id, agent, project, source_path, source_hash, started_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET source_hash=excluded.source_hash, updated_at=excluded.updated_at`,
+			sess.ID, sess.Agent, sess.Project, sess.SourcePath, sess.SourceHash, formatTime(sess.StartedAt), formatTime(sess.UpdatedAt)); err != nil {
+			return err
+		}
+	}
+	for _, turn := range parsed.Turns {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO turns(id, session_id, turn_index, role, event_type, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+			turn.ID, turn.SessionID, turn.TurnIndex, turn.Role, turn.EventType, formatTime(turn.CreatedAt)); err != nil {
+			return err
+		}
+	}
+	for _, action := range parsed.Actions {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO actions(id, turn_id, tool_name, command, file_path, excerpt) VALUES (?, ?, ?, ?, ?, ?)`,
+			action.ID, action.TurnID, action.ToolName, action.Command, action.FilePath, action.Excerpt); err != nil {
+			return err
+		}
+	}
+	for _, correction := range parsed.Corrections {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO corrections(id, session_id, turn_id, action_id, hash, normalized, excerpt, agent, project, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, correction.ID, correction.SessionID, correction.TurnID, correction.ActionID,
+			correction.Hash, correction.Normalized, correction.Excerpt, correction.Agent, correction.Project, formatTime(correction.CreatedAt)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) GetIngestionWork(sourceID string, generation int64) (IngestionWork, error) {
@@ -453,7 +467,7 @@ func (s *Store) CommitIngestionSlice(input SliceCommit, write func(*sql.Tx) erro
 	if input.Now.IsZero() {
 		input.Now = time.Now()
 	}
-	if input.NextOffset < input.ExpectedOffset || len(input.ParserState) > MaxParserStateBytes || input.ParserStateVersion < 0 {
+	if input.NextOffset < input.ExpectedOffset || len(input.ParserState) > MaxParserStateBytes || input.ParserStateVersion < 0 || (input.Complete && input.AwaitingAppend) {
 		return fmt.Errorf("%w: invalid checkpoint transition", ErrStateConflict)
 	}
 	tx, err := s.db.Begin()
@@ -474,8 +488,16 @@ func (s *Store) CommitIngestionSlice(input SliceCommit, write func(*sql.Tx) erro
 	if err != nil {
 		return err
 	}
-	if cp.CommittedOffset != input.ExpectedOffset {
-		return fmt.Errorf("%w: checkpoint is %d, expected %d", ErrStateConflict, cp.CommittedOffset, input.ExpectedOffset)
+	var sourceState string
+	var latestGeneration sql.NullInt64
+	if err := tx.QueryRow(`SELECT state FROM ingestion_sources WHERE source_id=? AND generation=?`, input.SourceID, input.Generation).Scan(&sourceState); err != nil {
+		return ErrGenerationMismatch
+	}
+	if err := tx.QueryRow(`SELECT MAX(generation) FROM ingestion_sources WHERE source_id=?`, input.SourceID).Scan(&latestGeneration); err != nil {
+		return err
+	}
+	if sourceState != string(SourceActive) || !latestGeneration.Valid || latestGeneration.Int64 != input.Generation {
+		return ErrGenerationMismatch
 	}
 	work, err := getIngestionWork(tx, input.SourceID, input.Generation)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -483,6 +505,20 @@ func (s *Store) CommitIngestionSlice(input SliceCommit, write func(*sql.Tx) erro
 	}
 	if err != nil {
 		return err
+	}
+	// A caller can lose the response after SQLite commits. Treat a byte-for-byte
+	// replay of that already published checkpoint as success without rewriting
+	// entities or queue state.
+	if cp.CommittedOffset == input.NextOffset && cp.ParserStateVersion == input.ParserStateVersion &&
+		bytes.Equal(cp.ParserState, input.ParserState) && cp.VisibilityWatermark == input.VisibilityWatermark &&
+		work.State == WorkComplete {
+		return tx.Commit()
+	}
+	if cp.CommittedOffset != input.ExpectedOffset {
+		return fmt.Errorf("%w: checkpoint is %d, expected %d", ErrStateConflict, cp.CommittedOffset, input.ExpectedOffset)
+	}
+	if work.State != WorkRunning || work.ActiveFence != input.FencingToken {
+		return fmt.Errorf("%w: work is not claimed by fence", ErrStateConflict)
 	}
 	if work.State == WorkQuarantined || input.NextOffset > work.TargetOffset || input.VisibilityWatermark < cp.VisibilityWatermark {
 		return ErrStateConflict
@@ -503,8 +539,12 @@ func (s *Store) CommitIngestionSlice(input SliceCommit, write func(*sql.Tx) erro
 		return err
 	}
 	state := WorkPending
-	if input.Complete || input.NextOffset >= work.TargetOffset {
+	if input.NextOffset >= work.TargetOffset {
 		state = WorkComplete
+	} else if input.AwaitingAppend {
+		state = WorkWaitingAppend
+	} else if input.Complete {
+		return fmt.Errorf("%w: completed slice is below target", ErrStateConflict)
 	}
 	_, err = tx.Exec(`UPDATE ingestion_work SET state=?, active_fence=?, failure_class='', updated_at=? WHERE source_id=? AND generation=?`,
 		state, input.FencingToken, formatTime(input.Now), input.SourceID, input.Generation)
@@ -522,6 +562,14 @@ func (s *Store) CommitIngestionSlice(input SliceCommit, write func(*sql.Tx) erro
 		}
 	}
 	return tx.Commit()
+}
+
+func (s *Store) GetConsumerVisibility() (ConsumerVisibility, error) {
+	var visibility ConsumerVisibility
+	var committed string
+	err := s.db.QueryRow(`SELECT watermark, committed_at FROM consumer_visibility WHERE singleton=1`).Scan(&visibility.Watermark, &committed)
+	visibility.CommittedAt = parseTime(committed)
+	return visibility, err
 }
 
 func (s *Store) QuarantineSource(input QuarantineRequest) error {

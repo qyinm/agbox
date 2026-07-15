@@ -66,7 +66,7 @@ func (AnthropicHandler) ProcessRecord(record Record, ctx *Context, acc *Accum, m
 				TurnIndex: ctx.TurnIndex, Role: "user", EventType: "message", CreatedAt: createdAt}
 			if acc != nil {
 				acc.Turns = append(acc.Turns, turn)
-				PairCorrection(acc, meta, turn.ID, text, ctx.LastAction)
+				PairCorrection(acc, meta, turn.ID, text, ctx.LastAction, createdAt)
 			}
 		}
 	}
@@ -160,7 +160,7 @@ func applyAnthropicLine(line string, ctx *Context, acc *Accum, meta Meta) {
 			}
 			if acc != nil {
 				acc.Turns = append(acc.Turns, turn)
-				PairCorrection(acc, meta, turn.ID, block.Text, ctx.LastAction)
+				PairCorrection(acc, meta, turn.ID, block.Text, ctx.LastAction, meta.Now)
 			}
 		}
 	}

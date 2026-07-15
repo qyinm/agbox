@@ -3,6 +3,7 @@ package session
 import (
 	"errors"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/hippoom/agbox/internal/model"
@@ -55,6 +56,20 @@ type Source struct {
 	SessionTime        time.Time
 	HistoricalEligible bool
 	BaselineOffset     int64
+}
+
+// DurableIdentity is stable across path moves while separating replacements
+// of the same logical source. Discovered sources always carry SourceID and a
+// positive Generation; the path fallback exists only for synthetic/demo
+// callers that predate durable discovery.
+func (s Source) DurableIdentity() string {
+	if s.SourceID == "" {
+		return s.Path
+	}
+	if s.Generation <= 0 {
+		return s.SourceID
+	}
+	return s.SourceID + ":g" + strconv.FormatInt(s.Generation, 10)
 }
 
 type Cursor struct {

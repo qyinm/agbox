@@ -16,6 +16,7 @@ type Context struct {
 	TurnIndex         int
 	LastAction        *model.Action
 	RequireLastAction bool
+	LastUserSignature string
 }
 
 // Accum collects parsed session entities from jsonl deltas.
@@ -73,7 +74,7 @@ func ProcessDelta(data []byte, lastOffset int64, handler LineHandler, meta Meta)
 }
 
 // PairCorrection links a user correction to the most recent agent action.
-func PairCorrection(acc *Accum, meta Meta, turnID, raw string, lastAction *model.Action) {
+func PairCorrection(acc *Accum, meta Meta, turnID, raw string, lastAction *model.Action, createdAt time.Time) {
 	if lastAction == nil {
 		return
 	}
@@ -81,8 +82,15 @@ func PairCorrection(acc *Accum, meta Meta, turnID, raw string, lastAction *model
 	if normalized == "" {
 		return
 	}
+	if createdAt.IsZero() {
+		createdAt = meta.Now
+	}
 	sigHash := hashSignal(normalized)
-	id := stableID("cor_", lastAction.ID, sigHash)
+	// The correction turn carries the record position (and record-local ordinal)
+	// assigned by the native handler. Include it so identical correction text
+	// repeated after one action remains two durable source records while retries
+	// of either record remain idempotent.
+	id := stableID("cor_", lastAction.ID, turnID, sigHash)
 	for _, existing := range acc.Corrections {
 		if existing.ID == id {
 			return
@@ -98,6 +106,6 @@ func PairCorrection(acc *Accum, meta Meta, turnID, raw string, lastAction *model
 		Excerpt:    excerpt(raw, 240),
 		Agent:      meta.Agent,
 		Project:    meta.Project,
-		CreatedAt:  meta.Now,
+		CreatedAt:  createdAt,
 	})
 }

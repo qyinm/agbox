@@ -92,7 +92,7 @@ func TestStableSourceIDMakesResultsPathIndependent(t *testing.T) {
 		if err := os.WriteFile(path, data, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		result, err := codex.New().ParseDelta(session.Source{Agent: "codex", Path: path, SourceID: "same-generation"}, session.Cursor{})
+		result, err := codex.New().ParseDelta(session.Source{Agent: "codex", Path: path, SourceID: "same-source", Generation: 7}, session.Cursor{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -100,6 +100,81 @@ func TestStableSourceIDMakesResultsPathIndependent(t *testing.T) {
 	}
 	if ids[0] != ids[1] {
 		t.Fatalf("correction IDs vary by path: %v", ids)
+	}
+}
+
+func TestStableIDsSeparateSourceGenerationsAndRecordOrdinals(t *testing.T) {
+	data := "{\"timestamp\":\"2026-07-15T15:32:30Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"exec\",\"input\":\"npm install\"}}\n" +
+		"{\"timestamp\":\"2026-07-15T15:32:31Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"use bun\"}}\n" +
+		"{\"timestamp\":\"2026-07-15T15:32:32Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"use bun\"}}\n"
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	parse := func(generation int64) session.ParseResult {
+		t.Helper()
+		result, err := codex.New().ParseDelta(session.Source{
+			Agent: "codex", Path: path, SourceID: "same-source", Generation: generation,
+		}, session.Cursor{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	first := parse(1)
+	second := parse(2)
+	if len(first.Corrections) != 2 {
+		t.Fatalf("same text at distinct record positions produced %d corrections, want 2", len(first.Corrections))
+	}
+	if first.Corrections[0].ID == first.Corrections[1].ID {
+		t.Fatalf("distinct record ordinals shared correction ID %q", first.Corrections[0].ID)
+	}
+	if first.Session.ID == second.Session.ID || first.Turns[0].ID == second.Turns[0].ID || first.Corrections[0].ID == second.Corrections[0].ID {
+		t.Fatal("replacement generation reused durable identities")
+	}
+}
+
+func TestStableIDsAreIdenticalAcrossSliceBoundaryAndRestart(t *testing.T) {
+	action := "{\"timestamp\":\"2026-07-15T15:32:30Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"exec\",\"input\":\"npm install\"}}\n"
+	correction := "{\"timestamp\":\"2026-07-15T15:32:31Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"use bun\"}}\n"
+	dir := t.TempDir()
+	fullPath := filepath.Join(dir, "full.jsonl")
+	splitPath := filepath.Join(dir, "split.jsonl")
+	if err := os.WriteFile(fullPath, []byte(action+correction), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(splitPath, []byte(action), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	adapter := codex.New()
+	full, err := adapter.ParseDelta(session.Source{Agent: "codex", Path: fullPath, SourceID: "stable", Generation: 3}, session.Cursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := adapter.ParseDelta(session.Source{Agent: "codex", Path: splitPath, SourceID: "stable", Generation: 3}, session.Cursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(splitPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(correction); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := adapter.ParseDelta(session.Source{Agent: "codex", Path: splitPath, SourceID: "stable", Generation: 3}, session.Cursor{
+		LastOffset: first.NewOffset, ParserStateVersion: first.ParserStateVersion, ParserState: first.ParserState,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full.Session.ID != first.Session.ID || full.Actions[0].ID != first.Actions[0].ID ||
+		full.Corrections[0].ID != second.Corrections[0].ID || full.Corrections[0].TurnID != second.Corrections[0].TurnID {
+		t.Fatalf("slice/restart identities differ: full=%+v/%+v split=%+v/%+v", full.Actions, full.Corrections, first.Actions, second.Corrections)
 	}
 }
 

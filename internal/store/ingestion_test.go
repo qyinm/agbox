@@ -11,6 +11,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 
+	"github.com/hippoom/agbox/internal/model"
 	"github.com/hippoom/agbox/internal/store"
 )
 
@@ -207,6 +208,9 @@ func TestLeaseFencingAndCommitRollbackAreAtomic(t *testing.T) {
 	if newLease.FencingToken <= oldLease.FencingToken {
 		t.Fatalf("new fence %d <= old fence %d", newLease.FencingToken, oldLease.FencingToken)
 	}
+	if _, err := s.ClaimNextIngestionWork(newLease.OwnerID, newLease.FencingToken, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
 
 	commit := store.SliceCommit{
 		SourceID: source.SourceID, Generation: 1, ExpectedOffset: 0, NextOffset: 90,
@@ -243,6 +247,147 @@ func TestLeaseFencingAndCommitRollbackAreAtomic(t *testing.T) {
 	}
 	if len(events) != 0 {
 		t.Fatalf("event survived rollback: %d", len(events))
+	}
+}
+
+func TestParsedSliceCommitRollsBackEntitiesCheckpointVisibilityAndQueue(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().UTC()
+	source := store.SourceGeneration{SourceID: "src_fault", Generation: 4, Agent: "codex", SourceRef: "opaque:source", State: store.SourceActive, CreatedAt: now}
+	if err := s.UpsertSourceGeneration(source); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnqueueIngestionWork(store.EnqueueWork{SourceID: source.SourceID, Generation: source.Generation, Class: store.WorkLive, TargetOffset: 120, Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := s.AcquireSchedulerLease("fault-owner", now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimNextIngestionWork(lease.OwnerID, lease.FencingToken, now); err != nil {
+		t.Fatal(err)
+	}
+	parsed := store.ParsedSlice{
+		Session:     model.Session{ID: "ses_fault", Agent: "codex", SourcePath: "/private/source", SourceHash: "hash", StartedAt: now, UpdatedAt: now},
+		Turns:       []model.Turn{{ID: "turn_fault", SessionID: "ses_fault", TurnIndex: 1, Role: "agent", EventType: "tool", CreatedAt: now}},
+		Actions:     []model.Action{{ID: "act_fault", TurnID: "turn_fault", ToolName: "exec"}},
+		Corrections: []model.Correction{{ID: "cor_fault", SessionID: "ses_fault", TurnID: "turn_fault", ActionID: "act_fault", Hash: "h", Normalized: "use bun", Agent: "codex", CreatedAt: now}},
+		CursorHash:  "cursor-hash",
+	}
+	commit := store.SliceCommit{SourceID: source.SourceID, Generation: source.Generation, ExpectedOffset: 0, NextOffset: 120,
+		ParserStateVersion: 1, ParserState: []byte(`{"t":1}`), VisibilityWatermark: 41, ReceiptID: "missing-receipt",
+		LeaseOwner: lease.OwnerID, FencingToken: lease.FencingToken, Now: now, Complete: true}
+	if err := s.CommitParsedIngestionSlice(commit, parsed); !errors.Is(err, store.ErrStateConflict) {
+		t.Fatalf("fault-injected commit error = %v, want ErrStateConflict", err)
+	}
+	if n, err := s.CountCorrections(); err != nil || n != 0 {
+		t.Fatalf("corrections after rollback = %d, err=%v", n, err)
+	}
+	if _, err := s.GetTurn("turn_fault"); err == nil {
+		t.Fatal("turn survived rolled-back commit")
+	}
+	cp, err := s.GetIngestionCheckpoint(source.SourceID, source.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cp.CommittedOffset != 0 || cp.VisibilityWatermark != 0 || len(cp.ParserState) != 0 {
+		t.Fatalf("checkpoint advanced on rolled-back parsed commit: %+v", cp)
+	}
+	work, err := s.GetIngestionWork(source.SourceID, source.Generation)
+	if err != nil || work.State != store.WorkRunning {
+		t.Fatalf("queue changed on rolled-back parsed commit: %+v, err=%v", work, err)
+	}
+	visibility, err := s.GetConsumerVisibility()
+	if err != nil || visibility.Watermark != 0 {
+		t.Fatalf("consumer visibility advanced on rollback: %+v, err=%v", visibility, err)
+	}
+}
+
+func TestParsedSliceCommitIsIdempotentAndPublishesVisibilityWithCorrection(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().UTC()
+	source := store.SourceGeneration{SourceID: "src_retry", Generation: 2, Agent: "codex", SourceRef: "opaque:retry", State: store.SourceActive, CreatedAt: now}
+	if err := s.UpsertSourceGeneration(source); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnqueueIngestionWork(store.EnqueueWork{SourceID: source.SourceID, Generation: source.Generation, Class: store.WorkLive, TargetOffset: 90, ReceiptID: "receipt-retry", Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := s.AcquireSchedulerLease("retry-owner", now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimNextIngestionWork(lease.OwnerID, lease.FencingToken, now); err != nil {
+		t.Fatal(err)
+	}
+	parsed := store.ParsedSlice{
+		Session:     model.Session{ID: "ses_retry", Agent: "codex", SourcePath: "/private/retry", SourceHash: "hash", StartedAt: now, UpdatedAt: now},
+		Turns:       []model.Turn{{ID: "turn_retry", SessionID: "ses_retry", TurnIndex: 1, Role: "agent", EventType: "tool", CreatedAt: now}},
+		Actions:     []model.Action{{ID: "act_retry", TurnID: "turn_retry", ToolName: "exec"}},
+		Corrections: []model.Correction{{ID: "cor_retry", SessionID: "ses_retry", TurnID: "turn_retry", ActionID: "act_retry", Hash: "h", Normalized: "use bun", Agent: "codex", CreatedAt: now}},
+		CursorHash:  "cursor-hash",
+	}
+	commit := store.SliceCommit{SourceID: source.SourceID, Generation: source.Generation, ExpectedOffset: 0, NextOffset: 90,
+		ParserStateVersion: 1, ParserState: []byte(`{"t":1}`), VisibilityWatermark: 73, ReceiptID: "receipt-retry",
+		LeaseOwner: lease.OwnerID, FencingToken: lease.FencingToken, Now: now, Complete: true}
+	if err := s.CommitParsedIngestionSlice(commit, parsed); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CommitParsedIngestionSlice(commit, parsed); err != nil {
+		t.Fatalf("retry after committed slice = %v, want idempotent success", err)
+	}
+	if n, err := s.CountCorrections(); err != nil || n != 1 {
+		t.Fatalf("corrections after retry = %d, err=%v", n, err)
+	}
+	visibility, err := s.GetConsumerVisibility()
+	if err != nil || visibility.Watermark != 73 {
+		t.Fatalf("consumer visibility = %+v, err=%v", visibility, err)
+	}
+	cp, err := s.GetIngestionCheckpoint(source.SourceID, source.Generation)
+	if err != nil || cp.VisibilityWatermark != visibility.Watermark || cp.CommittedOffset != 90 {
+		t.Fatalf("checkpoint/visibility mismatch: cp=%+v visibility=%+v err=%v", cp, visibility, err)
+	}
+}
+
+func TestParsedSliceCommitRejectsReplacementGeneration(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().UTC()
+	for _, generation := range []int64{1, 2} {
+		if err := s.UpsertSourceGeneration(store.SourceGeneration{SourceID: "src_rotated", Generation: generation, Agent: "codex", SourceRef: "opaque", State: store.SourceActive, CreatedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.EnqueueIngestionWork(store.EnqueueWork{SourceID: "src_rotated", Generation: 1, Class: store.WorkLive, TargetOffset: 10, Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := s.AcquireSchedulerLease("rotation-owner", now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimNextIngestionWork(lease.OwnerID, lease.FencingToken, now); err != nil {
+		t.Fatal(err)
+	}
+	err = s.CommitIngestionSlice(store.SliceCommit{SourceID: "src_rotated", Generation: 1, ExpectedOffset: 0, NextOffset: 10,
+		ParserStateVersion: 1, ParserState: []byte(`{"t":0}`), VisibilityWatermark: 1,
+		LeaseOwner: lease.OwnerID, FencingToken: lease.FencingToken, Now: now, Complete: true}, nil)
+	if !errors.Is(err, store.ErrGenerationMismatch) {
+		t.Fatalf("commit after replacement = %v, want ErrGenerationMismatch", err)
+	}
+	cp, getErr := s.GetIngestionCheckpoint("src_rotated", 1)
+	if getErr != nil || cp.CommittedOffset != 0 {
+		t.Fatalf("replaced checkpoint advanced: %+v, err=%v", cp, getErr)
 	}
 }
 

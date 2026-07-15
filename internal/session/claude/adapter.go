@@ -53,10 +53,7 @@ func (a *Adapter) ParseDelta(src session.Source, cur session.Cursor) (session.Pa
 	if cur.ParserStateVersion != 0 && cur.ParserStateVersion != jsonl.ContextStateVersion {
 		return session.ParseResult{}, fmt.Errorf("%w: version %d", jsonl.ErrParserState, cur.ParserStateVersion)
 	}
-	identity := src.SourceID
-	if identity == "" {
-		identity = src.Path
-	}
+	identity := src.DurableIdentity()
 	sessionID := jsonl.StableID("ses_", src.Agent, identity)
 	now := time.Now()
 	state := cur.ParserState

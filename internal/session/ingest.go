@@ -87,21 +87,10 @@ func ingestSource(s *store.Store, adapter Adapter, src Source) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := s.UpsertSession(result.Session); err != nil {
-		return 0, err
-	}
-	if err := s.InsertTurns(result.Turns); err != nil {
-		return 0, err
-	}
-	if err := s.InsertActions(result.Actions); err != nil {
-		return 0, err
-	}
-	for _, c := range result.Corrections {
-		if err := s.InsertCorrection(c); err != nil {
-			return 0, err
-		}
-	}
-	if err := s.UpsertCursor(store.CursorRow{
+	if err := s.CommitSessionDelta(store.ParsedSlice{
+		Session: result.Session, Turns: result.Turns, Actions: result.Actions,
+		Corrections: result.Corrections, CursorHash: result.NewHash,
+	}, store.CursorRow{
 		SourcePath:   src.Path,
 		Agent:        src.Agent,
 		LastOffset:   result.NewOffset,

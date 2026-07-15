@@ -131,13 +131,23 @@ func appendCodexMessage(record Record, ctx *Context, acc *Accum, meta Meta, role
 	if role == "user" && ctx.LastAction == nil && ctx.RequireLastAction {
 		return ErrMissingContext
 	}
+	if role == "user" {
+		// Codex emits the same user message as both response_item and event_msg.
+		// Suppress that schema-level duplicate using a continuation-safe key,
+		// while preserving repeated text at a later source timestamp.
+		signature := stableID("usr_", createdAt.UTC().Format(time.RFC3339Nano), normalize(text))
+		if ctx.LastUserSignature == signature {
+			return nil
+		}
+		ctx.LastUserSignature = signature
+	}
 	ctx.TurnIndex++
 	turn := model.Turn{ID: stableID("turn_", meta.SessionID, fmt.Sprint(record.Offset), role), SessionID: meta.SessionID,
 		TurnIndex: ctx.TurnIndex, Role: mapCodexRole(role), EventType: "message", CreatedAt: createdAt}
 	if acc != nil {
 		acc.Turns = append(acc.Turns, turn)
 		if role == "user" {
-			PairCorrection(acc, meta, turn.ID, text, ctx.LastAction)
+			PairCorrection(acc, meta, turn.ID, text, ctx.LastAction, createdAt)
 		}
 	}
 	return nil
