@@ -31,10 +31,14 @@ func correctionForTest(text string) (out model.Correction) {
 
 type countedReadSeeker struct {
 	*bytes.Reader
-	read int64
+	read       int64
+	maxRequest int
 }
 
 func (r *countedReadSeeker) Read(p []byte) (int, error) {
+	if len(p) > r.maxRequest {
+		r.maxRequest = len(p)
+	}
 	n, err := r.Reader.Read(p)
 	r.read += int64(n)
 	return n, err
@@ -66,12 +70,16 @@ func TestProcessStreamIncompleteTrailingRecordDoesNotAdvance(t *testing.T) {
 
 func TestProcessStreamSkipsLargeIrrelevantStringWithoutLargeAllocation(t *testing.T) {
 	data := []byte(`{"type":"ignore","blob":"` + strings.Repeat("x", 32<<20) + `"}` + "\n")
-	result, err := ProcessStream(bytes.NewReader(data), 0, nil, testNativeHandler{}, Meta{})
+	r := &countedReadSeeker{Reader: bytes.NewReader(data)}
+	result, err := ProcessStream(r, 0, nil, testNativeHandler{}, Meta{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.NewOffset != int64(len(data)) {
 		t.Fatalf("offset = %d, want %d", result.NewOffset, len(data))
+	}
+	if r.maxRequest > 32<<10 {
+		t.Fatalf("largest read buffer = %d, want <= %d", r.maxRequest, 32<<10)
 	}
 }
 

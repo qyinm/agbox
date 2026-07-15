@@ -2,6 +2,12 @@ name: Publish npm package
 
 on:
   workflow_dispatch:
+    inputs:
+      run_release_ingestion_gate:
+        description: Run the 2,500-source, 5 GiB logical, 60-second ingestion gate
+        required: false
+        default: false
+        type: boolean
   push:
     tags:
       - "v*"
@@ -32,6 +38,17 @@ jobs:
 
       - name: Test
         run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Ingestion resource gate (smoke)
+        run: go run ./cmd/agbox-release-gate --profile smoke
+
+      - name: Ingestion resource gate (production scale)
+        if: github.event_name == 'workflow_dispatch' && inputs.run_release_ingestion_gate
+        timeout-minutes: 3
+        run: go run ./cmd/agbox-release-gate --profile release
 
       - name: Build macOS arm64 binary
         run: |

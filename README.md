@@ -26,7 +26,7 @@
   <p>
     <img src="https://img.shields.io/badge/Claude%20Code-ingest-6366F1?style=for-the-badge&logo=anthropic&logoColor=white" alt="Claude Code ingest" />
     <img src="https://img.shields.io/badge/Codex-ingest-10B981?style=for-the-badge&logo=openai&logoColor=white" alt="Codex ingest" />
-    <img src="https://img.shields.io/badge/Cursor-ingest-111111?style=for-the-badge" alt="Cursor ingest" />
+    <img src="https://img.shields.io/badge/Cursor-discovery%20only-6B7280?style=for-the-badge" alt="Cursor discovery only" />
     <img src="https://img.shields.io/badge/Grok-ingest-000000?style=for-the-badge" alt="Grok ingest" />
     <img src="https://img.shields.io/badge/Cline-export-2563EB?style=for-the-badge" alt="Cline export" />
   </p>
@@ -91,7 +91,10 @@ agbox beta
 ```
 
 `npm install` runs `agbox init --quiet` automatically. It creates `~/.agbox/`, installs the
-session watcher, installs managed workflow hooks, and ingests existing agent sessions.
+session watcher, installs managed workflow hooks, and queues eligible recent agent sessions.
+Automatic history is limited to the most recent 90 days; a later append to an older active
+session is still treated as live work. Cursor locations can be discovered and reported, but
+Cursor transcript parsing is intentionally disabled until a stable native format is supported.
 Set `AGBOX_SKIP_WATCHER=1` to skip all setup, or `AGBOX_SKIP_CONNECT=1` to keep the
 watcher but skip managed workflow hooks.
 
@@ -208,6 +211,41 @@ Ingest is automatic and quiet. Replay is instruction-only and scoped to the curr
 request. Saving a workflow for future use is **always** a separate human decision.
 Export remains reversible.
 
+### Ingestion safety and recovery
+
+The watcher registers live roots before it starts bounded catch-up. One durable scheduler
+owner parses at a time; live appends preempt active-history and archive work. `status` and
+`doctor` report a shared ingestion state:
+
+- `healthy` — no pending history and no known source fault
+- `catching_up` — bounded recent-history work remains
+- `degraded` — a source is quarantined or a service-level contract is violated
+- `stalled` — live work has made no progress and no scheduler owner is active
+
+A malformed or oversized relevant record quarantines only that source. Copy the opaque
+source ID and generation from `agbox doctor`, correct the local source if appropriate, then
+retry from the last committed checkpoint:
+
+```bash
+agbox sources resume <opaque-source-id> --generation <N>
+```
+
+The storage redesign uses a one-time schema-generation reset. When upgrading from the
+legacy schema, agbox deletes the old local database together with its WAL/SHM files and
+starts clean. **There is no migration backup, rollback, or recovery path for that prior
+agbox history.** Agent session files remain the local source of truth and are not deleted.
+
+Supported macOS arm64 resource contracts are: idle watcher RSS at most 50 MiB, processing
+RSS at most 200 MiB, and live visibility at p95 2 seconds / p99 5 seconds under the reference
+load. Maintainers can run the generated-fixture gates without checking large transcripts in:
+
+```bash
+go run ./cmd/agbox-release-gate --profile smoke
+go run ./cmd/agbox-release-gate --profile release  # 2,500 sources, 5 GiB logical, 50 records/s for 60s
+```
+
+Both commands emit JSON and exit non-zero when a contract fails.
+
 Clustering is deterministic and review-first: exact normalized hashes plus a small
 workflow taxonomy (package-manager preferences, PR-format rules, API/OpenAPI-sync
 rules). agbox never silently installs a detected workflow.
@@ -218,7 +256,7 @@ rules). agbox never silently installs a detected workflow.
 
 | | |
 |---|---|
-| **Automatic ingest** | A background watcher reads Claude Code, Codex, Cursor, and Grok session files. No manual commits, no copy-paste-into-a-fresh-chat. |
+| **Automatic ingest** | A background watcher reads bounded slices from Claude Code, Codex, and Grok session files. Cursor is discovery-only until its native parser contract is stable. |
 | **In-context replay** | Managed hooks can suggest an apply-once replay plan when the current prompt matches a Recorded Workflow. At session stop, agbox can separately ask whether to save that workflow for future use. |
 | **Smart clustering** | Repeated instructions get normalized, grouped, and confidence-scored — directional prefs like `bun-over-npm` included. |
 | **Workspace + Review TUI** | Bare `agbox` opens a workspace with status, sources, workflows, repair, and help. `agbox inbox` opens Recorded Workflow cards with replay plans; `agbox review` drills into evidence, approval, and export. |
@@ -237,7 +275,7 @@ exports to the formats they already read.
 
 | Ingest from | Export to |
 |---|---|
-| Claude Code · Codex · Cursor · Grok | `CLAUDE.md` |
+| Claude Code · Codex · Grok *(Cursor discovery only)* | `CLAUDE.md` |
 | Managed workflow hooks: Claude · Codex · Grok | `AGENTS.md` *(read by most modern agents, including OpenClaw)* |
 | | `.cursor/rules/*.mdc` *(Cursor)* |
 | | `.clinerules/*.md` *(Cline — export only)* |
