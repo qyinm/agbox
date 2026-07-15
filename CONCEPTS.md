@@ -50,3 +50,30 @@ Apply Once creates a Replay Application and may move the workflow into an interm
 The explicit user choice to promote a tried Recorded Workflow into future reusable agent behavior.
 
 Save For Future is separate from Apply Once. It should only be prompted after a matching Replay Application exists for the current project context, and durable persistence still requires explicit user approval.
+
+## Session Ingestion
+
+### Ingestion Source Generation
+A versioned identity for one physical incarnation of a discovered agent-session source, allowing agbox to distinguish continued appends and renames from truncation or path replacement.
+
+Checkpoints, work, receipts, and quarantine state belong to an exact generation so stale work for an earlier incarnation cannot publish into its replacement.
+
+### Ingestion Checkpoint
+The durable publication boundary for a Source Generation: bytes before it have had their normalized results and parser continuation committed, while bytes at or after it remain safe to process or retry.
+
+A checkpoint advances atomically with normalized records, visibility, receipt completion, and queue state; it is not merely the furthest byte a parser happened to read.
+
+### Ingestion Receipt
+A durable promise that a particular Source Generation will publish results through a requested target boundary or report that the generation was quarantined.
+
+Receipts let explicit sync callers cooperate with the shared ingestion scheduler instead of opening a second parser path.
+
+### Scheduler Fence
+The ownership generation attached to the current ingestion scheduler lease, used to reject claims and commits from an owner whose lease expired and was replaced.
+
+Lease expiry permits a new owner to take over; the fence prevents a delayed former owner from publishing after that takeover.
+
+### Active History Window
+The bounded interval of trustworthy prior session evidence that automatic catch-up may ingest and downstream evidence selection may continue to use.
+
+Sources outside the window are not automatically replayed from the beginning, while later appends to an old active source can still become live work.
