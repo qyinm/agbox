@@ -38,18 +38,37 @@ func RunWithReady(ctx context.Context, s *store.Store, pollInterval time.Duratio
 
 	adapters := allAdapters()
 	state := &watchState{}
-	// Watches precede baseline reconciliation, closing the startup append gap.
-	if err := state.watchRoots(fw, adapters); err != nil {
-		logError("register roots", err)
-	}
 	controller := scheduler.New(s)
 	controller.Adapters = adapters
-	if result, err := controller.Reconcile(scheduler.ReconcileOptions{}); err != nil {
-		logError("initial reconcile", err)
-	} else if result.Warning != nil {
-		logError("initial reconcile", result.Warning)
+	preWatch, preWatchErr := controller.Snapshot(time.Now())
+	if preWatchErr != nil {
+		logError("pre-watch snapshot", preWatchErr)
 	}
-	if err := state.refresh(fw, adapters); err != nil {
+	baselineByPath := make(map[string]int64, len(preWatch))
+	for _, src := range preWatch {
+		baselineByPath[src.Path] = src.Size
+	}
+	// Watches precede baseline reconciliation, closing the startup append gap.
+	if err := state.watchRoots(fw, adapters); err != nil {
+		if ready != nil {
+			return fmt.Errorf("register roots: %w", err)
+		}
+		logError("register roots", err)
+	}
+	initial, initialErr := controller.Reconcile(scheduler.ReconcileOptions{BaselineByPath: baselineByPath})
+	if initialErr != nil {
+		return fmt.Errorf("initial reconcile: %w", initialErr)
+	} else if initial.Warning != nil {
+		if ready != nil {
+			return fmt.Errorf("initial reconcile: %w", initial.Warning)
+		}
+		logError("initial reconcile", initial.Warning)
+	}
+	state.setSources(initial.Sources)
+	if err := state.refresh(fw, adapters, initial.Sources); err != nil {
+		if ready != nil {
+			return fmt.Errorf("refresh sources: %w", err)
+		}
 		logError("refresh sources", err)
 	}
 	if ready != nil {
@@ -72,11 +91,14 @@ func RunWithReady(ctx context.Context, s *store.Store, pollInterval time.Duratio
 		case <-pollTicker.C:
 			if result, err := controller.Reconcile(scheduler.ReconcileOptions{}); err != nil {
 				logError("poll reconcile", err)
-			} else if result.Warning != nil {
-				logError("poll reconcile", result.Warning)
-			}
-			if err := state.refresh(fw, adapters); err != nil {
-				logError("refresh sources", err)
+			} else {
+				if result.Warning != nil {
+					logError("poll reconcile", result.Warning)
+				}
+				state.setSources(result.Sources)
+				if err := state.refresh(fw, adapters, result.Sources); err != nil {
+					logError("refresh sources", err)
+				}
 			}
 		case event, ok := <-fw.Events:
 			if !ok {
@@ -87,14 +109,27 @@ func RunWithReady(ctx context.Context, s *store.Store, pollInterval time.Duratio
 			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) == 0 {
 				continue
 			}
+			if event.Op&fsnotify.Write != 0 && event.Op&(fsnotify.Create|fsnotify.Rename|fsnotify.Remove) == 0 {
+				if cached, ok := state.sources[filepath.Clean(event.Name)]; ok {
+					if refreshed, refreshErr := session.RefreshSource(cached); refreshErr == nil {
+						if err := controller.ReconcileLiveSource(refreshed, time.Now()); err == nil {
+							state.sources[filepath.Clean(event.Name)] = refreshed
+							continue
+						}
+					}
+				}
+			}
 			if result, err := controller.Reconcile(scheduler.ReconcileOptions{LivePath: event.Name}); err != nil {
 				logError("event reconcile", err)
-			} else if result.Warning != nil {
-				logError("event reconcile", result.Warning)
-			}
-			if event.Op&(fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0 {
-				if err := state.refresh(fw, adapters); err != nil {
-					logError("event refresh", err)
+			} else {
+				if result.Warning != nil {
+					logError("event reconcile", result.Warning)
+				}
+				state.setSources(result.Sources)
+				if event.Op&(fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0 {
+					if err := state.refresh(fw, adapters, result.Sources); err != nil {
+						logError("event refresh", err)
+					}
 				}
 			}
 		case err, ok := <-fw.Errors:
@@ -121,7 +156,17 @@ func logError(context string, err error) {
 	}
 }
 
-type watchState struct{ dirs map[string]struct{} }
+type watchState struct {
+	dirs    map[string]struct{}
+	sources map[string]session.Source
+}
+
+func (st *watchState) setSources(sources []session.Source) {
+	st.sources = make(map[string]session.Source, len(sources))
+	for _, src := range sources {
+		st.sources[filepath.Clean(src.Path)] = src
+	}
+}
 
 func (st *watchState) watchRoots(fw *fsnotify.Watcher, adapters []session.Adapter) error {
 	next := make(map[string]struct{})
@@ -176,24 +221,19 @@ func addExistingDirs(fw *fsnotify.Watcher, root string, recursive bool, out map[
 	})
 }
 
-func (st *watchState) refresh(fw *fsnotify.Watcher, adapters []session.Adapter) error {
+func (st *watchState) refresh(fw *fsnotify.Watcher, adapters []session.Adapter, sources []session.Source) error {
 	next := make(map[string]struct{})
 	var errs []error
+	for _, src := range sources {
+		dir := filepath.Dir(src.Path)
+		next[dir] = struct{}{}
+		if _, ok := st.dirs[dir]; !ok {
+			_ = fw.Add(dir)
+		}
+	}
 	for _, adapter := range adapters {
 		if rooted, ok := adapter.(session.RootedAdapter); ok && !rooted.Runnable() {
 			continue
-		}
-		sources, err := adapter.DiscoverSources()
-		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", adapter.Agent(), err))
-			continue
-		}
-		for _, src := range sources {
-			dir := filepath.Dir(src.Path)
-			next[dir] = struct{}{}
-			if _, ok := st.dirs[dir]; !ok {
-				_ = fw.Add(dir)
-			}
 		}
 		if rooted, ok := adapter.(session.RootedAdapter); ok {
 			for _, spec := range rooted.RootSpecs() {

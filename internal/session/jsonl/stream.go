@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ const (
 	MaxMetadataBytes    = 4 << 10
 	MaxRecordBytes      = 64 << 20
 	MaxSliceBytes       = 64 << 20
+	MaxSliceRecords     = 1024
 	MaxJSONDepth        = 64
 	MaxJSONTokens       = 200_000
 	MaxSliceDuration    = 5 * time.Second
@@ -37,8 +39,9 @@ var (
 type CapturePaths map[string]int
 
 type CapturedValue struct {
-	Value   string
-	Indexes []int
+	Value     string
+	Indexes   []int
+	Oversized bool
 }
 
 // Record contains only explicitly requested, bounded scalar values. It never
@@ -61,12 +64,17 @@ func (r Record) All(path string) []CapturedValue {
 }
 
 func (r Record) At(path string, indexes ...int) string {
+	value, _ := r.Captured(path, indexes...)
+	return value.Value
+}
+
+func (r Record) Captured(path string, indexes ...int) (CapturedValue, bool) {
 	for _, value := range r.Values[path] {
-		if equalIndexes(value.Indexes, indexes) {
-			return value.Value
+		if slices.Equal(value.Indexes, indexes) {
+			return value, true
 		}
 	}
-	return ""
+	return CapturedValue{}, false
 }
 
 // NativeHandler declares the exact bounded fields needed from its agent's
@@ -74,10 +82,6 @@ func (r Record) At(path string, indexes ...int) string {
 type NativeHandler interface {
 	CapturePaths() CapturePaths
 	ProcessRecord(record Record, ctx *Context, acc *Accum, meta Meta) error
-}
-
-type CaptureDecider interface {
-	ShouldCapture(path string, partial Record) bool
 }
 
 type StreamResult struct {
@@ -161,16 +165,21 @@ func ProcessStream(source io.ReadSeeker, startOffset int64, state []byte, handle
 	p := &streamParser{
 		r:        bufio.NewReaderSize(source, 32<<10),
 		captures: handler.CapturePaths(),
-		deadline: time.Now().Add(MaxSliceDuration),
-	}
-	if decider, ok := handler.(CaptureDecider); ok {
-		p.decider = decider
 	}
 	safeOffset := startOffset
-	for p.total < MaxSliceBytes {
+	records := 0
+	sliceDeadline := time.Now().Add(MaxSliceDuration)
+	for p.total < MaxSliceBytes && records < MaxSliceRecords {
+		if records > 0 && time.Now().After(sliceDeadline) {
+			break
+		}
 		recordStart := startOffset + p.total
 		p.recordStart = p.total
 		p.tokens = 0
+		// The slice budget controls yielding between records. Once a record is
+		// started it receives its own bounded parse budget so a healthy record is
+		// never quarantined merely because earlier records consumed the slice.
+		p.deadline = time.Now().Add(MaxSliceDuration)
 		record := Record{Offset: recordStart, Values: make(map[string][]CapturedValue)}
 		p.record = &record
 		err := p.parseValue(nil, nil, 0)
@@ -201,6 +210,7 @@ func ProcessStream(source io.ReadSeeker, startOffset int64, state []byte, handle
 			result.NewOffset = startOffset
 			return result, err
 		}
+		records++
 		safeOffset = startOffset + p.total
 		result.NewOffset = safeOffset
 		if safeOffset >= end {
@@ -215,7 +225,6 @@ func ProcessStream(source io.ReadSeeker, startOffset int64, state []byte, handle
 type streamParser struct {
 	r           *bufio.Reader
 	captures    CapturePaths
-	decider     CaptureDecider
 	record      *Record
 	total       int64
 	recordStart int64
@@ -305,9 +314,12 @@ func (p *streamParser) parseObject(path, indexes []string, depth int) error {
 		return ErrMalformedRecord
 	}
 	for {
-		key, err := p.readString(MaxMetadataBytes, true)
+		key, oversized, err := p.readString(MaxMetadataBytes, true)
 		if err != nil {
 			return err
+		}
+		if oversized {
+			return ErrRecordBudget
 		}
 		b, err = p.nextNonSpace()
 		if err != nil || b != ':' {
@@ -367,10 +379,7 @@ func (p *streamParser) parseArray(path, indexes []string, depth int) error {
 func (p *streamParser) parseCapturedString(path, indexes []string) error {
 	key := strings.Join(path, ".")
 	limit, capture := p.captures[key]
-	if capture && p.decider != nil && !p.decider.ShouldCapture(key, *p.record) {
-		capture = false
-	}
-	value, err := p.readString(limit, capture)
+	value, oversized, err := p.readString(limit, capture)
 	if err != nil {
 		return err
 	}
@@ -379,72 +388,81 @@ func (p *streamParser) parseCapturedString(path, indexes []string) error {
 		for i, raw := range indexes {
 			idx[i], _ = strconv.Atoi(raw)
 		}
-		p.record.Values[key] = append(p.record.Values[key], CapturedValue{Value: value, Indexes: idx})
+		p.record.Values[key] = append(p.record.Values[key], CapturedValue{Value: value, Indexes: idx, Oversized: oversized})
 	}
 	return nil
 }
 
 // readString is called after the opening quote has already been consumed.
-func (p *streamParser) readString(limit int, capture bool) (string, error) {
+func (p *streamParser) readString(limit int, capture bool) (string, bool, error) {
 	var raw strings.Builder
+	oversized := false
 	if capture {
 		raw.WriteByte('"')
 	}
 	for {
 		b, err := p.readByte()
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 		if b < 0x20 {
-			return "", ErrMalformedRecord
+			return "", false, ErrMalformedRecord
 		}
 		if b == '"' {
 			if !capture {
-				return "", nil
+				return "", false, nil
+			}
+			if oversized {
+				return "", true, nil
 			}
 			raw.WriteByte('"')
 			decoded, err := strconv.Unquote(raw.String())
 			if err != nil {
-				return "", ErrMalformedRecord
+				return "", false, ErrMalformedRecord
 			}
 			if len(decoded) > limit {
-				return "", ErrSignalTooLarge
+				return "", true, nil
 			}
-			return decoded, nil
+			return decoded, false, nil
 		}
 		if b == '\\' {
-			if capture {
+			if capture && !oversized {
 				raw.WriteByte(b)
 			}
 			escaped, err := p.readByte()
 			if err != nil {
-				return "", err
+				return "", false, err
 			}
 			if !strings.ContainsRune(`"\\/bfnrtu`, rune(escaped)) {
-				return "", ErrMalformedRecord
+				return "", false, ErrMalformedRecord
 			}
-			if capture {
+			if capture && !oversized {
 				raw.WriteByte(escaped)
 			}
 			if escaped == 'u' {
 				for i := 0; i < 4; i++ {
 					h, err := p.readByte()
 					if err != nil || !isHex(h) {
-						return "", ErrMalformedRecord
+						return "", false, ErrMalformedRecord
 					}
-					if capture {
+					if capture && !oversized {
 						raw.WriteByte(h)
 					}
 				}
 			}
+			if capture && !oversized && raw.Len() > limit*6+2 {
+				oversized = true
+				raw.Reset()
+			}
 			continue
 		}
-		if capture {
+		if capture && !oversized {
 			raw.WriteByte(b)
 			// JSON escaping can expand the raw form, so allow bounded slack but
-			// stop hostile relevant values before they can grow memory.
+			// stop retaining hostile values while still validating the record.
 			if raw.Len() > limit*6+2 {
-				return "", ErrSignalTooLarge
+				oversized = true
+				raw.Reset()
 			}
 		}
 	}
@@ -505,16 +523,4 @@ func appendPath(path []string, part string) []string {
 
 func isHex(b byte) bool {
 	return b >= '0' && b <= '9' || b >= 'a' && b <= 'f' || b >= 'A' && b <= 'F'
-}
-
-func equalIndexes(a, b []int) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

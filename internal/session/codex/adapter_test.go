@@ -5,8 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
+	"github.com/hippoom/agbox/internal/privacy"
 	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/session/codex"
 	"github.com/hippoom/agbox/internal/session/jsonl"
@@ -188,5 +190,38 @@ func TestOldEOFBaselineSignalsMissingCorrectionContext(t *testing.T) {
 	_, err := codex.New().ParseDelta(session.Source{Agent: "codex", Path: path, SourceID: "baseline"}, session.Cursor{LastOffset: int64(len(oldAction))})
 	if !errors.Is(err, jsonl.ErrMissingContext) {
 		t.Fatalf("error = %v, want diagnosable missing-context quarantine signal", err)
+	}
+}
+
+func TestCaptureIsIndependentOfJSONKeyOrder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	data := "{\"type\":\"response_item\",\"payload\":{\"input\":\"npm install\",\"name\":\"exec\",\"type\":\"custom_tool_call\"}}\n" +
+		"{\"type\":\"event_msg\",\"payload\":{\"message\":\"use bun\",\"type\":\"user_message\"}}\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := codex.New().ParseDelta(session.Source{Agent: "codex", Path: path, SourceID: "ordered"}, session.Cursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Actions) != 1 || len(result.Corrections) != 1 {
+		t.Fatalf("key-order parse actions/corrections = %d/%d, want 1/1", len(result.Actions), len(result.Corrections))
+	}
+}
+
+func TestOversizedIrrelevantAssistantMessageDoesNotQuarantineSource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	data := "{\"type\":\"event_msg\",\"payload\":{\"message\":\"" + strings.Repeat("x", privacy.MaxSignalBytes+1) + "\",\"type\":\"agent_message\"}}\n" +
+		"{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"exec\",\"input\":\"npm install\"}}\n" +
+		"{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"use bun\"}}\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := codex.New().ParseDelta(session.Source{Agent: "codex", Path: path, SourceID: "irrelevant"}, session.Cursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Corrections) != 1 {
+		t.Fatalf("corrections = %d, want 1 after irrelevant oversized record", len(result.Corrections))
 	}
 }

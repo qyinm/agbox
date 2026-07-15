@@ -46,6 +46,17 @@ const (
 	WorkQuarantined   WorkState = "quarantined"
 )
 
+const (
+	FailureSignalTooLarge     = "signal_too_large"
+	FailureRecordBudget       = "record_budget"
+	FailureMalformedRecord    = "malformed_record"
+	FailureMissingContext     = "missing_context"
+	FailureParse              = "parse_error"
+	FailureSourceUnavailable  = "source_unavailable"
+	FailureUnsupportedAdapter = "unsupported_adapter"
+	FailureNoProgress         = "no_progress"
+)
+
 type ReceiptStatus string
 
 const (
@@ -55,13 +66,18 @@ const (
 )
 
 type SourceGeneration struct {
-	SourceID   string
-	Generation int64
-	Agent      string
-	SourceRef  string
-	State      SourceState
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	SourceID     string
+	Generation   int64
+	Agent        string
+	SourceRef    string
+	Project      string
+	RootPath     string
+	RootClass    string
+	FileIdentity string
+	ObservedSize int64
+	State        SourceState
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 type IngestionCheckpoint struct {
@@ -181,24 +197,70 @@ func (s *Store) UpsertSourceGeneration(source SourceGeneration) error {
 		return err
 	}
 	defer tx.Rollback()
-	var agent, sourceRef string
-	err = tx.QueryRow(`SELECT agent, source_ref FROM ingestion_sources WHERE source_id = ? AND generation = ?`, source.SourceID, source.Generation).Scan(&agent, &sourceRef)
-	if err == nil && (agent != source.Agent || sourceRef != source.SourceRef) {
+	var agent, fileIdentity string
+	err = tx.QueryRow(`SELECT agent, file_identity FROM ingestion_sources WHERE source_id = ? AND generation = ?`, source.SourceID, source.Generation).Scan(&agent, &fileIdentity)
+	if err == nil && (agent != source.Agent || fileIdentity != source.FileIdentity) {
 		return fmt.Errorf("%w: immutable source identity changed", ErrGenerationMismatch)
 	}
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	_, err = tx.Exec(`INSERT INTO ingestion_sources(source_id, generation, agent, source_ref, state, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(source_id, generation) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at`,
-		source.SourceID, source.Generation, source.Agent, source.SourceRef, source.State, formatTime(source.CreatedAt), formatTime(source.UpdatedAt))
+	_, err = tx.Exec(`INSERT INTO ingestion_sources(source_id, generation, agent, source_ref, project, root_path, root_class, file_identity, observed_size, state, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(source_id, generation) DO UPDATE SET source_ref=excluded.source_ref, project=excluded.project,
+			root_path=excluded.root_path, root_class=excluded.root_class, observed_size=excluded.observed_size,
+			state=excluded.state, updated_at=excluded.updated_at`,
+		source.SourceID, source.Generation, source.Agent, source.SourceRef, source.Project, source.RootPath,
+		source.RootClass, source.FileIdentity, source.ObservedSize, source.State, formatTime(source.CreatedAt), formatTime(source.UpdatedAt))
 	if err != nil {
 		return err
 	}
 	_, err = tx.Exec(`INSERT INTO ingestion_checkpoints(source_id, generation, committed_offset, parser_state_version, parser_state, visibility_watermark, updated_at)
 		VALUES (?, ?, 0, 0, X'', 0, ?) ON CONFLICT(source_id, generation) DO NOTHING`, source.SourceID, source.Generation, formatTime(source.UpdatedAt))
 	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) ActiveSourceGenerations(agent string) ([]SourceGeneration, error) {
+	rows, err := s.db.Query(`SELECT source_id, generation, agent, source_ref, project, root_path, root_class,
+		file_identity, observed_size, state, created_at, updated_at FROM ingestion_sources
+		WHERE agent=? AND state='active' ORDER BY source_id,generation`, agent)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SourceGeneration
+	for rows.Next() {
+		var source SourceGeneration
+		var state, created, updated string
+		if err := rows.Scan(&source.SourceID, &source.Generation, &source.Agent, &source.SourceRef, &source.Project,
+			&source.RootPath, &source.RootClass, &source.FileIdentity, &source.ObservedSize, &state, &created, &updated); err != nil {
+			return nil, err
+		}
+		source.State = SourceState(state)
+		source.CreatedAt, source.UpdatedAt = parseTime(created), parseTime(updated)
+		out = append(out, source)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) TombstoneSourceGeneration(sourceID string, generation int64, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE ingestion_sources SET state='tombstoned', updated_at=?
+		WHERE source_id=? AND generation=? AND state='active'`, formatTime(now), sourceID, generation); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE ingestion_work SET state='complete', updated_at=?
+		WHERE source_id=? AND generation=? AND state IN ('pending','running','waiting_append')`, formatTime(now), sourceID, generation); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -230,6 +292,7 @@ func (s *Store) EnqueueIngestionWork(input EnqueueWork) (IngestionWork, error) {
 			target_offset=MAX(ingestion_work.target_offset, excluded.target_offset),
 			state=CASE
 				WHEN ingestion_work.state = 'quarantined' THEN 'quarantined'
+				WHEN ingestion_work.state = 'running' THEN 'running'
 				WHEN ingestion_work.state = 'waiting_append' AND excluded.target_offset <= ingestion_work.target_offset THEN 'waiting_append'
 				WHEN excluded.target_offset > COALESCE((SELECT committed_offset FROM ingestion_checkpoints WHERE source_id=excluded.source_id AND generation=excluded.generation), 0) THEN 'pending'
 				ELSE ingestion_work.state END,
@@ -313,13 +376,16 @@ func (s *Store) ClaimNextIngestionWork(owner string, fence int64, now time.Time)
 	var workState, sourceState, workCreated, workUpdated, sourceCreated, sourceUpdated string
 	err = tx.QueryRow(`SELECT w.source_id, w.generation, w.work_class, w.target_offset, w.state,
 		w.retry_count, w.failure_class, w.active_fence, w.created_at, w.updated_at,
-		s.agent, s.source_ref, s.state, s.created_at, s.updated_at
+		s.agent, s.source_ref, s.project, s.root_path, s.root_class, s.file_identity, s.observed_size,
+		s.state, s.created_at, s.updated_at
 		FROM ingestion_work w JOIN ingestion_sources s USING(source_id, generation)
 		WHERE w.state='pending' AND s.state='active'
 		ORDER BY w.work_class ASC, w.updated_at ASC, w.source_id ASC LIMIT 1`).Scan(
 		&item.Work.SourceID, &item.Work.Generation, &item.Work.Class, &item.Work.TargetOffset, &workState,
 		&item.Work.RetryCount, &item.Work.FailureClass, &item.Work.ActiveFence, &workCreated, &workUpdated,
-		&item.Source.Agent, &item.Source.SourceRef, &sourceState, &sourceCreated, &sourceUpdated)
+		&item.Source.Agent, &item.Source.SourceRef, &item.Source.Project, &item.Source.RootPath,
+		&item.Source.RootClass, &item.Source.FileIdentity, &item.Source.ObservedSize,
+		&sourceState, &sourceCreated, &sourceUpdated)
 	if err != nil {
 		return RunnableIngestion{}, err
 	}
@@ -520,7 +586,7 @@ func (s *Store) CommitIngestionSlice(input SliceCommit, write func(*sql.Tx) erro
 	if work.State != WorkRunning || work.ActiveFence != input.FencingToken {
 		return fmt.Errorf("%w: work is not claimed by fence", ErrStateConflict)
 	}
-	if work.State == WorkQuarantined || input.NextOffset > work.TargetOffset || input.VisibilityWatermark < cp.VisibilityWatermark {
+	if input.NextOffset > work.TargetOffset || input.VisibilityWatermark < cp.VisibilityWatermark {
 		return ErrStateConflict
 	}
 	if write != nil {
@@ -551,15 +617,34 @@ func (s *Store) CommitIngestionSlice(input SliceCommit, write func(*sql.Tx) erro
 	if err != nil {
 		return err
 	}
-	if state == WorkComplete {
-		result, err := tx.Exec(`UPDATE ingestion_receipts SET status='completed', completed_at=?
-			WHERE source_id=? AND generation=? AND status='accepted' AND target_offset <= ?`, formatTime(input.Now), input.SourceID, input.Generation, input.NextOffset)
-		if err != nil {
-			return err
-		}
-		if n, _ := result.RowsAffected(); input.ReceiptID != "" && n == 0 {
-			return fmt.Errorf("%w: receipt not found or target not reached", ErrStateConflict)
-		}
+	result, err := tx.Exec(`UPDATE ingestion_receipts SET status='completed', completed_at=?
+		WHERE source_id=? AND generation=? AND status='accepted' AND target_offset <= ?`, formatTime(input.Now), input.SourceID, input.Generation, input.NextOffset)
+	if err != nil {
+		return err
+	}
+	if n, _ := result.RowsAffected(); input.ReceiptID != "" && n == 0 {
+		return fmt.Errorf("%w: receipt not found or target not reached", ErrStateConflict)
+	}
+	return tx.Commit()
+}
+
+func (s *Store) RequeueClaimedWork(sourceID string, generation int64, owner string, fence int64, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := requireFence(tx, owner, fence, now); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`UPDATE ingestion_work SET state='pending', updated_at=?
+		WHERE source_id=? AND generation=? AND state='running' AND active_fence=?`,
+		formatTime(now), sourceID, generation, fence)
+	if err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -642,15 +727,18 @@ func (s *Store) ResumeSource(sourceID string, expectedGeneration int64, now time
 		return err
 	}
 	if n, _ := result.RowsAffected(); n == 0 {
-		var state string
-		if err := tx.QueryRow(`SELECT state FROM ingestion_work WHERE source_id=? AND generation=?`, sourceID, expectedGeneration).Scan(&state); err != nil {
+		var state, resumedAt string
+		if err := tx.QueryRow(`SELECT w.state, s.resumed_at FROM ingestion_work w
+			JOIN ingestion_sources s USING(source_id,generation) WHERE w.source_id=? AND w.generation=?`,
+			sourceID, expectedGeneration).Scan(&state, &resumedAt); err != nil {
 			return ErrGenerationMismatch
 		}
-		if state != string(WorkPending) {
+		if state != string(WorkPending) && resumedAt == "" {
 			return ErrStateConflict
 		}
 	}
-	_, err = tx.Exec(`UPDATE ingestion_sources SET state='active', updated_at=? WHERE source_id=? AND generation=?`, formatTime(now), sourceID, expectedGeneration)
+	_, err = tx.Exec(`UPDATE ingestion_sources SET state='active', resumed_at=?, updated_at=? WHERE source_id=? AND generation=?`,
+		formatTime(now), formatTime(now), sourceID, expectedGeneration)
 	if err != nil {
 		return err
 	}
@@ -667,6 +755,38 @@ func (s *Store) GetIngestionReceipt(receiptID string) (IngestionReceipt, error) 
 	receipt.CreatedAt = parseTime(created)
 	receipt.CompletedAt = parseTime(completed)
 	return receipt, err
+}
+
+func (s *Store) GetIngestionReceipts(receiptIDs []string) ([]IngestionReceipt, error) {
+	if len(receiptIDs) == 0 {
+		return nil, nil
+	}
+	if len(receiptIDs) > 500 {
+		return nil, fmt.Errorf("receipt batch exceeds 500")
+	}
+	args := make([]any, len(receiptIDs))
+	for i, id := range receiptIDs {
+		args[i] = id
+	}
+	rows, err := s.db.Query(`SELECT receipt_id, source_id, generation, target_offset, status, failure_class, created_at, completed_at
+		FROM ingestion_receipts WHERE receipt_id IN (`+strings.TrimSuffix(strings.Repeat("?,", len(receiptIDs)), ",")+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]IngestionReceipt, 0, len(receiptIDs))
+	for rows.Next() {
+		var receipt IngestionReceipt
+		var status, created, completed string
+		if err := rows.Scan(&receipt.ReceiptID, &receipt.SourceID, &receipt.Generation, &receipt.TargetOffset,
+			&status, &receipt.FailureClass, &created, &completed); err != nil {
+			return nil, err
+		}
+		receipt.Status = ReceiptStatus(status)
+		receipt.CreatedAt, receipt.CompletedAt = parseTime(created), parseTime(completed)
+		result = append(result, receipt)
+	}
+	return result, rows.Err()
 }
 
 type rowQuerier interface {

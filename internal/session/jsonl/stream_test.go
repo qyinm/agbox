@@ -19,7 +19,11 @@ func (testNativeHandler) CapturePaths() CapturePaths {
 
 func (testNativeHandler) ProcessRecord(record Record, _ *Context, acc *Accum, _ Meta) error {
 	if record.First("type") == "signal" {
-		acc.Corrections = append(acc.Corrections, correctionForTest(record.First("text")))
+		text, _ := record.Captured("text")
+		if text.Oversized {
+			return ErrSignalTooLarge
+		}
+		acc.Corrections = append(acc.Corrections, correctionForTest(text.Value))
 	}
 	return nil
 }

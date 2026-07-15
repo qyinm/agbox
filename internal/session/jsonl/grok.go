@@ -33,7 +33,11 @@ func (GrokHandler) ProcessRecord(record Record, ctx *Context, acc *Accum, meta M
 				continue
 			}
 			index := nameValue.Indexes[0]
-			arguments := record.At("tool_calls.*.arguments", index)
+			argumentsValue, _ := record.Captured("tool_calls.*.arguments", index)
+			if argumentsValue.Oversized {
+				return ErrSignalTooLarge
+			}
+			arguments := argumentsValue.Value
 			ctx.TurnIndex++
 			turn := model.Turn{ID: stableID("turn_", meta.SessionID, fmt.Sprint(record.Offset), fmt.Sprint(index)), SessionID: meta.SessionID,
 				TurnIndex: ctx.TurnIndex, Role: "agent", EventType: "tool", CreatedAt: createdAt}
@@ -52,12 +56,20 @@ func (GrokHandler) ProcessRecord(record Record, ctx *Context, acc *Accum, meta M
 			ctx.RequireLastAction = false
 		}
 	case "user":
-		text := record.First("content")
+		content, _ := record.Captured("content")
+		if content.Oversized {
+			return ErrSignalTooLarge
+		}
+		text := content.Value
 		if text == "" {
 			var parts []string
 			for _, blockType := range record.All("content.*.type") {
 				if blockType.Value == "text" && len(blockType.Indexes) > 0 {
-					parts = append(parts, record.At("content.*.text", blockType.Indexes[0]))
+					textValue, _ := record.Captured("content.*.text", blockType.Indexes[0])
+					if textValue.Oversized {
+						return ErrSignalTooLarge
+					}
+					parts = append(parts, textValue.Value)
 				}
 			}
 			text = strings.Join(parts, "\n")

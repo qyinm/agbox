@@ -25,10 +25,7 @@ func BuildAt(s *store.Store, candidateID string, now time.Time) (model.EvidenceC
 	if err != nil {
 		return model.EvidenceCard{}, err
 	}
-	if c.SourceKind == model.CandidateSourceCorrection && len(corrections) > 0 {
-		return buildFromCorrections(s, currentCorrectionCandidate(c, corrections), corrections)
-	}
-	if c.SourceKind == "" && len(corrections) > 0 {
+	if (c.SourceKind == model.CandidateSourceCorrection || c.SourceKind == "") && len(corrections) > 0 {
 		return buildFromCorrections(s, currentCorrectionCandidate(c, corrections), corrections)
 	}
 	return buildFromEvents(s, c, candidateID)

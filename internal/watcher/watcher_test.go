@@ -2,11 +2,14 @@ package watcher_test
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/session/claude"
@@ -180,5 +183,37 @@ func TestRunTargetedIngestUsesAdapter(t *testing.T) {
 	}
 	if count == 0 {
 		t.Fatal("expected targeted ingest to store corrections")
+	}
+}
+
+func TestReadinessRemainsClosedWhenInitialReconciliationFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dbPath := filepath.Join(home, "agbox.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	db, err := sql.Open("sqlite3", dbPath+"?_busy_timeout=5000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP TABLE ingestion_policy`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan struct{})
+	err = watcher.RunWithReady(context.Background(), s, time.Hour, ready)
+	if err == nil {
+		t.Fatal("watcher reported success after the startup barrier failed")
+	}
+	select {
+	case <-ready:
+		t.Fatal("readiness closed despite failed initial reconciliation")
+	default:
 	}
 }

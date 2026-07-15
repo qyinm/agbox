@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -23,7 +24,7 @@ func maybeRunWorkspace(args []string, stdin io.Reader, stdout io.Writer) (bool, 
 	if !interactiveTerminalHook(stdin) || !interactiveTerminalHook(stdout) {
 		return false, nil
 	}
-	if (len(args) > 0 && args[0] == "status" && containsArg(args[1:], "--json")) ||
+	if (len(args) > 0 && args[0] == "status" && slices.Contains(args[1:], "--json")) ||
 		(len(args) > 1 && args[0] == "sources" && args[1] == "resume") {
 		return false, nil
 	}
@@ -53,15 +54,6 @@ func maybeRunWorkspace(args []string, stdin io.Reader, stdout io.Writer) (bool, 
 		}
 		return launchWorkspaceProgram(opts, stdin, stdout)
 	})
-}
-
-func containsArg(args []string, want string) bool {
-	for _, arg := range args {
-		if arg == want {
-			return true
-		}
-	}
-	return false
 }
 
 func workspaceOptions(args []string) (tui.WorkspaceOptions, bool, bool, error) {

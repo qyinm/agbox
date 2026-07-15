@@ -27,6 +27,56 @@ func (a *testAdapter) ParseDelta(src session.Source, cur session.Cursor) (sessio
 	return a.parse(src, cur)
 }
 
+type rootedTestAdapter struct{ *testAdapter }
+
+func (*rootedTestAdapter) RootSpecs() []session.RootSpec { return nil }
+func (*rootedTestAdapter) Runnable() bool                { return true }
+
+func TestReconcilePersistsRenameTruncateAndDeleteLifecycle(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().UTC()
+	adapter := &testAdapter{agent: "test", sources: []session.Source{{
+		Agent: "test", Path: "/root/old.jsonl", Project: "demo", RootPath: "/root", RootClass: session.RootActive,
+		SourceID: "src_lifecycle", Generation: 1, FileIdentity: "1:2", Size: 100, HistoricalEligible: true,
+	}}, parse: func(src session.Source, cur session.Cursor) (session.ParseResult, error) {
+		return parsedTo(src, cur, src.Size), nil
+	}}
+	c := New(s)
+	c.Adapters = []session.Adapter{&rootedTestAdapter{adapter}}
+	if _, err := c.Reconcile(ReconcileOptions{Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	adapter.sources[0].Path = "/root/renamed.jsonl"
+	adapter.sources[0].Size = 120
+	if _, err := c.Reconcile(ReconcileOptions{Now: now.Add(time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	active, err := s.ActiveSourceGenerations("test")
+	if err != nil || len(active) != 1 || active[0].SourceRef != "/root/renamed.jsonl" || active[0].Generation != 1 {
+		t.Fatalf("rename lifecycle = %+v, err=%v", active, err)
+	}
+	adapter.sources[0].Size = 20
+	if _, err := c.Reconcile(ReconcileOptions{Now: now.Add(2 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	active, err = s.ActiveSourceGenerations("test")
+	if err != nil || len(active) != 1 || active[0].Generation != 2 || active[0].ObservedSize != 20 {
+		t.Fatalf("truncate lifecycle = %+v, err=%v", active, err)
+	}
+	adapter.sources = nil
+	if _, err := c.Reconcile(ReconcileOptions{Now: now.Add(3 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	active, err = s.ActiveSourceGenerations("test")
+	if err != nil || len(active) != 0 {
+		t.Fatalf("delete lifecycle = %+v, err=%v", active, err)
+	}
+}
+
 func TestConcurrentControllersParseWithOneOwner(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "source.jsonl")

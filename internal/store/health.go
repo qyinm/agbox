@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -123,12 +124,19 @@ func (s *Store) IngestionHealthAt(now time.Time) IngestionHealth {
 			h.Unavailable = append(h.Unavailable, HealthDiagnostic{Field: field, Code: healthErrorCode(err)})
 		}
 	}
+	tx, err := s.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		metricError("snapshot", err)
+		h.State = HealthDegraded
+		return h
+	}
+	defer tx.Rollback()
 
-	metricError("live_queue_depth", s.db.QueryRow(`SELECT COUNT(*) FROM ingestion_work WHERE work_class=? AND state IN ('pending','running','waiting_append')`, WorkLive).Scan(&h.LiveQueueDepth))
-	metricError("catchup_queue_depth", s.db.QueryRow(`SELECT COUNT(*) FROM ingestion_work WHERE work_class IN (?,?) AND state IN ('pending','running','waiting_append')`, WorkActiveCatchup, WorkArchive).Scan(&h.CatchupQueueDepth))
+	metricError("live_queue_depth", tx.QueryRow(`SELECT COUNT(*) FROM ingestion_work WHERE work_class=? AND state IN ('pending','running')`, WorkLive).Scan(&h.LiveQueueDepth))
+	metricError("catchup_queue_depth", tx.QueryRow(`SELECT COUNT(*) FROM ingestion_work WHERE work_class IN (?,?) AND state IN ('pending','running')`, WorkActiveCatchup, WorkArchive).Scan(&h.CatchupQueueDepth))
 
 	var oldest sql.NullString
-	if err := s.db.QueryRow(`SELECT MIN(updated_at) FROM ingestion_work WHERE work_class=? AND state IN ('pending','running','waiting_append')`, WorkLive).Scan(&oldest); err != nil {
+	if err := tx.QueryRow(`SELECT MIN(updated_at) FROM ingestion_work WHERE work_class=? AND state IN ('pending','running')`, WorkLive).Scan(&oldest); err != nil {
 		metricError("oldest_live_lag_ms", err)
 	} else if oldest.Valid {
 		if t := parseTime(oldest.String); !t.IsZero() {
@@ -139,7 +147,7 @@ func (s *Store) IngestionHealthAt(now time.Time) IngestionHealth {
 	var current HealthCurrentWork
 	var currentSource, started string
 	var currentClass int
-	err := s.db.QueryRow(`SELECT w.source_id, w.generation, s.agent, w.work_class, w.updated_at
+	err = tx.QueryRow(`SELECT w.source_id, w.generation, s.agent, w.work_class, w.updated_at
 		FROM ingestion_work w JOIN ingestion_sources s USING(source_id,generation)
 		WHERE w.state='running' ORDER BY w.updated_at ASC LIMIT 1`).Scan(&currentSource, &current.Generation, &current.Agent, &currentClass, &started)
 	if err == nil {
@@ -154,7 +162,7 @@ func (s *Store) IngestionHealthAt(now time.Time) IngestionHealth {
 
 	var progress HealthProgress
 	var progressSource, progressAt string
-	err = s.db.QueryRow(`SELECT source_id, generation, committed_offset, updated_at FROM ingestion_checkpoints
+	err = tx.QueryRow(`SELECT source_id, generation, committed_offset, updated_at FROM ingestion_checkpoints
 		WHERE committed_offset > 0 OR visibility_watermark > 0 ORDER BY updated_at DESC LIMIT 1`).Scan(&progressSource, &progress.Generation, &progress.CommittedBytes, &progressAt)
 	if err == nil {
 		progress.SourceID = operatorSourceID(progressSource)
@@ -165,23 +173,38 @@ func (s *Store) IngestionHealthAt(now time.Time) IngestionHealth {
 	}
 
 	var successful string
-	if err := s.db.QueryRow(`SELECT committed_at FROM consumer_visibility WHERE singleton=1`).Scan(&successful); err != nil {
+	if err := tx.QueryRow(`SELECT committed_at FROM consumer_visibility WHERE singleton=1`).Scan(&successful); err != nil {
 		metricError("last_successful_ingest", err)
 	} else {
 		h.LastSuccessfulIngest = parseTime(successful)
 	}
-	if window, err := s.HistoryWindow(); err != nil {
+	var windowSeconds int64
+	if err := tx.QueryRow(`SELECT history_window_seconds FROM ingestion_policy WHERE singleton=1`).Scan(&windowSeconds); err != nil {
 		metricError("history_window_days", err)
 	} else {
-		h.HistoryWindowDays = int(window / (24 * time.Hour))
+		h.HistoryWindowDays = int((time.Duration(windowSeconds) * time.Second) / (24 * time.Hour))
 	}
-	if consumer, err := s.ConsumerState(); err != nil {
+	var consumer ConsumerState
+	if err := tx.QueryRow(`SELECT
+		COALESCE(SUM(CASE WHEN state IN ('pending','running','waiting_append') THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN work_class=? AND state IN ('pending','running','waiting_append') THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN work_class IN (?,?) AND state IN ('pending','running','waiting_append') THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN state='quarantined' THEN 1 ELSE 0 END), 0) FROM ingestion_work`,
+		WorkLive, WorkActiveCatchup, WorkArchive).Scan(&consumer.Pending, &consumer.LivePending, &consumer.CatchupPending, &consumer.Quarantined); err != nil {
 		metricError("consumer", err)
 	} else {
+		switch {
+		case consumer.Quarantined > 0:
+			consumer.Completeness = ConsumerQuarantined
+		case consumer.Pending > 0:
+			consumer.Completeness = ConsumerIncomplete
+		default:
+			consumer.Completeness = ConsumerComplete
+		}
 		h.Consumer = consumer
 	}
 
-	rows, err := s.db.Query(`SELECT w.source_id, w.generation, s.agent, w.work_class, c.committed_offset, w.failure_class, w.retry_count
+	rows, err := tx.Query(`SELECT w.source_id, w.generation, s.agent, w.work_class, c.committed_offset, w.failure_class, w.retry_count
 		FROM ingestion_work w JOIN ingestion_sources s USING(source_id,generation)
 		JOIN ingestion_checkpoints c USING(source_id,generation)
 		WHERE w.state='quarantined' ORDER BY s.agent,w.source_id`)
@@ -217,7 +240,7 @@ func (s *Store) IngestionHealthAt(now time.Time) IngestionHealth {
 	}
 	leaseAlive := false
 	var expires string
-	if err := s.db.QueryRow(`SELECT expires_at FROM scheduler_lease WHERE singleton=1`).Scan(&expires); err == nil {
+	if err := tx.QueryRow(`SELECT expires_at FROM scheduler_lease WHERE singleton=1`).Scan(&expires); err == nil {
 		leaseAlive = parseTime(expires).After(now)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		metricError("scheduler_lease", err)
@@ -295,7 +318,8 @@ func safeAgent(agent string) string {
 
 func safeFailureCode(code string) string {
 	switch code {
-	case "oversized_signal", "source_unavailable", "unsupported_adapter", "no_progress", "parse_error", "record_too_deep", "record_too_complex":
+	case FailureSignalTooLarge, FailureRecordBudget, FailureMalformedRecord, FailureMissingContext,
+		FailureParse, FailureSourceUnavailable, FailureUnsupportedAdapter, FailureNoProgress:
 		return code
 	default:
 		return "ingestion_failure"

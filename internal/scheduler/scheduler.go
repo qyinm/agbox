@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -22,14 +21,45 @@ const (
 )
 
 type ReconcileOptions struct {
-	LivePath      string
-	CreateReceipt bool
-	FailFast      bool
-	Now           time.Time
+	LivePath       string
+	BaselineByPath map[string]int64
+	CreateReceipt  bool
+	FailFast       bool
+	Now            time.Time
+}
+
+func (c *Controller) Snapshot(now time.Time) ([]session.Source, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	historyWindow, err := c.Store.HistoryWindow()
+	if err != nil {
+		return nil, err
+	}
+	var sources []session.Source
+	var errs []error
+	for _, adapter := range c.Adapters {
+		if !session.IsRunnable(adapter) {
+			continue
+		}
+		var observed []session.Source
+		if configurable, ok := adapter.(session.ConfigurableDiscovery); ok {
+			observed, err = configurable.DiscoverSourcesWithOptions(session.DiscoveryOptions{Agent: adapter.Agent(), Now: now, HistoryWindow: historyWindow})
+		} else {
+			observed, err = adapter.DiscoverSources()
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s discovery: %w", adapter.Agent(), err))
+			continue
+		}
+		sources = append(sources, observed...)
+	}
+	return sources, errors.Join(errs...)
 }
 
 type ReconcileResult struct {
 	Receipts []string
+	Sources  []session.Source
 	Warning  error
 }
 
@@ -55,7 +85,7 @@ func opaqueID(prefix string) string {
 func (c *Controller) adapter(agent string) (session.Adapter, bool) {
 	for _, adapter := range c.Adapters {
 		if adapter.Agent() == agent {
-			if rooted, ok := adapter.(session.RootedAdapter); ok && !rooted.Runnable() {
+			if !session.IsRunnable(adapter) {
 				return nil, false
 			}
 			return adapter, true
@@ -77,7 +107,7 @@ func (c *Controller) Reconcile(opts ReconcileOptions) (ReconcileResult, error) {
 		return result, err
 	}
 	for _, adapter := range c.Adapters {
-		if rooted, ok := adapter.(session.RootedAdapter); ok && !rooted.Runnable() {
+		if !session.IsRunnable(adapter) {
 			continue
 		}
 		var sources []session.Source
@@ -95,6 +125,43 @@ func (c *Controller) Reconcile(opts ReconcileOptions) (ReconcileResult, error) {
 			warnings = append(warnings, wrapped)
 			continue
 		}
+		var durable, compatibility []session.Source
+		for _, src := range sources {
+			if src.FileIdentity != "" {
+				durable = append(durable, src)
+			} else {
+				compatibility = append(compatibility, src)
+			}
+		}
+		_, rooted := adapter.(session.RootedAdapter)
+		if rooted || len(durable) > 0 {
+			persisted, listErr := c.Store.ActiveSourceGenerations(adapter.Agent())
+			if listErr != nil {
+				if opts.FailFast {
+					return result, listErr
+				}
+				warnings = append(warnings, listErr)
+			} else {
+				previous := make([]session.Source, 0, len(persisted))
+				for _, prior := range persisted {
+					previous = append(previous, session.Source{Agent: prior.Agent, Path: prior.SourceRef, Project: prior.Project,
+						RootPath: prior.RootPath, RootClass: session.RootClass(prior.RootClass), SourceID: prior.SourceID,
+						Generation: prior.Generation, FileIdentity: prior.FileIdentity, Size: prior.ObservedSize})
+				}
+				reconciled := session.ReconcileSources(previous, durable)
+				for _, stale := range append(reconciled.Replaced, reconciled.Deleted...) {
+					if tombstoneErr := c.Store.TombstoneSourceGeneration(stale.SourceID, stale.Generation, opts.Now); tombstoneErr != nil {
+						if opts.FailFast {
+							return result, tombstoneErr
+						}
+						warnings = append(warnings, tombstoneErr)
+					}
+				}
+				durable = reconciled.Current
+			}
+		}
+		sources = append(durable, compatibility...)
+		result.Sources = append(result.Sources, sources...)
 		for _, src := range sources {
 			if src.Generation <= 0 {
 				src.Generation = 1
@@ -106,7 +173,9 @@ func (c *Controller) Reconcile(opts ReconcileOptions) (ReconcileResult, error) {
 			}
 			if err := c.Store.UpsertSourceGeneration(store.SourceGeneration{
 				SourceID: src.SourceID, Generation: src.Generation, Agent: src.Agent,
-				SourceRef: src.Path, State: store.SourceActive, CreatedAt: opts.Now, UpdatedAt: opts.Now,
+				SourceRef: src.Path, Project: src.Project, RootPath: src.RootPath, RootClass: string(src.RootClass),
+				FileIdentity: src.FileIdentity, ObservedSize: src.Size, State: store.SourceActive,
+				CreatedAt: opts.Now, UpdatedAt: opts.Now,
 			}); err != nil {
 				if opts.FailFast {
 					return result, err
@@ -123,10 +192,17 @@ func (c *Controller) Reconcile(opts ReconcileOptions) (ReconcileResult, error) {
 				}
 			}
 			isLive := opts.LivePath != "" && samePath(opts.LivePath, src.Path)
+			startupBaseline, hadBaseline := opts.BaselineByPath[src.Path]
+			if opts.BaselineByPath != nil && (!hadBaseline || src.Size > startupBaseline) {
+				isLive = true
+			}
 			if isLive {
 				class = store.WorkLive
 			}
 			baseline := src.BaselineOffset
+			if hadBaseline {
+				baseline = startupBaseline
+			}
 			if isLive {
 				// A watched append is eligible regardless of source age. Existing
 				// non-zero checkpoints remain intact; a newly created live file
@@ -172,6 +248,25 @@ func (c *Controller) Reconcile(opts ReconcileOptions) (ReconcileResult, error) {
 	}
 	result.Warning = errors.Join(warnings...)
 	return result, nil
+}
+
+func (c *Controller) ReconcileLiveSource(src session.Source, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if src.SourceID == "" || src.Generation <= 0 {
+		return store.ErrGenerationMismatch
+	}
+	if err := c.Store.UpsertSourceGeneration(store.SourceGeneration{
+		SourceID: src.SourceID, Generation: src.Generation, Agent: src.Agent, SourceRef: src.Path,
+		Project: src.Project, RootPath: src.RootPath, RootClass: string(src.RootClass), FileIdentity: src.FileIdentity,
+		ObservedSize: src.Size, State: store.SourceActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		return err
+	}
+	_, err := c.Store.EnqueueIngestionWork(store.EnqueueWork{SourceID: src.SourceID, Generation: src.Generation,
+		Class: store.WorkLive, TargetOffset: src.Size, Now: now})
+	return err
 }
 
 func pathSourceID(agent, path string) string {
@@ -225,6 +320,7 @@ func (c *Controller) ProcessOne(ctx context.Context) (bool, int, error) {
 	}
 	cp, err := c.Store.GetIngestionCheckpoint(item.Work.SourceID, item.Work.Generation)
 	if err != nil {
+		_ = c.Store.RequeueClaimedWork(item.Work.SourceID, item.Work.Generation, c.OwnerID, lease.FencingToken, time.Now())
 		return true, 0, err
 	}
 	adapter, ok := c.adapter(item.Source.Agent)
@@ -233,15 +329,11 @@ func (c *Controller) ProcessOne(ctx context.Context) (bool, int, error) {
 		_ = c.quarantine(item, cp, lease, "unsupported_adapter")
 		return true, 0, err
 	}
-	info, err := os.Stat(item.Source.SourceRef)
-	if err != nil {
-		_ = c.quarantine(item, cp, lease, "source_unavailable")
-		return true, 0, err
-	}
 	src := session.Source{
 		Agent: item.Source.Agent, Path: item.Source.SourceRef,
-		Project: filepath.Base(filepath.Dir(item.Source.SourceRef)), SourceID: item.Source.SourceID,
-		Generation: item.Source.Generation, Size: info.Size(), ModTime: info.ModTime(),
+		Project: item.Source.Project, RootPath: item.Source.RootPath, RootClass: session.RootClass(item.Source.RootClass),
+		FileIdentity: item.Source.FileIdentity, SourceID: item.Source.SourceID,
+		Generation: item.Source.Generation, Size: item.Work.TargetOffset,
 	}
 	parsed, err := adapter.ParseDelta(src, session.Cursor{
 		SourcePath: src.Path, LastOffset: cp.CommittedOffset,
@@ -269,6 +361,9 @@ func (c *Controller) ProcessOne(ctx context.Context) (bool, int, error) {
 		FencingToken: lease.FencingToken, Now: time.Now(), Complete: complete, AwaitingAppend: parsed.Incomplete,
 	}, store.ParsedSlice{Session: parsed.Session, Turns: parsed.Turns, Actions: parsed.Actions,
 		Corrections: parsed.Corrections, CursorHash: parsed.NewHash})
+	if err != nil {
+		_ = c.Store.RequeueClaimedWork(item.Work.SourceID, item.Work.Generation, c.OwnerID, lease.FencingToken, time.Now())
+	}
 	return true, len(parsed.Corrections), err
 }
 
@@ -281,15 +376,15 @@ func (c *Controller) quarantine(item store.RunnableIngestion, cp store.Ingestion
 func classifyFailure(err error) string {
 	switch {
 	case errors.Is(err, jsonl.ErrSignalTooLarge):
-		return "signal_too_large"
+		return store.FailureSignalTooLarge
 	case errors.Is(err, jsonl.ErrRecordBudget):
-		return "record_budget"
+		return store.FailureRecordBudget
 	case errors.Is(err, jsonl.ErrMalformedRecord):
-		return "malformed_record"
+		return store.FailureMalformedRecord
 	case errors.Is(err, jsonl.ErrMissingContext):
-		return "missing_context"
+		return store.FailureMissingContext
 	default:
-		return "parse_error"
+		return store.FailureParse
 	}
 }
 
@@ -322,21 +417,34 @@ func WaitReceipts(ctx context.Context, s *store.Store, receipts []string) error 
 			pending[id] = struct{}{}
 		}
 	}
+	var failures []error
 	for len(pending) > 0 {
+		ids := make([]string, 0, len(pending))
 		for id := range pending {
-			receipt, err := s.GetIngestionReceipt(id)
+			ids = append(ids, id)
+		}
+		for start := 0; start < len(ids); start += 500 {
+			end := min(start+500, len(ids))
+			receipts, err := s.GetIngestionReceipts(ids[start:end])
 			if err != nil {
 				return err
 			}
-			switch receipt.Status {
-			case store.ReceiptCompleted:
-				delete(pending, id)
-			case store.ReceiptQuarantined:
-				return fmt.Errorf("source %s quarantined: %s", receipt.SourceID, receipt.FailureClass)
+			if len(receipts) != end-start {
+				return sql.ErrNoRows
+			}
+			for _, receipt := range receipts {
+				id := receipt.ReceiptID
+				switch receipt.Status {
+				case store.ReceiptCompleted:
+					delete(pending, id)
+				case store.ReceiptQuarantined:
+					delete(pending, id)
+					failures = append(failures, fmt.Errorf("source %s quarantined: %s", receipt.SourceID, receipt.FailureClass))
+				}
 			}
 		}
 		if len(pending) == 0 {
-			return nil
+			return errors.Join(failures...)
 		}
 		select {
 		case <-ctx.Done():
@@ -344,5 +452,5 @@ func WaitReceipts(ctx context.Context, s *store.Store, receipts []string) error 
 		case <-ticker.C:
 		}
 	}
-	return nil
+	return errors.Join(failures...)
 }

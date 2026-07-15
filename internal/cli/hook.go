@@ -9,8 +9,6 @@ import (
 	"github.com/hippoom/agbox/internal/store"
 )
 
-var replayConsumerState = func(s *store.Store) (store.ConsumerState, error) { return s.ConsumerState() }
-
 func runHook(s *store.Store, args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: agbox hook propose|replay|save|acknowledge <agent>")
@@ -57,16 +55,6 @@ func runHookReplay(s *store.Store, args []string, stdin io.Reader, stdout io.Wri
 		return fmt.Errorf("usage: agbox hook replay <claude|codex|grok>")
 	}
 	agent := args[0]
-	consumer, err := replayConsumerState(s)
-	if err != nil {
-		return err
-	}
-	// Replay is a committed-state consumer. Pending or quarantined ingestion is
-	// represented explicitly by ConsumerState and must not be mistaken for an
-	// authoritative empty match.
-	if consumer.Completeness != store.ConsumerComplete {
-		return nil
-	}
 	hookData, err := io.ReadAll(stdin)
 	if err != nil {
 		return err
@@ -76,11 +64,19 @@ func runHookReplay(s *store.Store, args []string, stdin io.Reader, stdout io.Wri
 		project = defaultProject()
 	}
 	prompt := propose.PromptFromHook(hookData)
+	consumer, err := s.ConsumerStateFor(agent, project)
+	if err != nil {
+		return err
+	}
 	candidateID, payload, err := propose.SelectAndRenderForPrompt(s, agent, project, prompt)
 	if err != nil {
 		return err
 	}
 	if payload == "" {
+		if consumer.Completeness != store.ConsumerComplete {
+			fmt.Fprintf(stdout, "[agbox replay incomplete: state=%s live=%d catchup=%d quarantined=%d]\n",
+				consumer.Completeness, consumer.LivePending, consumer.CatchupPending, consumer.Quarantined)
+		}
 		return nil
 	}
 	return propose.DeliverProposed(s, candidateID, payload, stdout, os.Stderr)

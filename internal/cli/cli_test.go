@@ -139,6 +139,44 @@ func TestInitCanSkipManagedHooks(t *testing.T) {
 	}
 }
 
+func TestHookReplayReportsOnlyRelevantIncompleteIngestion(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().UTC()
+	for _, source := range []store.SourceGeneration{
+		{SourceID: "other", Generation: 1, Agent: "codex", Project: "other-project", SourceRef: "opaque:other", State: store.SourceActive, CreatedAt: now},
+		{SourceID: "demo", Generation: 1, Agent: "codex", Project: "demo", SourceRef: "opaque:demo", State: store.SourceActive, CreatedAt: now},
+	} {
+		if err := s.UpsertSourceGeneration(source); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.EnqueueIngestionWork(store.EnqueueWork{SourceID: "other", Generation: 1, Class: store.WorkActiveCatchup, TargetOffset: 10, Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	input := strings.NewReader(`{"cwd":"/tmp/demo","prompt":"unrelated prompt"}`)
+	var out bytes.Buffer
+	if err := runHookReplay(s, []string{"codex"}, input, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("unrelated backlog affected replay: %q", out.String())
+	}
+	if _, err := s.EnqueueIngestionWork(store.EnqueueWork{SourceID: "demo", Generation: 1, Class: store.WorkLive, TargetOffset: 10, Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := runHookReplay(s, []string{"codex"}, strings.NewReader(`{"cwd":"/tmp/demo","prompt":"unrelated prompt"}`), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "[agbox replay incomplete: state=incomplete live=1 catchup=0 quarantined=0]") {
+		t.Fatalf("missing bounded replay completeness marker: %q", out.String())
+	}
+}
+
 func TestInitStopsWatcherBeforeSyncAndInstallsAfter(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)

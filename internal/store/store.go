@@ -58,6 +58,12 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A Store is shared by the watcher, receipt waiters, health readers and the
+	// scheduler. Serializing them through one SQLite connection avoids
+	// SQLITE_LOCKED failures between connections in the same process; WAL and
+	// the busy timeout still coordinate separate CLI/watcher processes.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	s := &Store{db: db, path: path, resetPerformed: resetPerformed}
 	if err := s.migrate(); err != nil {
 		db.Close()

@@ -97,6 +97,35 @@ func TestOpenRejectsUnknownSymlinkAndNonRegularTargets(t *testing.T) {
 		}
 	})
 
+	t.Run("lookalike legacy schema", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "lookalike.db")
+		db, err := sql.Open("sqlite3", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, table := range []string{"actions", "candidate_corrections", "candidate_events", "candidates", "corrections", "events", "exports", "replay_applications", "sessions", "source_cursors", "turns"} {
+			if _, err := db.Exec(`CREATE TABLE ` + table + ` (secret TEXT)`); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Open(path); !errors.Is(err, store.ErrUnknownDatabase) {
+			t.Fatalf("Open error = %v, want ErrUnknownDatabase", err)
+		}
+		db, err = sql.Open("sqlite3", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		var secretTables int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND sql LIKE '%secret TEXT%'`).Scan(&secretTables); err != nil || secretTables != 11 {
+			t.Fatalf("lookalike database was modified: tables=%d err=%v", secretTables, err)
+		}
+	})
+
 	t.Run("symlink", func(t *testing.T) {
 		dir := t.TempDir()
 		target := filepath.Join(dir, "target.db")
@@ -357,6 +386,53 @@ func TestParsedSliceCommitIsIdempotentAndPublishesVisibilityWithCorrection(t *te
 	}
 }
 
+func TestConcurrentAppendPreservesClaimAndCompletesEarlierReceipt(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().UTC()
+	source := store.SourceGeneration{SourceID: "src_append", Generation: 1, Agent: "codex", SourceRef: "opaque:append", State: store.SourceActive, CreatedAt: now}
+	if err := s.UpsertSourceGeneration(source); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnqueueIngestionWork(store.EnqueueWork{SourceID: source.SourceID, Generation: 1, Class: store.WorkLive, TargetOffset: 100, ReceiptID: "receipt-100", Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := s.AcquireSchedulerLease("append-owner", now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimNextIngestionWork(lease.OwnerID, lease.FencingToken, now); err != nil {
+		t.Fatal(err)
+	}
+	work, err := s.EnqueueIngestionWork(store.EnqueueWork{SourceID: source.SourceID, Generation: 1, Class: store.WorkLive, TargetOffset: 200, ReceiptID: "receipt-200", Now: now.Add(time.Millisecond)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if work.State != store.WorkRunning || work.TargetOffset != 200 {
+		t.Fatalf("append invalidated claim: %+v", work)
+	}
+	if err := s.CommitIngestionSlice(store.SliceCommit{SourceID: source.SourceID, Generation: 1, ExpectedOffset: 0, NextOffset: 100,
+		ParserStateVersion: 1, ParserState: []byte(`{"t":1}`), VisibilityWatermark: 1,
+		LeaseOwner: lease.OwnerID, FencingToken: lease.FencingToken, Now: now.Add(2 * time.Millisecond)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.GetIngestionReceipt("receipt-100")
+	if err != nil || first.Status != store.ReceiptCompleted {
+		t.Fatalf("earlier receipt = %+v, err=%v", first, err)
+	}
+	second, err := s.GetIngestionReceipt("receipt-200")
+	if err != nil || second.Status != store.ReceiptAccepted {
+		t.Fatalf("later receipt = %+v, err=%v", second, err)
+	}
+	work, err = s.GetIngestionWork(source.SourceID, 1)
+	if err != nil || work.State != store.WorkPending {
+		t.Fatalf("remaining work = %+v, err=%v", work, err)
+	}
+}
+
 func TestParsedSliceCommitRejectsReplacementGeneration(t *testing.T) {
 	s, err := store.Open(filepath.Join(t.TempDir(), "agbox.db"))
 	if err != nil {
@@ -452,7 +528,8 @@ func createLegacyDatabase(t *testing.T, path string) {
 	defer db.Close()
 	for _, ddl := range []string{
 		`DROP TABLE ingestion_receipts`, `DROP TABLE ingestion_work`, `DROP TABLE ingestion_checkpoints`,
-		`DROP TABLE ingestion_sources`, `DROP TABLE scheduler_lease`, `DROP TABLE consumer_visibility`, `DROP TABLE agbox_schema`,
+		`DROP TABLE ingestion_sources`, `DROP TABLE scheduler_lease`, `DROP TABLE consumer_visibility`,
+		`DROP TABLE ingestion_policy`, `DROP TABLE agbox_schema`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			t.Fatal(err)

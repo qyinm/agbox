@@ -15,7 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -47,7 +47,7 @@ type profileConfig struct {
 func configFor(name string) (profileConfig, bool) {
 	switch name {
 	case "smoke":
-		return profileConfig{Name: name, IrrelevantBytes: 2 << 20, SourceCount: 25,
+		return profileConfig{Name: name, IrrelevantBytes: 32 << 20, SourceCount: 25,
 			LogicalCorpusBytes: 64 << 20, RecordsPerSecond: 50, LoadDuration: time.Second}, true
 	case "release":
 		return profileConfig{Name: name, IrrelevantBytes: 32 << 20, SourceCount: 2500,
@@ -82,6 +82,7 @@ type caseResult struct {
 	P95VisibilityMS     int64  `json:"p95_visibility_ms,omitempty"`
 	P99VisibilityMS     int64  `json:"p99_visibility_ms,omitempty"`
 	CatchupPreempted    bool   `json:"catchup_preempted,omitempty"`
+	CatchupProgressed   bool   `json:"catchup_progressed,omitempty"`
 	RuntimeSysBytes     int64  `json:"runtime_sys_bytes,omitempty"`
 }
 
@@ -117,11 +118,7 @@ func runParent(cfg profileConfig, selected string) report {
 	out := report{Version: reportVersion, Profile: cfg.Name, Passed: true, StartedAt: started.UTC()}
 	cases := []string{"eof", "irrelevant", "idle", "load"}
 	if selected != "all" {
-		valid := false
-		for _, name := range cases {
-			valid = valid || selected == name
-		}
-		if !valid {
+		if !slices.Contains(cases, selected) {
 			out.Passed = false
 			out.Cases = []caseResult{{Name: selected, Passed: false, ErrorCode: "unknown_case"}}
 			return out
@@ -206,7 +203,10 @@ func writeRepeated(w io.Writer, value byte, count int64) error {
 func runChild(executable, name, fixture string, cfg profileConfig) caseResult {
 	timeout := 20 * time.Second
 	if cfg.Name == "release" && name == "load" {
-		timeout = 90 * time.Second
+		// The 60-second load window begins only after 2,500 durable source and
+		// queue rows are created. Leave setup/teardown headroom while staying
+		// inside the workflow's five-minute gate budget.
+		timeout = 4 * time.Minute
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -395,7 +395,19 @@ func loadWorker(dir string, cfg profileConfig) caseResult {
 		}
 		path := filepath.Join(dir, fmt.Sprintf("catchup-%05d.jsonl", i))
 		f, createErr := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
-		if createErr != nil || f.Truncate(targetSize) != nil || f.Close() != nil {
+		if createErr == nil && i == 0 {
+			_, createErr = io.WriteString(f, `{"type":"ignored","payload":"`)
+			payloadBytes := targetSize - int64(len(`{"type":"ignored","payload":""}`+"\n"))
+			if createErr == nil && payloadBytes > 0 {
+				createErr = writeRepeated(f, 'x', payloadBytes)
+			}
+			if createErr == nil {
+				_, createErr = io.WriteString(f, `"}`+"\n")
+			}
+		} else if createErr == nil {
+			createErr = f.Truncate(targetSize)
+		}
+		if createErr != nil || f.Close() != nil {
 			result.ErrorCode = "catchup_fixture_failed"
 			return result
 		}
@@ -427,70 +439,129 @@ func loadWorker(dir string, cfg profileConfig) caseResult {
 	}
 	controller := scheduler.New(s)
 	controller.Adapters = []session.Adapter{codex.New()}
-	if worked, _, err := controller.ProcessOne(context.Background()); err != nil || !worked {
+	workerCtx, stopWorker := context.WithCancel(context.Background())
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- controller.Run(workerCtx) }()
+	defer func() {
+		stopWorker()
+		<-workerDone
+	}()
+	if err := waitFor(5*time.Second, func() (bool, error) {
+		work, err := s.GetIngestionWork(liveID, 1)
+		return err == nil && work.State == store.WorkComplete, err
+	}); err != nil {
 		result.ErrorCode = "initial_live_process_failed"
 		return result
-	}
-	if catchupCount > 0 {
-		work, err := s.GetIngestionWork("src_catchup_00000", 1)
-		if err != nil || work.State != store.WorkPending {
-			result.ErrorCode = "live_preemption_failed"
-			return result
-		}
-		result.CatchupPreempted = true
 	}
 
 	records := cfg.RecordsPerSecond * int(cfg.LoadDuration/time.Second)
 	latencies := make([]time.Duration, 0, records)
+	appendedAt := make([]time.Time, 0, records)
 	interval := time.Second / time.Duration(cfg.RecordsPerSecond)
-	nextAppend := time.Now()
-	lastWatermark := int64(0)
-	for i := 0; i < records; i++ {
-		if wait := time.Until(nextAppend); wait > 0 {
-			time.Sleep(wait)
+	loadStarted := time.Now()
+	nextAppend := loadStarted
+	tailDeadline := loadStarted.Add(cfg.LoadDuration + 5*time.Second)
+	liveSource := session.Source{Agent: "codex", Path: livePath, Project: "gate", SourceID: liveID, Generation: 1, RootClass: session.RootActive}
+	written, visible := 0, 0
+	for visible < records {
+		observedAt := time.Now()
+		// The producer is clock-driven, not visibility-driven: it continues at
+		// 50 records/s while the scheduler independently drains coalesced work.
+		for written < records && !observedAt.Before(nextAppend) {
+			started := time.Now()
+			record := fmt.Sprintf(`{"timestamp":%q,"type":"event_msg","payload":{"type":"user_message","message":"use bounded gate %d"}}`,
+				started.UTC().Format(time.RFC3339Nano), written) + "\n"
+			f, err := os.OpenFile(livePath, os.O_APPEND|os.O_WRONLY, 0o600)
+			if err != nil {
+				result.ErrorCode = "live_append_failed"
+				return result
+			}
+			_, writeErr := io.WriteString(f, record)
+			closeErr := f.Close()
+			if writeErr != nil || closeErr != nil {
+				result.ErrorCode = "live_append_failed"
+				return result
+			}
+			info, statErr := os.Stat(livePath)
+			if statErr != nil {
+				result.ErrorCode = "live_stat_failed"
+				return result
+			}
+			liveSource.Size, liveSource.ModTime = info.Size(), info.ModTime()
+			if err := controller.ReconcileLiveSource(liveSource, started); err != nil {
+				result.ErrorCode = "live_enqueue_" + gateErrorCode(err)
+				return result
+			}
+			appendedAt = append(appendedAt, started)
+			written++
+			nextAppend = nextAppend.Add(interval)
+			observedAt = time.Now()
 		}
-		started := time.Now()
-		record := fmt.Sprintf(`{"timestamp":%q,"type":"event_msg","payload":{"type":"user_message","message":"use bounded gate %d"}}`,
-			started.UTC().Format(time.RFC3339Nano), i) + "\n"
-		f, err := os.OpenFile(livePath, os.O_APPEND|os.O_WRONLY, 0o600)
-		if err != nil {
-			result.ErrorCode = "live_append_failed"
-			return result
-		}
-		_, writeErr := io.WriteString(f, record)
-		closeErr := f.Close()
-		if writeErr != nil || closeErr != nil {
-			result.ErrorCode = "live_append_failed"
-			return result
-		}
-		info, _ = os.Stat(livePath)
-		if _, err := s.EnqueueIngestionWork(store.EnqueueWork{SourceID: liveID, Generation: 1, Class: store.WorkLive, TargetOffset: info.Size(), Now: started}); err != nil {
-			result.ErrorCode = "live_enqueue_failed"
-			return result
-		}
-		worked, _, err := controller.ProcessOne(context.Background())
-		if err != nil || !worked {
-			result.ErrorCode = "live_process_failed"
-			return result
-		}
-		visibility, err := s.GetConsumerVisibility()
+
 		count, countErr := s.CountCorrections()
-		if err != nil || countErr != nil || visibility.Watermark <= lastWatermark || count != i+1 {
+		if countErr != nil {
 			result.ErrorCode = "consumer_visibility_failed"
 			return result
 		}
-		lastWatermark = visibility.Watermark
-		latencies = append(latencies, time.Since(started))
-		nextAppend = nextAppend.Add(interval)
+		if count > visible {
+			observedAt = time.Now()
+			upper := min(count, written)
+			for visible < upper {
+				latencies = append(latencies, observedAt.Sub(appendedAt[visible]))
+				visible++
+			}
+			if !result.CatchupPreempted && s.IngestionHealth().CatchupQueueDepth > 0 {
+				result.CatchupPreempted = true
+			}
+		}
+		if written == records && time.Now().After(tailDeadline) {
+			result.ErrorCode = "consumer_visibility_failed"
+			return result
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
-	result.VisibleRecords = records
+	result.VisibleRecords = visible
 	result.P95VisibilityMS = percentile(latencies, 0.95).Milliseconds()
 	result.P99VisibilityMS = percentile(latencies, 0.99).Milliseconds()
-	result.Passed = result.CatchupPreempted && result.VisibleRecords == records && result.P95VisibilityMS <= 2000 && result.P99VisibilityMS <= 5000
+	if catchupCount > 0 {
+		if cp, err := s.GetIngestionCheckpoint("src_catchup_00000", 1); err == nil && cp.CommittedOffset > 0 {
+			result.CatchupProgressed = true
+		}
+	}
+	result.Passed = result.CatchupPreempted && result.CatchupProgressed && result.VisibleRecords == records && result.P95VisibilityMS <= 2000 && result.P99VisibilityMS <= 5000
 	if !result.Passed {
 		result.ErrorCode = "visibility_slo_failed"
 	}
 	return result
+}
+
+func gateErrorCode(err error) string {
+	switch {
+	case errors.Is(err, store.ErrGenerationMismatch):
+		return "generation_mismatch"
+	case errors.Is(err, store.ErrStateConflict):
+		return "state_conflict"
+	case strings.Contains(strings.ToLower(err.Error()), "locked"):
+		return "database_locked"
+	case strings.Contains(strings.ToLower(err.Error()), "busy"):
+		return "database_busy"
+	default:
+		return "failed"
+	}
+}
+
+func waitFor(timeout time.Duration, check func() (bool, error)) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		done, err := check()
+		if err != nil || done {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return context.DeadlineExceeded
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 func percentile(values []time.Duration, q float64) time.Duration {
@@ -498,7 +569,7 @@ func percentile(values []time.Duration, q float64) time.Duration {
 		return 0
 	}
 	sorted := append([]time.Duration(nil), values...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	slices.Sort(sorted)
 	index := int(float64(len(sorted))*q+0.999999) - 1
 	if index < 0 {
 		index = 0

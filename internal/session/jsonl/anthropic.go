@@ -34,7 +34,11 @@ func (AnthropicHandler) ProcessRecord(record Record, ctx *Context, acc *Accum, m
 			}
 			index := blockType.Indexes[0]
 			name := record.At("message.content.*.name", index)
-			command := strings.TrimSpace(record.At("message.content.*.input.command", index))
+			commandValue, _ := record.Captured("message.content.*.input.command", index)
+			if commandValue.Oversized {
+				return ErrSignalTooLarge
+			}
+			command := strings.TrimSpace(commandValue.Value)
 			ctx.TurnIndex++
 			turn := model.Turn{ID: stableID("turn_", meta.SessionID, fmt.Sprint(record.Offset), fmt.Sprint(index)), SessionID: meta.SessionID,
 				TurnIndex: ctx.TurnIndex, Role: "agent", EventType: "tool", CreatedAt: createdAt}
@@ -54,7 +58,11 @@ func (AnthropicHandler) ProcessRecord(record Record, ctx *Context, acc *Accum, m
 				continue
 			}
 			index := blockType.Indexes[0]
-			text := record.At("message.content.*.text", index)
+			textValue, _ := record.Captured("message.content.*.text", index)
+			if textValue.Oversized {
+				return ErrSignalTooLarge
+			}
+			text := textValue.Value
 			if strings.TrimSpace(text) == "" {
 				continue
 			}

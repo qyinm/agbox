@@ -45,16 +45,7 @@ func SelectAndRender(s *store.Store, agent, project string) (candidateID, payloa
 	if len(eligible) == 0 {
 		return "", "", nil
 	}
-	sort.Slice(eligible, func(i, j int) bool {
-		ri, rj := confidenceRank(eligible[i]), confidenceRank(eligible[j])
-		if ri != rj {
-			return ri > rj
-		}
-		if eligible[i].EventCount != eligible[j].EventCount {
-			return eligible[i].EventCount > eligible[j].EventCount
-		}
-		return eligible[i].LastSeen.After(eligible[j].LastSeen)
-	})
+	sortCandidatesForProposal(eligible)
 	top := eligible[0]
 	card, err := evidence.Build(s, top.ID)
 	if err != nil {

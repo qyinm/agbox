@@ -26,8 +26,6 @@ var betaStatePriority = []model.CandidateState{
 	model.CandidateApproved,
 }
 
-var betaConsumerState = func(s *store.Store) (store.ConsumerState, error) { return s.ConsumerState() }
-
 func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("beta", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -64,7 +62,7 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 	if lastSyncErr != nil {
 		return lastSyncErr
 	}
-	consumer, consumerErr := betaConsumerState(s)
+	consumer, consumerErr := s.ConsumerState()
 	if consumerErr != nil {
 		return consumerErr
 	}

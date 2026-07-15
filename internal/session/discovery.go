@@ -155,6 +155,19 @@ func VerifiedOpen(src Source) (*os.File, error) {
 	return f, nil
 }
 
+func RefreshSource(src Source) (Source, error) {
+	if src.RootPath == "" || src.Path == "" || rejectSymlinkComponents(src.RootPath, src.Path) != nil {
+		return Source{}, ErrSourceIdentityChanged
+	}
+	info, err := os.Lstat(src.Path)
+	if err != nil || !info.Mode().IsRegular() || statIdentity(info) != src.FileIdentity {
+		return Source{}, ErrSourceIdentityChanged
+	}
+	src.Size = info.Size()
+	src.ModTime = info.ModTime()
+	return src, nil
+}
+
 func ReconcileSources(previous, observed []Source) Reconciliation {
 	prevByIdentity := make(map[string]Source, len(previous))
 	prevByPath := make(map[string]Source, len(previous))

@@ -79,9 +79,6 @@ func impactBaseline(s *store.Store, c model.Candidate, now time.Time) (baseline 
 	if err == nil && exp.Status == model.ExportApplied && !exp.AppliedAt.IsZero() {
 		return exp.AppliedAt, true, "active-window before export vs after export as of " + now.Format("2006-01-02")
 	}
-	if c.State == model.CandidateApproved || c.State == model.CandidateExported {
-		return time.Time{}, false, "no applied export yet; impact starts measuring after export"
-	}
 	return time.Time{}, false, "no applied export yet; impact starts measuring after export"
 }
 

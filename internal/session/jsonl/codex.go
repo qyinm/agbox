@@ -32,22 +32,6 @@ func (CodexHandler) CapturePaths() CapturePaths {
 	}
 }
 
-func (CodexHandler) ShouldCapture(path string, partial Record) bool {
-	switch path {
-	case "payload.content.*.text":
-		role := partial.First("payload.role")
-		return role == "user" || role == "assistant"
-	case "payload.message":
-		typeName := partial.First("payload.type")
-		return typeName == "user_message" || typeName == "agent_message"
-	case "payload.input", "payload.arguments", "payload.action.command", "payload.action.command.*":
-		typeName := partial.First("payload.type")
-		return typeName == "custom_tool_call" || typeName == "function_call" || typeName == "local_shell_call"
-	default:
-		return true
-	}
-}
-
 func (CodexHandler) ProcessRecord(record Record, ctx *Context, acc *Accum, meta Meta) error {
 	createdAt := recordTime(record.First("timestamp"), meta.Now)
 	switch record.First("type") {
@@ -68,16 +52,25 @@ func processCodexResponseItem(record Record, ctx *Context, acc *Accum, meta Meta
 		if name == "" {
 			name = payloadType
 		}
-		command := record.First("payload.input")
+		input, _ := record.Captured("payload.input")
+		arguments, _ := record.Captured("payload.arguments")
+		actionCommand, _ := record.Captured("payload.action.command")
+		if input.Oversized || arguments.Oversized || actionCommand.Oversized {
+			return ErrSignalTooLarge
+		}
+		command := input.Value
 		if command == "" {
-			command = commandFromArguments(record.First("payload.arguments"))
+			command = commandFromArguments(arguments.Value)
 		}
 		if command == "" {
-			command = record.First("payload.action.command")
+			command = actionCommand.Value
 		}
 		if command == "" {
 			var parts []string
 			for _, value := range record.All("payload.action.command.*") {
+				if value.Oversized {
+					return ErrSignalTooLarge
+				}
 				parts = append(parts, value.Value)
 			}
 			command = strings.Join(parts, " ")
@@ -104,7 +97,11 @@ func processCodexResponseItem(record Record, ctx *Context, acc *Accum, meta Meta
 			if len(blockType.Indexes) == 0 || (blockType.Value != "input_text" && blockType.Value != "output_text" && blockType.Value != "text") {
 				continue
 			}
-			if text := record.At("payload.content.*.text", blockType.Indexes[0]); strings.TrimSpace(text) != "" {
+			textValue, _ := record.Captured("payload.content.*.text", blockType.Indexes[0])
+			if role == "user" && textValue.Oversized {
+				return ErrSignalTooLarge
+			}
+			if text := textValue.Value; strings.TrimSpace(text) != "" {
 				parts = append(parts, text)
 			}
 		}
@@ -116,7 +113,11 @@ func processCodexResponseItem(record Record, ctx *Context, acc *Accum, meta Meta
 func processCodexEvent(record Record, ctx *Context, acc *Accum, meta Meta, createdAt time.Time) error {
 	switch record.First("payload.type") {
 	case "user_message":
-		return appendCodexMessage(record, ctx, acc, meta, "user", record.First("payload.message"), createdAt)
+		message, _ := record.Captured("payload.message")
+		if message.Oversized {
+			return ErrSignalTooLarge
+		}
+		return appendCodexMessage(record, ctx, acc, meta, "user", message.Value, createdAt)
 	case "agent_message":
 		return appendCodexMessage(record, ctx, acc, meta, "assistant", record.First("payload.message"), createdAt)
 	default:

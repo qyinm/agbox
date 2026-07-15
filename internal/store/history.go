@@ -159,10 +159,12 @@ func (s *Store) ApplyEvidenceAging(now time.Time, minEvidence int) (AgingResult,
 	}
 	if _, err := tx.Exec(`UPDATE actions SET command='', file_path='', excerpt=''
 		WHERE id IN (SELECT action_id FROM corrections WHERE created_at < ?)
-		AND id NOT IN (SELECT action_id FROM corrections WHERE created_at >= ?)`, formatTime(cutoff), formatTime(cutoff)); err != nil {
+		AND id NOT IN (SELECT action_id FROM corrections WHERE created_at >= ?)
+		AND (command <> '' OR file_path <> '' OR excerpt <> '')`, formatTime(cutoff), formatTime(cutoff)); err != nil {
 		return AgingResult{}, err
 	}
-	if _, err := tx.Exec(`UPDATE corrections SET normalized='', excerpt='' WHERE created_at < ?`, formatTime(cutoff)); err != nil {
+	if _, err := tx.Exec(`UPDATE corrections SET normalized='', excerpt='' WHERE created_at < ?
+		AND (normalized <> '' OR excerpt <> '')`, formatTime(cutoff)); err != nil {
 		return AgingResult{}, err
 	}
 	for _, candidateID := range affected {
@@ -214,13 +216,24 @@ func correctionConfidence(count, projects int) string {
 }
 
 func (s *Store) ConsumerState() (ConsumerState, error) {
+	return s.consumerStateWhere("", nil)
+}
+
+func (s *Store) ConsumerStateFor(agent, project string) (ConsumerState, error) {
+	return s.consumerStateWhere(`JOIN ingestion_sources s USING(source_id,generation) WHERE s.agent=? AND s.project=?`, []any{agent, project})
+}
+
+func (s *Store) consumerStateWhere(joinWhere string, args []any) (ConsumerState, error) {
 	var state ConsumerState
-	if err := s.db.QueryRow(`SELECT
-		COALESCE(SUM(CASE WHEN state IN ('pending','running','waiting_append') THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN work_class=? AND state IN ('pending','running','waiting_append') THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN work_class IN (?,?) AND state IN ('pending','running','waiting_append') THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN state='quarantined' THEN 1 ELSE 0 END), 0)
-		FROM ingestion_work`, WorkLive, WorkActiveCatchup, WorkArchive).Scan(&state.Pending, &state.LivePending, &state.CatchupPending, &state.Quarantined); err != nil {
+	query := `SELECT
+		COALESCE(SUM(CASE WHEN w.state IN ('pending','running','waiting_append') THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN w.work_class=? AND w.state IN ('pending','running','waiting_append') THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN w.work_class IN (?,?) AND w.state IN ('pending','running','waiting_append') THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN w.state='quarantined' THEN 1 ELSE 0 END), 0)
+		FROM ingestion_work w ` + joinWhere
+	queryArgs := []any{WorkLive, WorkActiveCatchup, WorkArchive}
+	queryArgs = append(queryArgs, args...)
+	if err := s.db.QueryRow(query, queryArgs...).Scan(&state.Pending, &state.LivePending, &state.CatchupPending, &state.Quarantined); err != nil {
 		return ConsumerState{}, err
 	}
 	switch {

@@ -119,3 +119,37 @@ func TestOpaqueResumeRequarantinesThenRejectsReplacement(t *testing.T) {
 		t.Fatalf("replacement resume = %v, want generation mismatch", err)
 	}
 }
+
+func TestWaitingAppendDoesNotDegradeRunnableHealth(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().UTC()
+	if err := s.UpsertSourceGeneration(SourceGeneration{SourceID: "tail", Generation: 1, Agent: "codex", SourceRef: "opaque", State: SourceActive, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnqueueIngestionWork(EnqueueWork{SourceID: "tail", Generation: 1, Class: WorkLive, TargetOffset: 20, Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := s.AcquireSchedulerLease("owner", now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimNextIngestionWork(lease.OwnerID, lease.FencingToken, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CommitIngestionSlice(SliceCommit{SourceID: "tail", Generation: 1, ExpectedOffset: 0, NextOffset: 10,
+		ParserStateVersion: 1, ParserState: []byte(`{"t":0}`), VisibilityWatermark: 1,
+		LeaseOwner: lease.OwnerID, FencingToken: lease.FencingToken, Now: now, AwaitingAppend: true}, nil); err != nil {
+		t.Fatal(err)
+	}
+	health := s.IngestionHealthAt(now.Add(time.Hour))
+	if health.State != HealthHealthy || health.LiveQueueDepth != 0 || health.OldestLiveLagMS != 0 || len(health.Violations) != 0 {
+		t.Fatalf("waiting append degraded runnable health: %+v", health)
+	}
+	if health.Consumer.Completeness != ConsumerIncomplete || health.Consumer.LivePending != 1 {
+		t.Fatalf("waiting append disappeared from consumer completeness: %+v", health.Consumer)
+	}
+}
