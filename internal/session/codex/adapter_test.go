@@ -1,12 +1,15 @@
 package codex_test
 
 import (
+	"errors"
+	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 
 	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/session/codex"
+	"github.com/hippoom/agbox/internal/session/jsonl"
 )
 
 func testdataPath(t *testing.T, name string) string {
@@ -30,5 +33,85 @@ func TestParseDeltaDetectsCorrection(t *testing.T) {
 	}
 	if result.Corrections[0].Excerpt == "" {
 		t.Fatal("expected redacted excerpt")
+	}
+}
+
+func TestParseDeltaPreservesActionLinkageAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	action := "{\"timestamp\":\"2026-07-15T15:32:30Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"exec\",\"input\":\"npm install\"}}\n"
+	if err := os.WriteFile(path, []byte(action), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	adapter := codex.New()
+	src := session.Source{Agent: "codex", Path: path, Project: "demo", SourceID: "stable-source"}
+	first, err := adapter.ParseDelta(src, session.Cursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Actions) != 1 || len(first.ParserState) == 0 {
+		t.Fatalf("first parse actions/state = %d/%d", len(first.Actions), len(first.ParserState))
+	}
+	correction := "{\"timestamp\":\"2026-07-15T15:32:31Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"use bun\"}}\n"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(correction); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+	second, err := adapter.ParseDelta(src, session.Cursor{LastOffset: first.NewOffset, ParserStateVersion: first.ParserStateVersion, ParserState: first.ParserState})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.BytesRead != int64(len(correction)) {
+		t.Fatalf("bytes read = %d, want appended %d", second.BytesRead, len(correction))
+	}
+	if len(second.Corrections) != 1 || second.Corrections[0].ActionID != first.Actions[0].ID {
+		t.Fatalf("restart linkage lost: first=%+v second=%+v", first.Actions, second.Corrections)
+	}
+
+	atEOF, err := adapter.ParseDelta(src, session.Cursor{LastOffset: second.NewOffset, ParserStateVersion: second.ParserStateVersion, ParserState: second.ParserState})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if atEOF.BytesRead != 0 || len(atEOF.Turns) != 0 {
+		t.Fatalf("EOF parse read/replayed content: %+v", atEOF)
+	}
+}
+
+func TestStableSourceIDMakesResultsPathIndependent(t *testing.T) {
+	data, err := os.ReadFile(testdataPath(t, "sample.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{filepath.Join(t.TempDir(), "a.jsonl"), filepath.Join(t.TempDir(), "b.jsonl")}
+	var ids []string
+	for _, path := range paths {
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		result, err := codex.New().ParseDelta(session.Source{Agent: "codex", Path: path, SourceID: "same-generation"}, session.Cursor{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, result.Corrections[0].ID)
+	}
+	if ids[0] != ids[1] {
+		t.Fatalf("correction IDs vary by path: %v", ids)
+	}
+}
+
+func TestOldEOFBaselineSignalsMissingCorrectionContext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	oldAction := "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"exec\",\"input\":\"npm install\"}}\n"
+	newCorrection := "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"use bun\"}}\n"
+	if err := os.WriteFile(path, []byte(oldAction+newCorrection), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := codex.New().ParseDelta(session.Source{Agent: "codex", Path: path, SourceID: "baseline"}, session.Cursor{LastOffset: int64(len(oldAction))})
+	if !errors.Is(err, jsonl.ErrMissingContext) {
+		t.Fatalf("error = %v, want diagnosable missing-context quarantine signal", err)
 	}
 }

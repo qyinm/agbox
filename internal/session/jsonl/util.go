@@ -3,6 +3,7 @@ package jsonl
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"strings"
 
 	"github.com/hippoom/agbox/internal/privacy"
@@ -32,4 +33,10 @@ func excerpt(s string, n int) string {
 func HashBytes(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+// CheckpointHash is a bounded progress fingerprint. Source generation owns
+// replacement detection, so adapters never re-hash an entire transcript.
+func CheckpointHash(sourceID string, offset int64, parserState []byte) string {
+	return HashBytes([]byte(fmt.Sprintf("%s|%d|%x", sourceID, offset, sha256.Sum256(parserState))))
 }

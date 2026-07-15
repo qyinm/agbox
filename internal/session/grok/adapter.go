@@ -1,7 +1,7 @@
 package grok
 
 import (
-	"io"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -67,15 +67,20 @@ func (a *Adapter) ParseDelta(src session.Source, cur session.Cursor) (session.Pa
 	}
 	defer f.Close()
 
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return session.ParseResult{}, err
+	if cur.ParserStateVersion != 0 && cur.ParserStateVersion != jsonl.ContextStateVersion {
+		return session.ParseResult{}, fmt.Errorf("%w: version %d", jsonl.ErrParserState, cur.ParserStateVersion)
 	}
-	fileHash := jsonl.HashBytes(data)
-	sessionID := jsonl.StableID("ses_", src.Agent, src.Path)
+	identity := src.SourceID
+	if identity == "" {
+		identity = src.Path
+	}
+	sessionID := jsonl.StableID("ses_", src.Agent, identity)
 	now := time.Now()
-
-	acc, newOffset, err := jsonl.ProcessDelta(data, cur.LastOffset, jsonl.GrokHandler{}, jsonl.Meta{
+	state := cur.ParserState
+	if cur.LastOffset > 0 && len(state) == 0 {
+		state = jsonl.MissingContextState()
+	}
+	stream, err := jsonl.ProcessStream(f, cur.LastOffset, state, jsonl.GrokHandler{}, jsonl.Meta{
 		SessionID: sessionID,
 		Agent:     src.Agent,
 		Project:   src.Project,
@@ -84,6 +89,7 @@ func (a *Adapter) ParseDelta(src session.Source, cur session.Cursor) (session.Pa
 	if err != nil {
 		return session.ParseResult{}, err
 	}
+	checkpointHash := jsonl.CheckpointHash(identity, stream.NewOffset, stream.ParserState)
 
 	return session.ParseResult{
 		Session: model.Session{
@@ -91,14 +97,18 @@ func (a *Adapter) ParseDelta(src session.Source, cur session.Cursor) (session.Pa
 			Agent:      src.Agent,
 			Project:    src.Project,
 			SourcePath: src.Path,
-			SourceHash: fileHash,
+			SourceHash: checkpointHash,
 			StartedAt:  now,
 			UpdatedAt:  now,
 		},
-		Turns:       acc.Turns,
-		Actions:     acc.Actions,
-		Corrections: acc.Corrections,
-		NewOffset:   newOffset,
-		NewHash:     fileHash,
+		Turns:              stream.Accum.Turns,
+		Actions:            stream.Accum.Actions,
+		Corrections:        stream.Accum.Corrections,
+		NewOffset:          stream.NewOffset,
+		NewHash:            checkpointHash,
+		ParserStateVersion: stream.ParserStateVersion,
+		ParserState:        stream.ParserState,
+		BytesRead:          stream.BytesRead,
+		Incomplete:         stream.Incomplete,
 	}, nil
 }

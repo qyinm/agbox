@@ -58,18 +58,24 @@ type Source struct {
 }
 
 type Cursor struct {
-	SourcePath string
-	LastOffset int64
-	LastHash   string
+	SourcePath         string
+	LastOffset         int64
+	LastHash           string
+	ParserStateVersion int
+	ParserState        []byte
 }
 
 type ParseResult struct {
-	Session     model.Session
-	Turns       []model.Turn
-	Actions     []model.Action
-	Corrections []model.Correction
-	NewOffset   int64
-	NewHash     string
+	Session            model.Session
+	Turns              []model.Turn
+	Actions            []model.Action
+	Corrections        []model.Correction
+	NewOffset          int64
+	NewHash            string
+	ParserStateVersion int
+	ParserState        []byte
+	BytesRead          int64
+	Incomplete         bool
 }
 
 type Adapter interface {

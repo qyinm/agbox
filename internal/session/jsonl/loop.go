@@ -13,8 +13,9 @@ import (
 
 // Context tracks turn state while scanning a session jsonl file.
 type Context struct {
-	TurnIndex  int
-	LastAction *model.Action
+	TurnIndex         int
+	LastAction        *model.Action
+	RequireLastAction bool
 }
 
 // Accum collects parsed session entities from jsonl deltas.
@@ -81,8 +82,14 @@ func PairCorrection(acc *Accum, meta Meta, turnID, raw string, lastAction *model
 		return
 	}
 	sigHash := hashSignal(normalized)
+	id := stableID("cor_", lastAction.ID, sigHash)
+	for _, existing := range acc.Corrections {
+		if existing.ID == id {
+			return
+		}
+	}
 	acc.Corrections = append(acc.Corrections, model.Correction{
-		ID:         stableID("cor_", lastAction.ID, sigHash),
+		ID:         id,
 		SessionID:  meta.SessionID,
 		TurnID:     turnID,
 		ActionID:   lastAction.ID,
