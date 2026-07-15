@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/hippoom/agbox/internal/history"
 	"github.com/hippoom/agbox/internal/model"
 )
 
@@ -14,7 +15,7 @@ var (
 	ErrSourceIdentityChanged = errors.New("session source identity changed")
 )
 
-const DefaultHistoryWindow = 90 * 24 * time.Hour
+const DefaultHistoryWindow = history.DefaultWindow
 
 type RootClass string
 
@@ -103,4 +104,10 @@ type RootedAdapter interface {
 	Adapter
 	RootSpecs() []RootSpec
 	Runnable() bool
+}
+
+// ConfigurableDiscovery lets the scheduler apply the single persisted history
+// policy without changing the compatibility surface of synthetic adapters.
+type ConfigurableDiscovery interface {
+	DiscoverSourcesWithOptions(DiscoveryOptions) ([]Source, error)
 }

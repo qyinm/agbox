@@ -18,18 +18,26 @@ type Meter struct {
 }
 
 func Build(s *store.Store, candidateID string) (Meter, error) {
+	return BuildAt(s, candidateID, time.Now())
+}
+
+func BuildAt(s *store.Store, candidateID string, now time.Time) (Meter, error) {
 	c, err := s.GetCandidate(candidateID)
 	if err != nil {
 		return Meter{}, err
 	}
-	baseline, applied, window := impactBaseline(s, c)
+	baseline, applied, window := impactBaseline(s, c, now)
 	events, err := s.EventsForCandidate(candidateID)
 	if err != nil {
 		return Meter{}, err
 	}
-	corrections, _ := s.CorrectionsForCandidate(candidateID)
+	corrections, _ := s.CorrectionsForCandidateAt(candidateID, now)
 	after := countAfterBaseline(events, corrections, baseline)
-	before := c.EventCount - after
+	total := c.EventCount
+	if c.SourceKind == model.CandidateSourceCorrection || len(corrections) > 0 {
+		total = len(corrections)
+	}
+	before := total - after
 	if before < 0 {
 		before = 0
 	}
@@ -60,16 +68,16 @@ func Build(s *store.Store, candidateID string) (Meter, error) {
 	}, nil
 }
 
-func impactBaseline(s *store.Store, c model.Candidate) (baseline time.Time, applied bool, window string) {
+func impactBaseline(s *store.Store, c model.Candidate, now time.Time) (baseline time.Time, applied bool, window string) {
 	if c.State == model.CandidateAccepted && !c.ProposedAt.IsZero() {
-		return c.ProposedAt, true, "all-time before acceptance vs after acceptance as of " + time.Now().Format("2006-01-02")
+		return c.ProposedAt, true, "active-window before acceptance vs after acceptance as of " + now.Format("2006-01-02")
 	}
 	exp, err := s.LatestExportForCandidate(c.ID)
 	if err != nil && err != sql.ErrNoRows {
 		return time.Time{}, false, "no applied export yet; impact starts measuring after export"
 	}
 	if err == nil && exp.Status == model.ExportApplied && !exp.AppliedAt.IsZero() {
-		return exp.AppliedAt, true, "all-time before export vs after export as of " + time.Now().Format("2006-01-02")
+		return exp.AppliedAt, true, "active-window before export vs after export as of " + now.Format("2006-01-02")
 	}
 	if c.State == model.CandidateApproved || c.State == model.CandidateExported {
 		return time.Time{}, false, "no applied export yet; impact starts measuring after export"

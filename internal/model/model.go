@@ -28,6 +28,7 @@ const (
 	CandidateApproved      CandidateState = "approved"
 	CandidateRejected      CandidateState = "rejected"
 	CandidateExported      CandidateState = "exported"
+	CandidateInactive      CandidateState = "inactive"
 )
 
 type CandidateSourceKind string

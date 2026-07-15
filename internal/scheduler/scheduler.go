@@ -72,11 +72,21 @@ func (c *Controller) Reconcile(opts ReconcileOptions) (ReconcileResult, error) {
 	}
 	var result ReconcileResult
 	var warnings []error
+	historyWindow, err := c.Store.HistoryWindow()
+	if err != nil {
+		return result, err
+	}
 	for _, adapter := range c.Adapters {
 		if rooted, ok := adapter.(session.RootedAdapter); ok && !rooted.Runnable() {
 			continue
 		}
-		sources, err := adapter.DiscoverSources()
+		var sources []session.Source
+		var err error
+		if configurable, ok := adapter.(session.ConfigurableDiscovery); ok {
+			sources, err = configurable.DiscoverSourcesWithOptions(session.DiscoveryOptions{Agent: adapter.Agent(), Now: opts.Now, HistoryWindow: historyWindow})
+		} else {
+			sources, err = adapter.DiscoverSources()
+		}
 		if err != nil {
 			wrapped := fmt.Errorf("%s discovery: %w", adapter.Agent(), err)
 			if opts.FailFast {
@@ -117,12 +127,10 @@ func (c *Controller) Reconcile(opts ReconcileOptions) (ReconcileResult, error) {
 				class = store.WorkLive
 			}
 			baseline := src.BaselineOffset
-			// Some agents do not encode a trusted timestamp in the path. A
-			// recent active-file mtime is the bounded fallback for 90-day catchup.
-			if src.RootClass == session.RootActive && !src.ModTime.IsZero() && !src.ModTime.Before(opts.Now.Add(-session.DefaultHistoryWindow)) {
-				baseline = 0
-			}
 			if isLive {
+				// A watched append is eligible regardless of source age. Existing
+				// non-zero checkpoints remain intact; a newly created live file
+				// starts at zero rather than being mistaken for old history.
 				baseline = 0
 			}
 			cp, cpErr := c.Store.GetIngestionCheckpoint(src.SourceID, src.Generation)
@@ -133,7 +141,8 @@ func (c *Controller) Reconcile(opts ReconcileOptions) (ReconcileResult, error) {
 				warnings = append(warnings, cpErr)
 				continue
 			}
-			if cp.CommittedOffset == 0 && baseline > 0 {
+			pristineCheckpoint := cp.CommittedOffset == 0 && cp.ParserStateVersion == 0 && len(cp.ParserState) == 0
+			if pristineCheckpoint && !isLive && src.RootClass == session.RootActive && !src.HistoricalEligible {
 				if err := c.Store.InitializeIngestionCheckpoint(src.SourceID, src.Generation, baseline, jsonl.ContextStateVersion, jsonl.MissingContextState(), opts.Now); err != nil {
 					if opts.FailFast {
 						return result, err
@@ -141,6 +150,9 @@ func (c *Controller) Reconcile(opts ReconcileOptions) (ReconcileResult, error) {
 					warnings = append(warnings, err)
 					continue
 				}
+			}
+			if !isLive && !src.HistoricalEligible {
+				continue
 			}
 			receipt := ""
 			if opts.CreateReceipt {

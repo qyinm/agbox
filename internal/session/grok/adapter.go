@@ -40,7 +40,12 @@ func (a *Adapter) RootSpecs() []session.RootSpec {
 }
 
 func (a *Adapter) DiscoverSources() ([]session.Source, error) {
-	sources, err := session.DiscoverRoots(a.RootSpecs(), session.DiscoveryOptions{Agent: a.Agent()})
+	return a.DiscoverSourcesWithOptions(session.DiscoveryOptions{})
+}
+
+func (a *Adapter) DiscoverSourcesWithOptions(opts session.DiscoveryOptions) ([]session.Source, error) {
+	opts.Agent = a.Agent()
+	sources, err := session.DiscoverRoots(a.RootSpecs(), opts)
 	for i := range sources {
 		sources[i].Project = projectFromPath(sources[i].Path)
 	}

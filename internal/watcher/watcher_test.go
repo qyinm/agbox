@@ -10,6 +10,7 @@ import (
 
 	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/session/claude"
+	_ "github.com/hippoom/agbox/internal/session/codex"
 	"github.com/hippoom/agbox/internal/store"
 	"github.com/hippoom/agbox/internal/watcher"
 )
@@ -23,15 +24,25 @@ func claudeSamplePath(t *testing.T) string {
 	return filepath.Join(filepath.Dir(file), "..", "session", "claude", "testdata", "sample.jsonl")
 }
 
+func codexSamplePath(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Join(filepath.Dir(file), "..", "session", "codex", "testdata", "sample.jsonl")
+}
+
 func TestRunIngestsOnStartup(t *testing.T) {
-	sample, err := os.ReadFile(claudeSamplePath(t))
+	sample, err := os.ReadFile(codexSamplePath(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	projectRoot := filepath.Join(home, ".claude", "projects", "demo")
+	now := time.Now().UTC()
+	projectRoot := filepath.Join(home, ".codex", "sessions", now.Format("2006"), now.Format("01"), now.Format("02"))
 	if err := os.MkdirAll(projectRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}

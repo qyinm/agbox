@@ -150,24 +150,7 @@ func (s *Store) ListCorrections() ([]model.Correction, error) {
 }
 
 func (s *Store) CorrectionsForCandidate(candidateID string) ([]model.Correction, error) {
-	rows, err := s.db.Query(`SELECT c.id, c.session_id, c.turn_id, c.action_id, c.hash, c.normalized, c.excerpt, c.agent, c.project, c.created_at
-		FROM corrections c
-		JOIN candidate_corrections cc ON cc.correction_id = c.id
-		WHERE cc.candidate_id = ?
-		ORDER BY c.created_at ASC`, candidateID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []model.Correction
-	for rows.Next() {
-		c, err := scanCorrection(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
+	return s.CorrectionsForCandidateAt(candidateID, time.Now())
 }
 
 func (s *Store) CountCorrections() (int, error) {

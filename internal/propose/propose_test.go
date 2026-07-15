@@ -319,7 +319,14 @@ func TestSelectAndRenderThenMarkProposed(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpsertCandidate(c, nil, []string{"cor_1"}); err != nil {
+	if err := s.InsertCorrection(model.Correction{
+		ID: "cor_2", SessionID: "ses_1", TurnID: "turn_u", ActionID: "act_1",
+		Hash: "h2", Normalized: "use bun not npm", Excerpt: "use bun not npm",
+		Agent: "grok", Project: "agbox", CreatedAt: now.Add(time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertCandidate(c, nil, []string{"cor_1", "cor_2"}); err != nil {
 		t.Fatal(err)
 	}
 

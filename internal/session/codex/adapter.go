@@ -45,7 +45,12 @@ func (a *Adapter) RootSpecs() []session.RootSpec {
 }
 
 func (a *Adapter) DiscoverSources() ([]session.Source, error) {
-	return session.DiscoverRoots(a.RootSpecs(), session.DiscoveryOptions{Agent: a.Agent()})
+	return a.DiscoverSourcesWithOptions(session.DiscoveryOptions{})
+}
+
+func (a *Adapter) DiscoverSourcesWithOptions(opts session.DiscoveryOptions) ([]session.Source, error) {
+	opts.Agent = a.Agent()
+	return session.DiscoverRoots(a.RootSpecs(), opts)
 }
 
 var archiveDatePattern = regexp.MustCompile(`(?:^|[^0-9])(20[0-9]{2})-([01][0-9])-([0-3][0-9])(?:[^0-9]|$)`)

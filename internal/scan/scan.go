@@ -16,10 +16,17 @@ type Result struct {
 }
 
 func Run(s *store.Store, minRepeats int) (Result, error) {
+	return RunAt(s, minRepeats, time.Now())
+}
+
+func RunAt(s *store.Store, minRepeats int, now time.Time) (Result, error) {
 	if minRepeats <= 0 {
 		minRepeats = 2
 	}
-	correctionResult, err := runCorrections(s, minRepeats)
+	if _, err := s.ApplyEvidenceAging(now, minRepeats); err != nil {
+		return Result{}, err
+	}
+	correctionResult, err := runCorrections(s, minRepeats, now)
 	if err != nil {
 		return Result{}, err
 	}
@@ -68,8 +75,8 @@ func runEvents(s *store.Store, minRepeats int) (Result, error) {
 	return result, nil
 }
 
-func runCorrections(s *store.Store, minRepeats int) (Result, error) {
-	corrections, err := s.ListCorrections()
+func runCorrections(s *store.Store, minRepeats int, now time.Time) (Result, error) {
+	corrections, err := s.ListActiveCorrectionsAt(now)
 	if err != nil {
 		return Result{}, err
 	}

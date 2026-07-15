@@ -67,6 +67,13 @@ func migrateV7(db *sql.DB) error {
 		)`,
 		`INSERT INTO consumer_visibility(singleton, watermark, committed_at)
 			VALUES (1, 0, '') ON CONFLICT(singleton) DO NOTHING`,
+		`CREATE TABLE IF NOT EXISTS ingestion_policy (
+			singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+			history_window_seconds INTEGER NOT NULL CHECK(history_window_seconds > 0),
+			updated_at TEXT NOT NULL
+		)`,
+		`INSERT INTO ingestion_policy(singleton, history_window_seconds, updated_at)
+			VALUES (1, 7776000, '') ON CONFLICT(singleton) DO NOTHING`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {

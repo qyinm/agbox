@@ -41,6 +41,13 @@ func MergeOnScan(existing, incoming model.Candidate) MergeResult {
 	if IsFrozen(existing.State) {
 		return MergeResult{State: existing.State, Version: existing.Version}
 	}
+	if existing.State == model.CandidateInactive {
+		version := existing.Version + 1
+		if version <= 0 {
+			version = 1
+		}
+		return MergeResult{State: model.CandidatePending, Version: version}
+	}
 	version := existing.Version + 1
 	if version <= 0 {
 		version = 1

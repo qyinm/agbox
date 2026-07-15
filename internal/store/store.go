@@ -333,6 +333,11 @@ func (s *Store) UpsertCandidate(c model.Candidate, eventIDs, correctionIDs []str
 			return err
 		}
 	}
+	if c.SourceKind == model.CandidateSourceCorrection || correctionIDs != nil {
+		if _, err := tx.Exec(`DELETE FROM candidate_corrections WHERE candidate_id = ?`, c.ID); err != nil {
+			return err
+		}
+	}
 	for _, correctionID := range correctionIDs {
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO candidate_corrections(candidate_id, correction_id) VALUES (?, ?)`, c.ID, correctionID); err != nil {
 			return err
