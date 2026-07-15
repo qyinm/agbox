@@ -16,8 +16,9 @@ import (
 )
 
 type Store struct {
-	db   *sql.DB
-	path string
+	db             *sql.DB
+	path           string
+	resetPerformed bool
 }
 
 const candidateSelectCols = `id, fingerprint, name, description, rule_text, semantic_key, source_kind, state, event_count, project_count, source_count, first_seen, last_seen, confidence, version, updated_at, proposed_at, snoozed_until, skill_path`
@@ -48,16 +49,34 @@ func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
+	unlock, resetPerformed, err := prepareDatabase(path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	db, err := sql.Open("sqlite3", path+"?_busy_timeout=5000&_foreign_keys=on")
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{db: db, path: path}
+	s := &Store{db: db, path: path, resetPerformed: resetPerformed}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+func (s *Store) ResetPerformed() bool {
+	return s != nil && s.resetPerformed
+}
+
+func (s *Store) SchemaGeneration() int {
+	if s == nil || s.db == nil {
+		return 0
+	}
+	var generation int
+	_ = s.db.QueryRow(`SELECT generation FROM agbox_schema WHERE singleton = 1`).Scan(&generation)
+	return generation
 }
 
 func (s *Store) Close() error {
@@ -72,6 +91,27 @@ func (s *Store) Path() string {
 }
 
 func (s *Store) migrate() error {
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS agbox_schema (
+		singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+		generation INTEGER NOT NULL,
+		state TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		ready_at TEXT NOT NULL
+	)`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`INSERT INTO agbox_schema(singleton, generation, state, created_at, ready_at)
+		VALUES (1, ?, 'initializing', ?, '')
+		ON CONFLICT(singleton) DO NOTHING`, CurrentSchemaGeneration, formatTime(time.Now())); err != nil {
+		return err
+	}
+	var generation int
+	if err := s.db.QueryRow(`SELECT generation FROM agbox_schema WHERE singleton = 1`).Scan(&generation); err != nil {
+		return err
+	}
+	if generation != CurrentSchemaGeneration {
+		return fmt.Errorf("%w: generation %d", ErrUnknownDatabase, generation)
+	}
 	stmts := []string{
 		`PRAGMA journal_mode=WAL`,
 		`PRAGMA synchronous=NORMAL`,
@@ -145,7 +185,14 @@ func (s *Store) migrate() error {
 	if err := migrateV5(s.db); err != nil {
 		return err
 	}
-	return migrateV6(s.db)
+	if err := migrateV6(s.db); err != nil {
+		return err
+	}
+	if err := migrateV7(s.db); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`UPDATE agbox_schema SET state = 'ready', ready_at = ? WHERE singleton = 1 AND generation = ?`, formatTime(time.Now()), CurrentSchemaGeneration)
+	return err
 }
 
 func (s *Store) TableExists(name string) bool {
