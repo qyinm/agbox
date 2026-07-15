@@ -4,6 +4,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,7 +16,7 @@ import (
 
 type Adapter struct{}
 
-func New() session.Adapter {
+func New() *Adapter {
 	return &Adapter{}
 }
 
@@ -26,33 +28,44 @@ func (a *Adapter) Agent() string {
 	return "codex"
 }
 
-func (a *Adapter) DiscoverSources() ([]session.Source, error) {
+func (a *Adapter) Runnable() bool { return true }
+
+func (a *Adapter) RootSpecs() []session.RootSpec {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return nil, nil
-	}
-	root := filepath.Join(home, ".codex")
-	info, err := os.Stat(root)
-	if err != nil || !info.IsDir() {
-		return nil, nil
-	}
-
-	var sources []session.Source
-	_ = filepath.Walk(root, func(path string, fi os.FileInfo, walkErr error) error {
-		if walkErr != nil || fi.IsDir() {
-			return nil
-		}
-		if !strings.HasSuffix(strings.ToLower(fi.Name()), ".jsonl") {
-			return nil
-		}
-		sources = append(sources, session.Source{
-			Agent:   "codex",
-			Path:    path,
-			Project: filepath.Base(filepath.Dir(path)),
-		})
 		return nil
-	})
-	return sources, nil
+	}
+	matchJSONL := func(rel string, _ os.DirEntry) bool {
+		return strings.EqualFold(filepath.Ext(rel), ".jsonl")
+	}
+	return []session.RootSpec{
+		{Path: filepath.Join(home, ".codex", "sessions"), Class: session.RootActive, Recursive: true, Match: matchJSONL, SessionTime: session.DatePathSessionTime},
+		{Path: filepath.Join(home, ".codex", "archived_sessions"), Class: session.RootArchive, Recursive: true, Match: matchJSONL, SessionTime: codexArchiveSessionTime},
+	}
+}
+
+func (a *Adapter) DiscoverSources() ([]session.Source, error) {
+	return session.DiscoverRoots(a.RootSpecs(), session.DiscoveryOptions{Agent: a.Agent()})
+}
+
+var archiveDatePattern = regexp.MustCompile(`(?:^|[^0-9])(20[0-9]{2})-([01][0-9])-([0-3][0-9])(?:[^0-9]|$)`)
+
+func codexArchiveSessionTime(relativePath string, _ os.FileInfo) (time.Time, bool) {
+	match := archiveDatePattern.FindStringSubmatch(filepath.Base(relativePath))
+	if len(match) != 4 {
+		return time.Time{}, false
+	}
+	y, errY := strconv.Atoi(match[1])
+	m, errM := strconv.Atoi(match[2])
+	d, errD := strconv.Atoi(match[3])
+	if errY != nil || errM != nil || errD != nil || m < 1 || m > 12 || d < 1 || d > 31 {
+		return time.Time{}, false
+	}
+	parsed := time.Date(y, time.Month(m), d, 0, 0, 0, 0, time.UTC)
+	if parsed.Year() != y || int(parsed.Month()) != m || parsed.Day() != d {
+		return time.Time{}, false
+	}
+	return parsed, true
 }
 
 func (a *Adapter) ParseDelta(src session.Source, cur session.Cursor) (session.ParseResult, error) {

@@ -14,7 +14,7 @@ import (
 
 type Adapter struct{}
 
-func New() session.Adapter {
+func New() *Adapter {
 	return &Adapter{}
 }
 
@@ -26,33 +26,25 @@ func (a *Adapter) Agent() string {
 	return "grok"
 }
 
-func (a *Adapter) DiscoverSources() ([]session.Source, error) {
+func (a *Adapter) Runnable() bool { return true }
+
+func (a *Adapter) RootSpecs() []session.RootSpec {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return nil, nil
-	}
-	root := filepath.Join(home, ".grok", "sessions")
-	info, err := os.Stat(root)
-	if err != nil || !info.IsDir() {
-		return nil, nil
-	}
-
-	var sources []session.Source
-	_ = filepath.Walk(root, func(path string, fi os.FileInfo, walkErr error) error {
-		if walkErr != nil || fi.IsDir() {
-			return nil
-		}
-		if fi.Name() != "chat_history.jsonl" {
-			return nil
-		}
-		sources = append(sources, session.Source{
-			Agent:   "grok",
-			Path:    path,
-			Project: projectFromPath(path),
-		})
 		return nil
-	})
-	return sources, nil
+	}
+	return []session.RootSpec{{
+		Path: filepath.Join(home, ".grok", "sessions"), Class: session.RootActive, Recursive: true,
+		Match: func(_ string, entry os.DirEntry) bool { return entry.Name() == "chat_history.jsonl" },
+	}}
+}
+
+func (a *Adapter) DiscoverSources() ([]session.Source, error) {
+	sources, err := session.DiscoverRoots(a.RootSpecs(), session.DiscoveryOptions{Agent: a.Agent()})
+	for i := range sources {
+		sources[i].Project = projectFromPath(sources[i].Path)
+	}
+	return sources, err
 }
 
 func projectFromPath(path string) string {

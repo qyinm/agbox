@@ -29,3 +29,16 @@ func AgentNames() []string {
 	}
 	return names
 }
+
+func RootSpecsFor(adapter Adapter) []RootSpec {
+	rooted, ok := adapter.(RootedAdapter)
+	if !ok {
+		return nil
+	}
+	return rooted.RootSpecs()
+}
+
+func IsRunnable(adapter Adapter) bool {
+	rooted, ok := adapter.(RootedAdapter)
+	return !ok || rooted.Runnable()
+}

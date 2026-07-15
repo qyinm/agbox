@@ -14,7 +14,7 @@ import (
 
 type Adapter struct{}
 
-func New() session.Adapter {
+func New() *Adapter {
 	return &Adapter{}
 }
 
@@ -26,33 +26,21 @@ func (a *Adapter) Agent() string {
 	return "claude"
 }
 
-func (a *Adapter) DiscoverSources() ([]session.Source, error) {
+func (a *Adapter) Runnable() bool { return true }
+
+func (a *Adapter) RootSpecs() []session.RootSpec {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return nil, nil
-	}
-	root := filepath.Join(home, ".claude", "projects")
-	info, err := os.Stat(root)
-	if err != nil || !info.IsDir() {
-		return nil, nil
-	}
-
-	var sources []session.Source
-	_ = filepath.Walk(root, func(path string, fi os.FileInfo, walkErr error) error {
-		if walkErr != nil || fi.IsDir() {
-			return nil
-		}
-		if !strings.HasSuffix(strings.ToLower(fi.Name()), ".jsonl") {
-			return nil
-		}
-		sources = append(sources, session.Source{
-			Agent:   "claude",
-			Path:    path,
-			Project: filepath.Base(filepath.Dir(path)),
-		})
 		return nil
-	})
-	return sources, nil
+	}
+	return []session.RootSpec{{
+		Path: filepath.Join(home, ".claude", "projects"), Class: session.RootActive, Recursive: true,
+		Match: func(rel string, _ os.DirEntry) bool { return strings.EqualFold(filepath.Ext(rel), ".jsonl") },
+	}}
+}
+
+func (a *Adapter) DiscoverSources() ([]session.Source, error) {
+	return session.DiscoverRoots(a.RootSpecs(), session.DiscoveryOptions{Agent: a.Agent()})
 }
 
 func (a *Adapter) ParseDelta(src session.Source, cur session.Cursor) (session.ParseResult, error) {
