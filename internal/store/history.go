@@ -26,9 +26,11 @@ const (
 )
 
 type ConsumerState struct {
-	Completeness ConsumerCompleteness
-	Pending      int
-	Quarantined  int
+	Completeness   ConsumerCompleteness `json:"completeness"`
+	Pending        int                  `json:"pending"`
+	LivePending    int                  `json:"live_pending"`
+	CatchupPending int                  `json:"catchup_pending"`
+	Quarantined    int                  `json:"quarantined"`
 }
 
 func (s *Store) HistoryWindow() (time.Duration, error) {
@@ -215,8 +217,10 @@ func (s *Store) ConsumerState() (ConsumerState, error) {
 	var state ConsumerState
 	if err := s.db.QueryRow(`SELECT
 		COALESCE(SUM(CASE WHEN state IN ('pending','running','waiting_append') THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN work_class=? AND state IN ('pending','running','waiting_append') THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN work_class IN (?,?) AND state IN ('pending','running','waiting_append') THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN state='quarantined' THEN 1 ELSE 0 END), 0)
-		FROM ingestion_work`).Scan(&state.Pending, &state.Quarantined); err != nil {
+		FROM ingestion_work`, WorkLive, WorkActiveCatchup, WorkArchive).Scan(&state.Pending, &state.LivePending, &state.CatchupPending, &state.Quarantined); err != nil {
 		return ConsumerState{}, err
 	}
 	switch {

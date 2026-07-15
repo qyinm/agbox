@@ -26,6 +26,8 @@ var betaStatePriority = []model.CandidateState{
 	model.CandidateApproved,
 }
 
+var betaConsumerState = func(s *store.Store) (store.ConsumerState, error) { return s.ConsumerState() }
+
 func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("beta", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -62,6 +64,10 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 	if lastSyncErr != nil {
 		return lastSyncErr
 	}
+	consumer, consumerErr := betaConsumerState(s)
+	if consumerErr != nil {
+		return consumerErr
+	}
 
 	fmt.Fprintln(stdout, "agbox beta")
 	fmt.Fprintln(stdout)
@@ -74,6 +80,7 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 	fmt.Fprintf(stdout, "  corrections: %d\n", corrections)
 	fmt.Fprintf(stdout, "  prompt events: %d\n", stats.Events)
 	fmt.Fprintf(stdout, "  recorded workflows: %d\n", stats.Candidates)
+	fmt.Fprintf(stdout, "  result completeness: %s\n", betaCompletenessLabel(consumer))
 	if syncErr != nil {
 		fmt.Fprintf(stdout, "  sync: partial (%s)\n", betaSyncIssue(syncErr))
 	} else if syncResult.IngestSkipped {
@@ -123,6 +130,19 @@ func runBeta(s *store.Store, args []string, stdout io.Writer) error {
 	fmt.Fprintln(stdout)
 	fmt.Fprintln(stdout, "Manage recorded workflows: agbox inbox")
 	return nil
+}
+
+func betaCompletenessLabel(state store.ConsumerState) string {
+	switch {
+	case state.Quarantined > 0:
+		return fmt.Sprintf("quarantined (%d source(s); results incomplete)", state.Quarantined)
+	case state.LivePending > 0:
+		return fmt.Sprintf("pending live (%d source(s))", state.LivePending)
+	case state.CatchupPending > 0:
+		return fmt.Sprintf("incomplete catch-up (%d source(s))", state.CatchupPending)
+	default:
+		return "complete (empty is authoritative)"
+	}
 }
 
 func betaCandidates(s *store.Store, limit int) ([]model.Candidate, error) {

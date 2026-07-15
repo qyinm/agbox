@@ -21,24 +21,25 @@ type Report struct {
 
 func Run(s *store.Store) Report {
 	stats, err := s.Stats()
-	r := Report{OK: err == nil}
+	r := Report{OK: true}
 	if err != nil {
-		r.Lines = append(r.Lines, "store: FAIL "+err.Error())
-		return r
+		r.Lines = append(r.Lines, "store: FAIL read_failed")
+		r.OK = false
+	} else {
+		r.Lines = append(r.Lines, "store: OK available")
+		r.Lines = append(r.Lines, fmt.Sprintf("events: %d", stats.Events))
+		r.Lines = append(r.Lines, fmt.Sprintf("recorded workflows: %d", stats.Candidates))
+		r.Lines = append(r.Lines, fmt.Sprintf("exports: %d", stats.Exports))
 	}
-	r.Lines = append(r.Lines, "store: OK "+stats.Path)
-	r.Lines = append(r.Lines, fmt.Sprintf("events: %d", stats.Events))
 	corrections, err := s.CountCorrections()
 	if err != nil {
-		r.Lines = append(r.Lines, "corrections: FAIL "+err.Error())
+		r.Lines = append(r.Lines, "corrections: FAIL read_failed")
 		r.OK = false
 	} else {
 		r.Lines = append(r.Lines, fmt.Sprintf("corrections: %d", corrections))
 	}
-	r.Lines = append(r.Lines, fmt.Sprintf("recorded workflows: %d", stats.Candidates))
-	r.Lines = append(r.Lines, fmt.Sprintf("exports: %d", stats.Exports))
 	if reconcileResult, err := propose.ReconcileAcceptedSkills(s); err != nil {
-		r.Lines = append(r.Lines, "skills: FAIL "+err.Error())
+		r.Lines = append(r.Lines, "skills: FAIL read_failed")
 		r.OK = false
 	} else if reconcileResult.Accepted > 0 {
 		r.Lines = append(r.Lines, fmt.Sprintf("skills: accepted %d existing skill file(s)", reconcileResult.Accepted))
@@ -59,7 +60,7 @@ func Run(s *store.Store) Report {
 
 	lastSync, err := s.LatestCursorSync()
 	if err != nil {
-		r.Lines = append(r.Lines, "last sync: FAIL "+err.Error())
+		r.Lines = append(r.Lines, "last sync: FAIL read_failed")
 		r.OK = false
 	} else if lastSync.IsZero() {
 		r.Lines = append(r.Lines, "last sync: never")
@@ -67,21 +68,24 @@ func Run(s *store.Store) Report {
 		r.Lines = append(r.Lines, "last sync: "+formatLastSync(lastSync))
 	}
 
+	health := s.IngestionHealth()
+	r.Lines = append(r.Lines, health.PlainLines()...)
+	if health.State == store.HealthDegraded || health.State == store.HealthStalled {
+		r.OK = false
+	}
+
 	for _, adapter := range session.All() {
 		sources, err := adapter.DiscoverSources()
 		line := fmt.Sprintf("source %s: %d paths", adapter.Agent(), len(sources))
 		if err != nil {
-			line += " (" + err.Error() + ")"
+			line += " (discovery_failed)"
 			r.OK = false
 		}
 		r.Lines = append(r.Lines, line)
 	}
 
 	for _, status := range connect.StatusAll() {
-		line := fmt.Sprintf("hook %s: %s (%s)", status.Agent, status.State, status.Path)
-		if status.Detail != "" && status.State != "connected" {
-			line += " — " + status.Detail
-		}
+		line := fmt.Sprintf("hook %s: %s", status.Agent, status.State)
 		if !status.OK {
 			r.OK = false
 		}

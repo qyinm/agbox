@@ -85,9 +85,9 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) error 
 	case "watch":
 		return runWatch()
 	case "status":
-		return withStore(func(s *store.Store) error { return runStatus(s, stdout) })
+		return withStore(func(s *store.Store) error { return runStatus(s, args[1:], stdout) })
 	case "sources":
-		return runSources(stdout)
+		return withStore(func(s *store.Store) error { return runSources(s, args[1:], stdout) })
 	case "sync":
 		return withStore(func(s *store.Store) error { return runSync(s, args[1:], stdout) })
 	case "capture":
@@ -758,8 +758,9 @@ Usage:
   agbox manifest verify
   agbox doctor [--plain]
   agbox repair [--plain]
-  agbox status [--plain]
+  agbox status [--plain] [--json]
   agbox sources [--plain]
+  agbox sources resume <opaque-source-id> --generation N
   agbox sync --once
   agbox telemetry on|off|status
 
@@ -789,15 +790,18 @@ create .agbox/, and ensure .agbox/ is ignored by Git.
 Options:
   --quiet          Suppress status output`,
 	"status": `Usage:
-  agbox status [--plain]
+  agbox status [--plain] [--json]
 
 Open the Status workspace screen in an interactive terminal. Use --plain, pipes,
-or redirected output for the line-oriented watcher, store, sync, and count summary.`,
+or redirected output for the line-oriented watcher, store, sync, and count summary.
+Use --json for the versioned, privacy-safe machine-readable projection.`,
 	"sources": `Usage:
   agbox sources [--plain]
+  agbox sources resume <opaque-source-id> --generation N
 
 Open the Sources workspace screen in an interactive terminal. Use --plain, pipes,
-or redirected output to list discovered session source paths per agent.`,
+or redirected output to list discovered session source paths per agent. Resume a
+quarantined source only with the opaque ID and generation shown by status or doctor.`,
 	"sync": `Usage:
   agbox sync [--once]
 

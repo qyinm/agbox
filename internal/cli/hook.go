@@ -9,6 +9,8 @@ import (
 	"github.com/hippoom/agbox/internal/store"
 )
 
+var replayConsumerState = func(s *store.Store) (store.ConsumerState, error) { return s.ConsumerState() }
+
 func runHook(s *store.Store, args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: agbox hook propose|replay|save|acknowledge <agent>")
@@ -55,6 +57,16 @@ func runHookReplay(s *store.Store, args []string, stdin io.Reader, stdout io.Wri
 		return fmt.Errorf("usage: agbox hook replay <claude|codex|grok>")
 	}
 	agent := args[0]
+	consumer, err := replayConsumerState(s)
+	if err != nil {
+		return err
+	}
+	// Replay is a committed-state consumer. Pending or quarantined ingestion is
+	// represented explicitly by ConsumerState and must not be mistaken for an
+	// authoritative empty match.
+	if consumer.Completeness != store.ConsumerComplete {
+		return nil
+	}
 	hookData, err := io.ReadAll(stdin)
 	if err != nil {
 		return err
