@@ -39,12 +39,20 @@ if (truthyEnv("AGBOX_SKIP_WATCHER")) {
 }
 
 try {
-  execFileSync(executable, ["init", "--quiet"], { stdio: "pipe" });
+  const initOutput = execFileSync(executable, ["init", "--quiet"], {
+    stdio: "pipe",
+    encoding: "utf8",
+  });
+  if (initOutput.trim()) {
+    console.warn(initOutput.trim());
+  }
   if (truthyEnv("AGBOX_SKIP_CONNECT") || truthyEnv("AGBOX_SKIP_HOOKS")) {
     console.log("agbox: watcher installed · managed hooks skipped · telemetry on by default · run `agbox doctor` to verify");
   } else {
     console.log("agbox: watcher initialized · managed workflow hooks attempted · telemetry on by default · Codex users: run /hooks and trust agbox hooks · run `agbox doctor` to verify");
   }
 } catch (err) {
-  console.error("agbox: watcher install failed — run `agbox init` manually");
+  const detail = String(err.stderr || err.stdout || err.message || "").trim();
+  console.error(`agbox: watcher install failed${detail ? ` — ${detail}` : ""} — run \`agbox init\` manually`);
+  process.exitCode = 1;
 }

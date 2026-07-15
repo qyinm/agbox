@@ -5,12 +5,9 @@ import (
 	"io"
 	"os"
 
-	"github.com/hippoom/agbox/internal/pipeline"
 	"github.com/hippoom/agbox/internal/propose"
 	"github.com/hippoom/agbox/internal/store"
 )
-
-var syncBestEffortIfStale = pipeline.SyncBestEffortIfStale
 
 func runHook(s *store.Store, args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) == 0 {
@@ -38,13 +35,6 @@ func runHookPropose(s *store.Store, args []string, stdin io.Reader, stdout io.Wr
 	hookData, err := io.ReadAll(stdin)
 	if err != nil {
 		return err
-	}
-	syncResult, err := syncBestEffortIfStale(s)
-	if err != nil {
-		return err
-	}
-	if syncResult.Warning != nil {
-		fmt.Fprintf(os.Stderr, "agbox: warning: partial sync before proposal: %s\n", syncResult.Warning)
 	}
 	project := propose.ProjectFromHook(hookData)
 	if project == "" {
@@ -74,11 +64,19 @@ func runHookReplay(s *store.Store, args []string, stdin io.Reader, stdout io.Wri
 		project = defaultProject()
 	}
 	prompt := propose.PromptFromHook(hookData)
+	consumer, err := s.ConsumerStateFor(agent, project)
+	if err != nil {
+		return err
+	}
 	candidateID, payload, err := propose.SelectAndRenderForPrompt(s, agent, project, prompt)
 	if err != nil {
 		return err
 	}
 	if payload == "" {
+		if consumer.Completeness != store.ConsumerComplete {
+			fmt.Fprintf(stdout, "[agbox replay incomplete: state=%s live=%d catchup=%d quarantined=%d]\n",
+				consumer.Completeness, consumer.LivePending, consumer.CatchupPending, consumer.Quarantined)
+		}
 		return nil
 	}
 	return propose.DeliverProposed(s, candidateID, payload, stdout, os.Stderr)
@@ -92,13 +90,6 @@ func runHookSave(s *store.Store, args []string, stdin io.Reader, stdout io.Write
 	hookData, err := io.ReadAll(stdin)
 	if err != nil {
 		return err
-	}
-	syncResult, err := syncBestEffortIfStale(s)
-	if err != nil {
-		return err
-	}
-	if syncResult.Warning != nil {
-		fmt.Fprintf(os.Stderr, "agbox: warning: partial sync before save prompt: %s\n", syncResult.Warning)
 	}
 	project := propose.ProjectFromHook(hookData)
 	if project == "" {

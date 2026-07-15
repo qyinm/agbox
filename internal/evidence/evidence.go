@@ -3,6 +3,7 @@ package evidence
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"sort"
 
@@ -11,22 +12,46 @@ import (
 )
 
 func Build(s *store.Store, candidateID string) (model.EvidenceCard, error) {
+	return BuildAt(s, candidateID, time.Now())
+}
+
+func BuildAt(s *store.Store, candidateID string, now time.Time) (model.EvidenceCard, error) {
 	c, err := s.GetCandidate(candidateID)
 	if err != nil {
 		return model.EvidenceCard{}, err
 	}
 
-	corrections, err := s.CorrectionsForCandidate(candidateID)
+	corrections, err := s.CorrectionsForCandidateAt(candidateID, now)
 	if err != nil {
 		return model.EvidenceCard{}, err
 	}
-	if c.SourceKind == model.CandidateSourceCorrection && len(corrections) > 0 {
-		return buildFromCorrections(s, c, corrections)
-	}
-	if c.SourceKind == "" && len(corrections) > 0 {
-		return buildFromCorrections(s, c, corrections)
+	if (c.SourceKind == model.CandidateSourceCorrection || c.SourceKind == "") && len(corrections) > 0 {
+		return buildFromCorrections(s, currentCorrectionCandidate(c, corrections), corrections)
 	}
 	return buildFromEvents(s, c, candidateID)
+}
+
+func currentCorrectionCandidate(candidate model.Candidate, corrections []model.Correction) model.Candidate {
+	projects := make(map[string]struct{})
+	sources := make(map[string]struct{})
+	for _, correction := range corrections {
+		projects[correction.Project] = struct{}{}
+		sources[correction.Agent] = struct{}{}
+	}
+	candidate.EventCount = len(corrections)
+	candidate.ProjectCount = len(projects)
+	candidate.SourceCount = len(sources)
+	switch {
+	case len(corrections) < 2:
+		candidate.Confidence = "insufficient"
+	case len(corrections) >= 5 || len(projects) >= 2:
+		candidate.Confidence = "high"
+	case len(corrections) >= 3:
+		candidate.Confidence = "medium"
+	default:
+		candidate.Confidence = "low"
+	}
+	return candidate
 }
 
 func buildFromCorrections(s *store.Store, c model.Candidate, corrections []model.Correction) (model.EvidenceCard, error) {

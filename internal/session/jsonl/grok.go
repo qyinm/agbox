@@ -12,6 +12,85 @@ import (
 // GrokHandler parses Grok chat_history.jsonl records.
 type GrokHandler struct{}
 
+func (GrokHandler) CapturePaths() CapturePaths {
+	return CapturePaths{
+		"timestamp":              MaxMetadataBytes,
+		"type":                   MaxMetadataBytes,
+		"content":                privacy.MaxSignalBytes,
+		"content.*.type":         MaxMetadataBytes,
+		"content.*.text":         privacy.MaxSignalBytes,
+		"tool_calls.*.name":      MaxMetadataBytes,
+		"tool_calls.*.arguments": privacy.MaxSignalBytes,
+	}
+}
+
+func (GrokHandler) ProcessRecord(record Record, ctx *Context, acc *Accum, meta Meta) error {
+	createdAt := recordTime(record.First("timestamp"), meta.Now)
+	switch record.First("type") {
+	case "assistant":
+		for _, nameValue := range record.All("tool_calls.*.name") {
+			if len(nameValue.Indexes) == 0 {
+				continue
+			}
+			index := nameValue.Indexes[0]
+			argumentsValue, _ := record.Captured("tool_calls.*.arguments", index)
+			if argumentsValue.Oversized {
+				return ErrSignalTooLarge
+			}
+			arguments := argumentsValue.Value
+			ctx.TurnIndex++
+			turn := model.Turn{ID: stableID("turn_", meta.SessionID, fmt.Sprint(record.Offset), fmt.Sprint(index)), SessionID: meta.SessionID,
+				TurnIndex: ctx.TurnIndex, Role: "agent", EventType: "tool", CreatedAt: createdAt}
+			command, filePath := extractGrokToolInput(nameValue.Value, arguments)
+			redacted := privacy.Redact(command)
+			if redacted == "" && filePath != "" {
+				redacted = filePath
+			}
+			action := model.Action{ID: stableID("act_", turn.ID, nameValue.Value, command, filePath), TurnID: turn.ID,
+				ToolName: nameValue.Value, Command: redacted, FilePath: filePath, Excerpt: privacy.Excerpt(redacted, 240)}
+			if acc != nil {
+				acc.Turns = append(acc.Turns, turn)
+				acc.Actions = append(acc.Actions, action)
+			}
+			ctx.LastAction = &action
+			ctx.RequireLastAction = false
+		}
+	case "user":
+		content, _ := record.Captured("content")
+		if content.Oversized {
+			return ErrSignalTooLarge
+		}
+		text := content.Value
+		if text == "" {
+			var parts []string
+			for _, blockType := range record.All("content.*.type") {
+				if blockType.Value == "text" && len(blockType.Indexes) > 0 {
+					textValue, _ := record.Captured("content.*.text", blockType.Indexes[0])
+					if textValue.Oversized {
+						return ErrSignalTooLarge
+					}
+					parts = append(parts, textValue.Value)
+				}
+			}
+			text = strings.Join(parts, "\n")
+		}
+		if strings.TrimSpace(text) == "" {
+			return nil
+		}
+		if ctx.LastAction == nil && ctx.RequireLastAction {
+			return ErrMissingContext
+		}
+		ctx.TurnIndex++
+		turn := model.Turn{ID: stableID("turn_", meta.SessionID, fmt.Sprint(record.Offset)), SessionID: meta.SessionID,
+			TurnIndex: ctx.TurnIndex, Role: "user", EventType: "message", CreatedAt: createdAt}
+		if acc != nil {
+			acc.Turns = append(acc.Turns, turn)
+			PairCorrection(acc, meta, turn.ID, text, ctx.LastAction, createdAt)
+		}
+	}
+	return nil
+}
+
 func (GrokHandler) ApplyContext(line string, ctx *Context) {
 	applyGrokLine(line, ctx, nil, Meta{SessionID: "ctx"})
 }
@@ -100,7 +179,7 @@ func applyGrokLine(line string, ctx *Context, acc *Accum, meta Meta) {
 		}
 		if acc != nil {
 			acc.Turns = append(acc.Turns, turn)
-			PairCorrection(acc, meta, turn.ID, text, ctx.LastAction)
+			PairCorrection(acc, meta, turn.ID, text, ctx.LastAction, meta.Now)
 		}
 	}
 }

@@ -47,6 +47,9 @@ func runInit(args []string, stdout io.Writer) error {
 		return err
 	}
 	defer s.Close()
+	if s.ResetPerformed() {
+		fmt.Fprintln(stdout, "agbox: local history was permanently reset for the bounded-ingestion upgrade; no backup was created")
+	}
 	if err := os.MkdirAll(".agbox", 0o755); err != nil {
 		return err
 	}

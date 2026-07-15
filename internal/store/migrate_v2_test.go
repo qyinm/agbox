@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -58,7 +59,7 @@ func TestCandidateSourceKindDefaultsToPromptPattern(t *testing.T) {
 	}
 }
 
-func TestMigrateV6CreatesReplayApplicationsForLegacyDatabase(t *testing.T) {
+func TestOpenRejectsIncompleteLegacyDatabase(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "legacy.db")
 	db, err := sql.Open("sqlite3", path)
@@ -96,23 +97,8 @@ func TestMigrateV6CreatesReplayApplicationsForLegacyDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s, err := store.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	if !s.TableExists("replay_applications") {
-		t.Fatal("replay_applications table not created")
-	}
-	got, err := s.GetCandidate("cand_legacy123")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.State != model.CandidatePending {
-		t.Fatalf("state = %s, want pending", got.State)
-	}
-	if got.SourceKind != model.CandidateSourcePromptPattern {
-		t.Fatalf("source kind = %s, want prompt_pattern", got.SourceKind)
+	if _, err := store.Open(path); !errors.Is(err, store.ErrUnknownDatabase) {
+		t.Fatalf("Open error = %v, want ErrUnknownDatabase", err)
 	}
 }
 

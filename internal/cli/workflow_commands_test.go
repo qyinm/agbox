@@ -2,14 +2,13 @@ package cli
 
 import (
 	"bytes"
-	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/hippoom/agbox/internal/model"
-	"github.com/hippoom/agbox/internal/pipeline"
 	"github.com/hippoom/agbox/internal/store"
 )
 
@@ -362,14 +361,6 @@ func TestHookReplayDoesNotRunStaleSync(t *testing.T) {
 	t.Setenv("HOME", root)
 	t.Setenv("AGBOX_DB", filepath.Join(root, "agbox.db"))
 
-	oldSyncBestEffortIfStale := syncBestEffortIfStale
-	t.Cleanup(func() {
-		syncBestEffortIfStale = oldSyncBestEffortIfStale
-	})
-	syncBestEffortIfStale = func(*store.Store) (pipeline.BestEffortSyncResult, error) {
-		return pipeline.BestEffortSyncResult{}, errors.New("unexpected sync from replay hook")
-	}
-
 	s, err := store.Open(filepath.Join(root, "agbox.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -396,6 +387,43 @@ func TestHookReplayDoesNotRunStaleSync(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), c.ID) {
 		t.Fatalf("replay output missing candidate id %s:\n%s", c.ID, out.String())
+	}
+}
+
+func TestPromptHooksReadCommittedStateWithoutIngestingSessions(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	dbPath := filepath.Join(root, "agbox.db")
+	t.Setenv("AGBOX_DB", dbPath)
+	sample, err := os.ReadFile(filepath.Join("..", "session", "claude", "testdata", "sample.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceDir := filepath.Join(root, ".claude", "projects", "demo")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "session.jsonl"), sample, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, command := range []string{"propose", "save"} {
+		var out bytes.Buffer
+		if err := Execute([]string{"hook", command, "claude"}, strings.NewReader(`{"cwd":"demo"}`), &out, &bytes.Buffer{}); err != nil {
+			t.Fatalf("hook %s: %v", command, err)
+		}
+	}
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	count, err := s.CountCorrections()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("prompt hooks ingested %d corrections, want committed-state read only", count)
 	}
 }
 

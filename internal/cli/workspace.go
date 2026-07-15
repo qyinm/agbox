@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -21,6 +22,10 @@ var (
 
 func maybeRunWorkspace(args []string, stdin io.Reader, stdout io.Writer) (bool, error) {
 	if !interactiveTerminalHook(stdin) || !interactiveTerminalHook(stdout) {
+		return false, nil
+	}
+	if (len(args) > 0 && args[0] == "status" && slices.Contains(args[1:], "--json")) ||
+		(len(args) > 1 && args[0] == "sources" && args[1] == "resume") {
 		return false, nil
 	}
 	if len(args) > 0 {

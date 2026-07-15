@@ -34,6 +34,9 @@ func SelectAndRender(s *store.Store, agent, project string) (candidateID, payloa
 	}
 	var eligible []model.Candidate
 	for _, c := range candidates {
+		if !hasCurrentEvidence(s, c, time.Now()) {
+			continue
+		}
 		if project != "" && !candidateMatchesProject(s, c.ID, project) {
 			continue
 		}
@@ -42,16 +45,7 @@ func SelectAndRender(s *store.Store, agent, project string) (candidateID, payloa
 	if len(eligible) == 0 {
 		return "", "", nil
 	}
-	sort.Slice(eligible, func(i, j int) bool {
-		ri, rj := confidenceRank(eligible[i]), confidenceRank(eligible[j])
-		if ri != rj {
-			return ri > rj
-		}
-		if eligible[i].EventCount != eligible[j].EventCount {
-			return eligible[i].EventCount > eligible[j].EventCount
-		}
-		return eligible[i].LastSeen.After(eligible[j].LastSeen)
-	})
+	sortCandidatesForProposal(eligible)
 	top := eligible[0]
 	card, err := evidence.Build(s, top.ID)
 	if err != nil {
@@ -142,6 +136,9 @@ func SelectForSaveForFuture(s *store.Store, project string) (model.Candidate, er
 	var eligible []model.Candidate
 	appliedAt := map[string]time.Time{}
 	for _, c := range candidates {
+		if !hasCurrentEvidence(s, c, time.Now()) {
+			continue
+		}
 		if project != "" && !candidateMatchesProject(s, c.ID, project) {
 			continue
 		}
@@ -292,6 +289,14 @@ func candidateMatchesProject(s *store.Store, candidateID, project string) bool {
 		return false
 	}
 	return true
+}
+
+func hasCurrentEvidence(s *store.Store, candidate model.Candidate, now time.Time) bool {
+	if candidate.SourceKind != model.CandidateSourceCorrection {
+		return true
+	}
+	count, err := s.ActiveCorrectionCount(candidate.ID, now)
+	return err == nil && count >= 2
 }
 
 func sortCandidatesForProposal(candidates []model.Candidate) {

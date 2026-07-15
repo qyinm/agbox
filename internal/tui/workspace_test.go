@@ -155,6 +155,9 @@ func TestWorkspaceModelRendersStatusScreen(t *testing.T) {
 		"recorded workflows: 0",
 		"events: 0",
 		"exports: 0",
+		"ingestion: healthy",
+		"queue live: 0",
+		"history window: 90d",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("status screen missing %q:\n%s", want, got)

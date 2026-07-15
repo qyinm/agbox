@@ -2,14 +2,18 @@ package watcher_test
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
 
+	_ "github.com/mattn/go-sqlite3"
+
 	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/session/claude"
+	_ "github.com/hippoom/agbox/internal/session/codex"
 	"github.com/hippoom/agbox/internal/store"
 	"github.com/hippoom/agbox/internal/watcher"
 )
@@ -23,15 +27,25 @@ func claudeSamplePath(t *testing.T) string {
 	return filepath.Join(filepath.Dir(file), "..", "session", "claude", "testdata", "sample.jsonl")
 }
 
+func codexSamplePath(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Join(filepath.Dir(file), "..", "session", "codex", "testdata", "sample.jsonl")
+}
+
 func TestRunIngestsOnStartup(t *testing.T) {
-	sample, err := os.ReadFile(claudeSamplePath(t))
+	sample, err := os.ReadFile(codexSamplePath(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	projectRoot := filepath.Join(home, ".claude", "projects", "demo")
+	now := time.Now().UTC()
+	projectRoot := filepath.Join(home, ".codex", "sessions", now.Format("2006"), now.Format("01"), now.Format("02"))
 	if err := os.MkdirAll(projectRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -111,11 +125,16 @@ func TestRunIngestsOnFileChange(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	ready := make(chan struct{})
 	go func() {
-		_ = watcher.Run(ctx, s, 200*time.Millisecond)
+		_ = watcher.RunWithReady(ctx, s, 200*time.Millisecond, ready)
 	}()
 
-	time.Sleep(300 * time.Millisecond)
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watcher readiness barrier did not close")
+	}
 	if err := os.WriteFile(srcPath, sample, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -164,5 +183,37 @@ func TestRunTargetedIngestUsesAdapter(t *testing.T) {
 	}
 	if count == 0 {
 		t.Fatal("expected targeted ingest to store corrections")
+	}
+}
+
+func TestReadinessRemainsClosedWhenInitialReconciliationFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dbPath := filepath.Join(home, "agbox.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	db, err := sql.Open("sqlite3", dbPath+"?_busy_timeout=5000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP TABLE ingestion_policy`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan struct{})
+	err = watcher.RunWithReady(context.Background(), s, time.Hour, ready)
+	if err == nil {
+		t.Fatal("watcher reported success after the startup barrier failed")
+	}
+	select {
+	case <-ready:
+		t.Fatal("readiness closed despite failed initial reconciliation")
+	default:
 	}
 }

@@ -301,7 +301,7 @@ func (m WorkspaceModel) renderStatus() string {
 	if m.snapshot.statsErr != nil {
 		fmt.Fprintf(&b, "%s\n", kv("store", "FAIL "+m.snapshot.statsErr.Error()))
 	} else {
-		fmt.Fprintf(&b, "%s\n", kv("store", m.snapshot.storePath))
+		fmt.Fprintf(&b, "%s\n", kv("store", "available"))
 	}
 	if m.snapshot.correctionsErr != nil {
 		fmt.Fprintf(&b, "%s\n", kv("corrections", "FAIL "+m.snapshot.correctionsErr.Error()))
@@ -318,6 +318,11 @@ func (m WorkspaceModel) renderStatus() string {
 	if m.snapshot.statsErr == nil {
 		fmt.Fprintf(&b, "%s\n", kv("events", fmt.Sprintf("%d", m.snapshot.stats.Events)))
 		fmt.Fprintf(&b, "%s\n", kv("exports", fmt.Sprintf("%d", m.snapshot.stats.Exports)))
+	}
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, labelStyle.Render("Ingestion"))
+	for _, line := range m.snapshot.ingestionHealth.PlainLines() {
+		fmt.Fprintln(&b, bodyStyle.Render("  "+line))
 	}
 	return b.String()
 }
@@ -490,11 +495,11 @@ func (m *WorkspaceModel) refreshSnapshotWithSources(loadSources bool) {
 	if err != nil {
 		snapshot.statsErr = err
 	} else {
-		snapshot.storePath = stats.Path
 		snapshot.stats = storeStats{Events: stats.Events, Candidates: stats.Candidates, Exports: stats.Exports}
 	}
 	snapshot.corrections, snapshot.correctionsErr = m.opts.Store.CountCorrections()
 	snapshot.lastSync, snapshot.lastSyncErr = m.opts.Store.LatestCursorSync()
+	snapshot.ingestionHealth = m.opts.Store.IngestionHealth()
 	if m.active == WorkspaceRepair {
 		snapshot.repairReport = doctor.Run(m.opts.Store)
 	}
@@ -559,7 +564,6 @@ type workspaceSnapshot struct {
 	sources            []workspaceSource
 	sourceSummary      string
 	storeAvailable     bool
-	storePath          string
 	stats              storeStats
 	statsErr           error
 	corrections        int
@@ -572,6 +576,7 @@ type workspaceSnapshot struct {
 	workflowErr        error
 	evidenceCard       *model.EvidenceCard
 	evidenceErr        error
+	ingestionHealth    store.IngestionHealth
 }
 
 func (m WorkspaceModel) renderHelp() string {

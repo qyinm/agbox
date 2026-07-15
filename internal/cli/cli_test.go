@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -135,6 +136,44 @@ func TestInitCanSkipManagedHooks(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, ".claude", "settings.json")); !os.IsNotExist(err) {
 		t.Fatalf("managed hooks were written despite AGBOX_SKIP_CONNECT=1: %v", err)
+	}
+}
+
+func TestHookReplayReportsOnlyRelevantIncompleteIngestion(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "agbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().UTC()
+	for _, source := range []store.SourceGeneration{
+		{SourceID: "other", Generation: 1, Agent: "codex", Project: "other-project", SourceRef: "opaque:other", State: store.SourceActive, CreatedAt: now},
+		{SourceID: "demo", Generation: 1, Agent: "codex", Project: "demo", SourceRef: "opaque:demo", State: store.SourceActive, CreatedAt: now},
+	} {
+		if err := s.UpsertSourceGeneration(source); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.EnqueueIngestionWork(store.EnqueueWork{SourceID: "other", Generation: 1, Class: store.WorkActiveCatchup, TargetOffset: 10, Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	input := strings.NewReader(`{"cwd":"/tmp/demo","prompt":"unrelated prompt"}`)
+	var out bytes.Buffer
+	if err := runHookReplay(s, []string{"codex"}, input, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("unrelated backlog affected replay: %q", out.String())
+	}
+	if _, err := s.EnqueueIngestionWork(store.EnqueueWork{SourceID: "demo", Generation: 1, Class: store.WorkLive, TargetOffset: 10, Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := runHookReplay(s, []string{"codex"}, strings.NewReader(`{"cwd":"/tmp/demo","prompt":"unrelated prompt"}`), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "[agbox replay incomplete: state=incomplete live=1 catchup=0 quarantined=0]") {
+		t.Fatalf("missing bounded replay completeness marker: %q", out.String())
 	}
 }
 
@@ -602,6 +641,101 @@ func TestStatusFreshHomeShowsZeroCounts(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("status output missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestStatusJSONUsesPrivacySafeHealthProjection(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "agbox.db")
+	t.Setenv("HOME", root)
+	t.Setenv("AGBOX_DB", dbPath)
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	secretPath := "/Users/alice/customer-x/raw-prompt.jsonl"
+	if err := s.UpsertSourceGeneration(store.SourceGeneration{SourceID: secretPath, Generation: 4, Agent: "codex", SourceRef: secretPath, State: store.SourceActive, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnqueueIngestionWork(store.EnqueueWork{SourceID: secretPath, Generation: 4, Class: store.WorkLive, TargetOffset: 10, Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := s.AcquireSchedulerLease("owner", now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.QuarantineSource(store.QuarantineRequest{SourceID: secretPath, Generation: 4, ExpectedOffset: 0, FailureClass: "parse_error", LeaseOwner: lease.OwnerID, FencingToken: lease.FencingToken, Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	err = Execute([]string{"status", "--json"}, strings.NewReader(""), &out, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "degraded") {
+		t.Fatalf("degraded status error = %v", err)
+	}
+	var payload struct {
+		Version   int                   `json:"version"`
+		Ingestion store.IngestionHealth `json:"ingestion"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("status JSON invalid: %v\n%s", err, out.String())
+	}
+	if payload.Version != 1 || payload.Ingestion.State != store.HealthDegraded || len(payload.Ingestion.Quarantines) != 1 {
+		t.Fatalf("status JSON = %+v", payload)
+	}
+	for _, secret := range []string{"customer-x", "raw-prompt", secretPath, dbPath} {
+		if strings.Contains(out.String(), secret) {
+			t.Fatalf("status JSON leaked %q: %s", secret, out.String())
+		}
+	}
+}
+
+func TestSourcesResumeUsesOpaqueIDAndGeneration(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "agbox.db")
+	t.Setenv("AGBOX_DB", dbPath)
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := s.UpsertSourceGeneration(store.SourceGeneration{SourceID: "internal-key", Generation: 2, Agent: "codex", SourceRef: "/not/printed", State: store.SourceActive, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnqueueIngestionWork(store.EnqueueWork{SourceID: "internal-key", Generation: 2, Class: store.WorkLive, TargetOffset: 10, Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := s.AcquireSchedulerLease("owner", now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.QuarantineSource(store.QuarantineRequest{SourceID: "internal-key", Generation: 2, ExpectedOffset: 0, FailureClass: "parse_error", LeaseOwner: lease.OwnerID, FencingToken: lease.FencingToken, Now: now}); err != nil {
+		t.Fatal(err)
+	}
+	opaque := s.IngestionHealth().Quarantines[0].SourceID
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := Execute([]string{"sources", "resume", opaque, "--generation", "2"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); !strings.Contains(got, opaque) || strings.Contains(got, "internal-key") || strings.Contains(got, "/not/printed") {
+		t.Fatalf("resume output = %q", got)
+	}
+	s, err = store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	work, err := s.GetIngestionWork("internal-key", 2)
+	if err != nil || work.State != store.WorkPending {
+		t.Fatalf("resumed work = %+v, %v", work, err)
 	}
 }
 

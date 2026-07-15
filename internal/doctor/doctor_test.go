@@ -32,6 +32,8 @@ func TestRunReportsStoreWatcherAndSources(t *testing.T) {
 		"telemetry: on (not configured",
 		"watcher:",
 		"last sync: never",
+		"ingestion: healthy",
+		"queue live: 0",
 		"source claude:",
 	} {
 		if !reportContains(report, needle) {

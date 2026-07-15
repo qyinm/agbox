@@ -94,7 +94,15 @@ func (s *Store) GetCursor(sourcePath string) (CursorRow, error) {
 }
 
 func (s *Store) UpsertCursor(row CursorRow) error {
-	_, err := s.db.Exec(`INSERT INTO source_cursors
+	return upsertCursorTx(s.db, row)
+}
+
+type cursorExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func upsertCursorTx(exec cursorExecer, row CursorRow) error {
+	_, err := exec.Exec(`INSERT INTO source_cursors
 		(source_path, agent, last_offset, last_hash, last_synced_at)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(source_path) DO UPDATE SET
@@ -104,6 +112,23 @@ func (s *Store) UpsertCursor(row CursorRow) error {
 			last_synced_at=excluded.last_synced_at`,
 		row.SourcePath, row.Agent, row.LastOffset, row.LastHash, formatTime(row.LastSyncedAt))
 	return err
+}
+
+// CommitSessionDelta keeps the legacy synthetic/demo ingestion helper atomic.
+// Production discovery and sync use the fenced scheduler commit instead.
+func (s *Store) CommitSessionDelta(parsed ParsedSlice, cursor CursorRow) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := writeParsedEntities(tx, parsed); err != nil {
+		return err
+	}
+	if err := upsertCursorTx(tx, cursor); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) ListCorrections() ([]model.Correction, error) {
@@ -125,24 +150,7 @@ func (s *Store) ListCorrections() ([]model.Correction, error) {
 }
 
 func (s *Store) CorrectionsForCandidate(candidateID string) ([]model.Correction, error) {
-	rows, err := s.db.Query(`SELECT c.id, c.session_id, c.turn_id, c.action_id, c.hash, c.normalized, c.excerpt, c.agent, c.project, c.created_at
-		FROM corrections c
-		JOIN candidate_corrections cc ON cc.correction_id = c.id
-		WHERE cc.candidate_id = ?
-		ORDER BY c.created_at ASC`, candidateID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []model.Correction
-	for rows.Next() {
-		c, err := scanCorrection(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
+	return s.CorrectionsForCandidateAt(candidateID, time.Now())
 }
 
 func (s *Store) CountCorrections() (int, error) {

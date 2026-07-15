@@ -1,20 +1,19 @@
 package codex
 
 import (
-	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
-	"github.com/hippoom/agbox/internal/model"
 	"github.com/hippoom/agbox/internal/session"
 	"github.com/hippoom/agbox/internal/session/jsonl"
 )
 
 type Adapter struct{}
 
-func New() session.Adapter {
+func New() *Adapter {
 	return &Adapter{}
 }
 
@@ -26,74 +25,45 @@ func (a *Adapter) Agent() string {
 	return "codex"
 }
 
-func (a *Adapter) DiscoverSources() ([]session.Source, error) {
+func (a *Adapter) Runnable() bool { return true }
+
+func (a *Adapter) RootSpecs() []session.RootSpec {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return nil, nil
-	}
-	root := filepath.Join(home, ".codex")
-	info, err := os.Stat(root)
-	if err != nil || !info.IsDir() {
-		return nil, nil
-	}
-
-	var sources []session.Source
-	_ = filepath.Walk(root, func(path string, fi os.FileInfo, walkErr error) error {
-		if walkErr != nil || fi.IsDir() {
-			return nil
-		}
-		if !strings.HasSuffix(strings.ToLower(fi.Name()), ".jsonl") {
-			return nil
-		}
-		sources = append(sources, session.Source{
-			Agent:   "codex",
-			Path:    path,
-			Project: filepath.Base(filepath.Dir(path)),
-		})
 		return nil
-	})
-	return sources, nil
+	}
+	matchJSONL := func(rel string, _ os.DirEntry) bool {
+		return strings.EqualFold(filepath.Ext(rel), ".jsonl")
+	}
+	return []session.RootSpec{
+		{Path: filepath.Join(home, ".codex", "sessions"), Class: session.RootActive, Recursive: true, Match: matchJSONL, SessionTime: session.DatePathSessionTime},
+		{Path: filepath.Join(home, ".codex", "archived_sessions"), Class: session.RootArchive, Recursive: true, Match: matchJSONL, SessionTime: codexArchiveSessionTime},
+	}
+}
+
+func (a *Adapter) DiscoverSources() ([]session.Source, error) {
+	return a.DiscoverSourcesWithOptions(session.DiscoveryOptions{})
+}
+
+func (a *Adapter) DiscoverSourcesWithOptions(opts session.DiscoveryOptions) ([]session.Source, error) {
+	opts.Agent = a.Agent()
+	return session.DiscoverRoots(a.RootSpecs(), opts)
+}
+
+var archiveDatePattern = regexp.MustCompile(`(?:^|[^0-9])(20[0-9]{2})-([01][0-9])-([0-3][0-9])(?:[^0-9]|$)`)
+
+func codexArchiveSessionTime(relativePath string, _ os.FileInfo) (time.Time, bool) {
+	match := archiveDatePattern.FindStringSubmatch(filepath.Base(relativePath))
+	if len(match) != 4 {
+		return time.Time{}, false
+	}
+	parsed, err := time.Parse("2006-01-02", strings.Join(match[1:4], "-"))
+	if err != nil {
+		return time.Time{}, false
+	}
+	return parsed, true
 }
 
 func (a *Adapter) ParseDelta(src session.Source, cur session.Cursor) (session.ParseResult, error) {
-	f, err := os.Open(src.Path)
-	if err != nil {
-		return session.ParseResult{}, err
-	}
-	defer f.Close()
-
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return session.ParseResult{}, err
-	}
-	fileHash := jsonl.HashBytes(data)
-	sessionID := jsonl.StableID("ses_", src.Agent, src.Path)
-	now := time.Now()
-
-	acc, newOffset, err := jsonl.ProcessDelta(data, cur.LastOffset, jsonl.AnthropicHandler{}, jsonl.Meta{
-		SessionID: sessionID,
-		Agent:     src.Agent,
-		Project:   src.Project,
-		Now:       now,
-	})
-	if err != nil {
-		return session.ParseResult{}, err
-	}
-
-	return session.ParseResult{
-		Session: model.Session{
-			ID:         sessionID,
-			Agent:      src.Agent,
-			Project:    src.Project,
-			SourcePath: src.Path,
-			SourceHash: fileHash,
-			StartedAt:  now,
-			UpdatedAt:  now,
-		},
-		Turns:       acc.Turns,
-		Actions:     acc.Actions,
-		Corrections: acc.Corrections,
-		NewOffset:   newOffset,
-		NewHash:     fileHash,
-	}, nil
+	return session.ParseNative(src, cur, jsonl.CodexHandler{})
 }

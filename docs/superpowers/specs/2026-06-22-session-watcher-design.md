@@ -17,6 +17,15 @@
 > use through native `SKILL.md` acknowledgement. Replay remains instruction-only:
 > agbox does not re-run prior commands or create persistent skills without
 > explicit approval.
+>
+> 2026-07-16 update: ingestion is now a bounded, durable scheduler rather than
+> direct whole-file sync. Live-root watches are registered before catch-up;
+> live work preempts active-history and archive work; and only trustworthy
+> session dates within the persisted 90-day window enter automatic catch-up.
+> A later append to an older active file remains live work. Cursor remains
+> discovery-only and is reported as unsupported until a native parser and real
+> fixtures are available. This update supersedes the earlier Cursor-ingest and
+> unbounded `ParseDelta` descriptions below.
 
 ---
 
@@ -261,7 +270,7 @@ type Adapter interface {
 
 1. **Claude Code** — parse project jsonl under `~/.claude/projects/`
 2. **Codex** — parse session files under `~/.codex/`
-3. **Cursor** — parse composer/chat logs under Cursor app data; adapter interface first, implementation last due to format instability
+3. **Cursor** — discover known roots only; parsing is disabled until a stable native schema and real fixtures exist
 
 ### Correction Detector
 
@@ -351,6 +360,7 @@ exports:     3
 | `agbox watch` | Internal daemon entry (LaunchAgent target) |
 | `agbox status` | Short status: watcher, last sync, candidate count |
 | `agbox sources` | List discovered session source paths |
+| `agbox sources resume <opaque-id> --generation N` | Retry a quarantined generation from its committed checkpoint |
 | `agbox sync --once` | Debug/recovery: force one ingestion pass |
 | `agbox inbox` | Primary UX: Recorded Workflow cards and replay plans |
 | `agbox review` | Deeper TUI drill-down for evidence, approval, and export |
@@ -363,6 +373,71 @@ exports:     3
 `capture`, `scan`, `discover`, `evidence`, `apply`, `approve`, `reject`, `snooze`, `accept`, `export`, `impact`, `audit`, `doctor`, `demo`, `debug-bundle`, `repair`, `manifest`, `compile`
 
 `capture` remains for manual testing only.
+
+---
+
+## Bounded ingestion contract (2026-07-16)
+
+SQLite owns the scheduler queue, lease heartbeat, fencing token, parser
+continuation state, source-generation checkpoint, receipt, and consumer
+visibility watermark. Watcher, polling, CLI sync, initialization, and recovery
+may enqueue or wait for work, but they do not parse independently. A source
+slice commits normalized entities, checkpoint state, and consumer visibility in
+one transaction. A crash before commit retries the slice; a retry after commit
+is idempotent.
+
+Priority is strict:
+
+```text
+live append -> recent active catch-up -> recent archive catch-up
+```
+
+The watcher readiness barrier is: register active-root watches, reconcile
+metadata, durably enqueue observed work, then report ready. Filesystem event
+storms coalesce to a target offset rather than creating one parse per event.
+Malformed records and relevant values above the privacy bound quarantine only
+their source. `status`, `doctor`, beta/replay completeness, and recovery use one
+versioned health projection with these states:
+
+| State | Meaning |
+|---|---|
+| `healthy` | no pending history and no source fault |
+| `catching_up` | recent-history work remains |
+| `degraded` | a quarantine or service-level violation exists |
+| `stalled` | old live work has no active scheduler owner |
+
+Diagnostics expose opaque source IDs, generation, bounded progress, queue depth,
+and scheduler ownership/progress timestamps. They never include transcript
+bodies or source paths. Resume is generation-guarded:
+
+```bash
+agbox sources resume <opaque-source-id> --generation <N>
+```
+
+Automatic history defaults to 90 days for both active and archive roots. Older
+signals stop contributing to candidates/replay and their active evidence links
+are retired. Existing session files remain the local source of truth.
+
+The schema transition is intentionally destructive. A coordinated, one-time
+generation reset removes a verified legacy database and its WAL/SHM files before
+creating the new schema. There is no backup or rollback for prior agbox results;
+agent-owned session files are not removed.
+
+### Release gates
+
+The supported macOS arm64 build must satisfy:
+
+- idle watcher RSS <= 50 MiB;
+- processing RSS <= 200 MiB, including an 838 MiB source at committed EOF and
+  a 32 MiB irrelevant JSON value;
+- committed EOF handling performs zero content reads;
+- 2,500 sources / 5 GiB logical corpus with 50 visible records per second for
+  60 seconds meets p95 <= 2 seconds and p99 <= 5 seconds while catch-up exists.
+
+`go run ./cmd/agbox-release-gate --profile smoke` is the fast CI signal.
+`--profile release` generates the full logical corpus and 60-second workload.
+Both emit versioned JSON and fail on a contract violation; fixtures are generated
+at runtime and removed afterward.
 
 ---
 
