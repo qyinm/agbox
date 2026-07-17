@@ -65,7 +65,7 @@ These measurements explain how overlapping passes over a multi-gigabyte corpus c
 
 #### Contract mismatch
 
-The approved watcher design in `docs/superpowers/specs/2026-06-22-session-watcher-design.md` promises cursor-based incremental parsing, local source files as the source of truth, no full transcript copies, and bounded redacted excerpts. The current implementation retains the cursor in SQLite but does not use it to bound file I/O or memory. This plan restores that contract and makes it testable.
+The approved watcher design in `docs/specs/2026-06-22-session-watcher-design.md` promises cursor-based incremental parsing, local source files as the source of truth, no full transcript copies, and bounded redacted excerpts. The current implementation retains the cursor in SQLite but does not use it to bound file I/O or memory. This plan restores that contract and makes it testable.
 
 ---
 
@@ -392,7 +392,7 @@ The schema and transaction boundary land first, followed by explicit discovery a
 - **Goal:** Prevent regression to corpus-proportional memory, overlapping ingestion, or unusable latency.
 - **Requirements:** R24-R30, R42-R47, R53-R68
 - **Dependencies:** U1-U7
-- **Files:** benchmark/integration test files, fixture generators, `.github/workflows/npm-publish.yml`, `README.md`, `docs/superpowers/specs/2026-06-22-session-watcher-design.md`, release notes
+- **Files:** benchmark/integration test files, fixture generators, `.github/workflows/npm-publish.yml`, `README.md`, `docs/specs/2026-06-22-session-watcher-design.md`, release notes
 - **Approach:** Generate large JSONL inputs without checking raw large transcripts into git. Measure child-process RSS and end-to-end visibility latency under the reference load. Run crash, restart, rotation, malformed-record, duplicate-event, and preemption scenarios. Update documentation to describe the 90-day automatic history window and destructive reset.
 - **Test scenarios:** reference load meets p95/p99 and RSS gates through `beta`/replay visibility; 838 MiB EOF no-op is bounded; 32 MiB irrelevant record is bounded; multi-process trigger storms preserve one fenced owner; a killed process resumes with no gaps/duplicates; startup-boundary appends are captured once; prompt-submit remains read-only; logs, JSON health, receipts, and bundles remain redacted; quiet initialization still reports the irreversible reset.
 - **Verification:** the performance harness emits machine-readable percentile and peak-RSS results and fails when a contract is exceeded.
@@ -453,7 +453,7 @@ The schema and transaction boundary land first, followed by explicit discovery a
 
 ## Sources and Grounding
 
-- `docs/superpowers/specs/2026-06-22-session-watcher-design.md` defines cursor-based incremental parsing, local source-of-truth behavior, and the no-raw-transcript contract.
+- `docs/specs/2026-06-22-session-watcher-design.md` defines cursor-based incremental parsing, local source-of-truth behavior, and the no-raw-transcript contract.
 - `internal/session/codex/adapter.go`, `internal/session/claude/adapter.go`, and `internal/session/grok/adapter.go` currently read entire files with `io.ReadAll`.
 - `internal/session/jsonl/loop.go` currently begins at byte zero and replays pre-cursor lines for context.
 - `internal/watcher/watcher.go` currently exposes startup, polling, and debounced all-source ingestion paths, including ingestion from a `time.AfterFunc` callback.

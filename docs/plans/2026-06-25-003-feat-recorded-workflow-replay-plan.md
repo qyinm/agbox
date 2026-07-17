@@ -205,7 +205,7 @@ The implementation should extend the existing candidate lifecycle instead of int
 - **Goal:** Align docs, help, and package copy with automatic record plus instruction-only replay.
 - **Requirements:** R1, R2, R3, R7, R9, R10, R12, R13, R14
 - **Dependencies:** U3, U4, U5, U6
-- **Files:** `README.md`, `npm/cli/README.md`, `npm/cli/package.json`, `internal/cli/cli.go`, `internal/cli/cli_test.go`, `docs/superpowers/specs/2026-06-22-session-watcher-design.md`
+- **Files:** `README.md`, `npm/cli/README.md`, `npm/cli/package.json`, `internal/cli/cli.go`, `internal/cli/cli_test.go`, `docs/specs/2026-06-22-session-watcher-design.md`
 - **Approach:** Update quick start and command reference so `agbox inbox` is the workflow-management command, `agbox beta` is setup/onboarding, and replay is described as instruction/context injection. Explicitly state that agbox does not re-run prior commands or write persistent skills without approval. Keep local-first privacy language and managed hook disclosure precise.
 - **Patterns to follow:** Existing README "30-second aha", "How it works", "Features", and command reference sections.
 - **Test scenarios:**

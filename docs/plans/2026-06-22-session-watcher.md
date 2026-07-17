@@ -13,7 +13,7 @@
 
 **Tech Stack:** Go 1.22+, SQLite (mattn/go-sqlite3), Bubble Tea v2, macOS LaunchAgent, Node postinstall script.
 
-**Spec:** `docs/superpowers/specs/2026-06-22-session-watcher-design.md`
+**Spec:** `docs/specs/2026-06-22-session-watcher-design.md`
 
 ---
 
@@ -732,7 +732,7 @@ Task 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 
 
 ## Execution Handoff
 
-Plan complete and saved to `docs/superpowers/plans/2026-06-22-session-watcher.md`.
+Plan complete and saved to `docs/plans/2026-06-22-session-watcher.md`.
 
 **Two execution options:**
 

@@ -195,7 +195,7 @@ flowchart TB
 - **Goal:** Align README, package copy, and internal design notes with the beta behavior that actually ships.
 - **Requirements:** R9
 - **Dependencies:** U1, U4, U5, U6
-- **Files:** `README.md`, `npm/cli/package.json`, `docs/superpowers/specs/2026-06-22-session-watcher-design.md`, `docs/superpowers/plans/2026-06-22-session-watcher.md`
+- **Files:** `README.md`, `npm/cli/package.json`, `docs/specs/2026-06-22-session-watcher-design.md`, `docs/plans/2026-06-22-session-watcher.md`
 - **Approach:** Replace "no hooks" claims with precise language: watcher reads session files; managed hooks only inject skill proposals and acknowledge created skills; project file writes happen through explicit export. Update the quick start to make `agbox beta` the first command after install.
 - **Patterns to follow:** Existing README structure around "30-second aha", "Quick start", and "Privacy & local-first".
 - **Test scenarios:** Test expectation: none for prose-only docs, but every command shown in README should match CLI help and shipped behavior.
@@ -268,8 +268,8 @@ flowchart TB
 
 ## Sources / Research
 
-- `docs/superpowers/specs/2026-06-22-session-watcher-design.md` established the session watcher, causal evidence, local store, and review-first direction.
-- `docs/superpowers/plans/2026-06-22-session-watcher.md` mapped the initial session ingestion implementation.
+- `docs/specs/2026-06-22-session-watcher-design.md` established the session watcher, causal evidence, local store, and review-first direction.
+- `docs/plans/2026-06-22-session-watcher.md` mapped the initial session ingestion implementation.
 - `internal/cli/cli.go` contains the current command surface, including `discover`, `review`, `demo`, `hook`, `export`, and state validation gaps.
 - `internal/propose/injection.go`, `internal/propose/propose.go`, and `internal/propose/acknowledge.go` contain the current in-context proposal loop.
 - `internal/propose/state/state.go` defines the candidate lifecycle and cooldown behavior.
