@@ -143,6 +143,8 @@ impl DecoderState {
 #[derive(Clone)]
 pub struct DecodeContext {
     pub project_id: ProjectId,
+    pub project_root: Option<PathBuf>,
+    pub source_id: String,
     pub observed_at: OffsetDateTime,
     pub source_generation: u64,
     pub format: String,
@@ -153,6 +155,7 @@ impl fmt::Debug for DecodeContext {
         formatter
             .debug_struct("DecodeContext")
             .field("project_id", &self.project_id)
+            .field("source_id_bytes", &self.source_id.len())
             .field("observed_at", &self.observed_at)
             .field("source_generation", &self.source_generation)
             .finish_non_exhaustive()
@@ -527,7 +530,9 @@ pub trait SourceAdapter: Send + Sync {
 
 #[must_use]
 pub fn adapters() -> &'static [&'static dyn SourceAdapter] {
-    &[]
+    static CLAUDE: crate::ClaudeAdapter = crate::ClaudeAdapter;
+    static ADAPTERS: [&dyn SourceAdapter; 1] = [&CLAUDE];
+    &ADAPTERS
 }
 
 fn allowlisted_native_identifier(value: &[u8]) -> bool {

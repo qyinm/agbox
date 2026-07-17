@@ -19,6 +19,30 @@ pub struct CapturedString {
     pub truncated: bool,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) enum CapturedValue {
+    String(CapturedString),
+    Scalar(String),
+}
+
+impl fmt::Debug for CapturedValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::String(value) => formatter.debug_tuple("String").field(value).finish(),
+            Self::Scalar(value) => formatter
+                .debug_struct("Scalar")
+                .field("byte_length", &value.len())
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CapturedMatch {
+    pub array_indices: Vec<usize>,
+    pub value: CapturedValue,
+}
+
 impl fmt::Debug for CapturedString {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -105,6 +129,57 @@ impl<R: Read> BoundedJsonReader<R> {
             .map_err(|_| DecodeError::Malformed("invalid-decoded-scalar".to_owned()))
     }
 
+    /// Captures repeated scalar values at one object path, retaining their
+    /// enclosing array ordinals so callers can correlate sibling projections.
+    pub(crate) fn capture_matches(
+        &mut self,
+        path: &[&str],
+        limit: usize,
+        max_matches: usize,
+    ) -> Result<Vec<CapturedMatch>, DecodeError> {
+        if limit > MAX_CAPTURE_BYTES || max_matches > agbox_core::limits::MAX_EVENTS_PER_RECORD {
+            if !self.parsed {
+                self.parsed = true;
+                if let Err(terminal_error) = self.input.drain_to_terminal() {
+                    return Err(DecodeError::Io(terminal_error));
+                }
+            }
+            return Err(DecodeError::OutputTooLarge);
+        }
+        let outcome = self.parse(path, SelectionMode::Matches { max_matches }, limit)?;
+        Ok(outcome.matches)
+    }
+
+    /// Captures complete selected JSON values as bounded raw JSON prefixes.
+    /// Hash and byte length cover the whole selected value, including
+    /// structured objects or arrays.
+    pub(crate) fn capture_raw_matches(
+        &mut self,
+        path: &[&str],
+        limit: usize,
+        max_matches: usize,
+        max_retained_bytes: usize,
+    ) -> Result<Vec<CapturedMatch>, DecodeError> {
+        if limit > MAX_CAPTURE_BYTES || max_matches > agbox_core::limits::MAX_EVENTS_PER_RECORD {
+            if !self.parsed {
+                self.parsed = true;
+                if let Err(terminal_error) = self.input.drain_to_terminal() {
+                    return Err(DecodeError::Io(terminal_error));
+                }
+            }
+            return Err(DecodeError::OutputTooLarge);
+        }
+        let outcome = self.parse(
+            path,
+            SelectionMode::RawMatches {
+                max_matches,
+                max_retained_bytes,
+            },
+            limit,
+        )?;
+        Ok(outcome.matches)
+    }
+
     #[must_use]
     pub fn schema_fingerprint(&self) -> Option<&str> {
         self.schema_fingerprint.as_deref()
@@ -148,6 +223,17 @@ impl<R: Read> BoundedJsonReader<R> {
             || outcome.scalar.as_ref().map_or(0, Vec::len),
             |value| value.bytes.len(),
         );
+        self.retained_bytes = outcome
+            .matches
+            .iter()
+            .try_fold(self.retained_bytes, |total, captured| {
+                let bytes = match &captured.value {
+                    CapturedValue::String(value) => value.bytes.len(),
+                    CapturedValue::Scalar(value) => value.len(),
+                };
+                total.checked_add(bytes)
+            })
+            .ok_or(DecodeError::OutputTooLarge)?;
         self.schema_fingerprint = Some(outcome.schema_fingerprint.clone());
         Ok(outcome)
     }
@@ -156,6 +242,7 @@ impl<R: Read> BoundedJsonReader<R> {
 struct Input<R: Read> {
     reader: BufReader<R>,
     peeked: Option<u8>,
+    capture: Option<StringAccumulator>,
 }
 
 impl<R: Read> Input<R> {
@@ -163,11 +250,13 @@ impl<R: Read> Input<R> {
         Self {
             reader: BufReader::with_capacity(8 * 1024, reader),
             peeked: None,
+            capture: None,
         }
     }
 
     fn read_byte(&mut self) -> Result<Option<u8>, DecodeError> {
         if let Some(byte) = self.peeked.take() {
+            self.capture_byte(byte)?;
             return Ok(Some(byte));
         }
         let buffer = self.reader.fill_buf()?;
@@ -175,14 +264,42 @@ impl<R: Read> Input<R> {
             return Ok(None);
         };
         self.reader.consume(1);
+        self.capture_byte(byte)?;
         Ok(Some(byte))
     }
 
     fn peek_byte(&mut self) -> Result<Option<u8>, DecodeError> {
         if self.peeked.is_none() {
-            self.peeked = self.read_byte()?;
+            let buffer = self.reader.fill_buf()?;
+            let Some(byte) = buffer.first().copied() else {
+                return Ok(None);
+            };
+            self.reader.consume(1);
+            self.peeked = Some(byte);
         }
         Ok(self.peeked)
+    }
+
+    fn capture_byte(&mut self, byte: u8) -> Result<(), DecodeError> {
+        if let Some(capture) = &mut self.capture {
+            capture.push(&[byte])?;
+        }
+        Ok(())
+    }
+
+    fn start_capture(&mut self, limit: usize) -> Result<(), DecodeError> {
+        if self.capture.is_some() {
+            return Err(DecodeError::Malformed("nested-selection".to_owned()));
+        }
+        self.capture = Some(StringAccumulator::new(limit));
+        Ok(())
+    }
+
+    fn finish_capture(&mut self) -> Result<StringInfo, DecodeError> {
+        self.capture
+            .take()
+            .map(StringAccumulator::finish)
+            .ok_or_else(|| DecodeError::Malformed("missing-selection".to_owned()))
     }
 
     fn required_byte(&mut self) -> Result<u8, DecodeError> {
@@ -222,11 +339,19 @@ impl<R: Read> Input<R> {
 enum SelectionMode {
     String,
     Scalar,
+    Matches {
+        max_matches: usize,
+    },
+    RawMatches {
+        max_matches: usize,
+        max_retained_bytes: usize,
+    },
 }
 
 struct ParseOutcome {
     string: Option<CapturedString>,
     scalar: Option<Vec<u8>>,
+    matches: Vec<CapturedMatch>,
     schema_fingerprint: String,
 }
 
@@ -238,6 +363,8 @@ struct Parser<'a, R: Read> {
     selected: bool,
     string: Option<CapturedString>,
     scalar: Option<Vec<u8>>,
+    matches: Vec<CapturedMatch>,
+    array_indices: Vec<usize>,
     schema: blake3::Hasher,
 }
 
@@ -258,6 +385,8 @@ impl<'a, R: Read> Parser<'a, R> {
             selected: false,
             string: None,
             scalar: None,
+            matches: Vec::new(),
+            array_indices: Vec::new(),
             schema,
         }
     }
@@ -266,6 +395,7 @@ impl<'a, R: Read> Parser<'a, R> {
         ParseOutcome {
             string: self.string,
             scalar: self.scalar,
+            matches: self.matches,
             schema_fingerprint: self.schema.finalize().to_hex().to_string(),
         }
     }
@@ -277,12 +407,81 @@ impl<'a, R: Read> Parser<'a, R> {
     ) -> Result<(), DecodeError> {
         self.input.skip_whitespace()?;
         let matches_selected_path = matching_path_index == Some(self.path.len());
-        if self.selected && matches_selected_path {
+        if self.selected
+            && matches_selected_path
+            && !matches!(self.mode, SelectionMode::Matches { .. })
+        {
             return Err(DecodeError::Malformed(
                 "duplicate-selected-field".to_owned(),
             ));
         }
-        let selected_here = !self.selected && matches_selected_path;
+        let selected_here = matches_selected_path
+            && (!self.selected
+                || matches!(
+                    self.mode,
+                    SelectionMode::Matches { .. } | SelectionMode::RawMatches { .. }
+                ));
+        if selected_here
+            && let SelectionMode::RawMatches {
+                max_matches,
+                max_retained_bytes,
+            } = self.mode
+        {
+            self.input.start_capture(self.selection_limit)?;
+            self.parse_unselected_value(depth, None)?;
+            let value = self.input.finish_capture()?;
+            let mut prefix = value.prefix;
+            if let Err(error) = std::str::from_utf8(&prefix) {
+                prefix.truncate(error.valid_up_to());
+            }
+            let retained = self
+                .matches
+                .iter()
+                .try_fold(prefix.len(), |total, captured| {
+                    let bytes = match &captured.value {
+                        CapturedValue::String(value) => value.bytes.len(),
+                        CapturedValue::Scalar(value) => value.len(),
+                    };
+                    total.checked_add(bytes)
+                })
+                .ok_or(DecodeError::OutputTooLarge)?;
+            if retained > max_retained_bytes {
+                return Err(DecodeError::OutputTooLarge);
+            }
+            self.push_match(
+                max_matches,
+                CapturedValue::String(CapturedString {
+                    bytes: prefix,
+                    total_bytes: value.total,
+                    hash: value.hash,
+                    truncated: value.truncated,
+                }),
+            )?;
+            return Ok(());
+        }
+        if selected_here
+            && matches!(self.mode, SelectionMode::Matches { .. })
+            && matches!(self.input.peek_byte()?, Some(b'{' | b'['))
+        {
+            return self.parse_unselected_value(depth, None);
+        }
+        self.parse_unselected_or_selected_value(depth, matching_path_index, selected_here)
+    }
+
+    fn parse_unselected_value(
+        &mut self,
+        depth: usize,
+        matching_path_index: Option<usize>,
+    ) -> Result<(), DecodeError> {
+        self.parse_unselected_or_selected_value(depth, matching_path_index, false)
+    }
+
+    fn parse_unselected_or_selected_value(
+        &mut self,
+        depth: usize,
+        matching_path_index: Option<usize>,
+        selected_here: bool,
+    ) -> Result<(), DecodeError> {
         match self.input.peek_byte()? {
             Some(b'{') => {
                 if selected_here {
@@ -364,11 +563,16 @@ impl<'a, R: Read> Parser<'a, R> {
             self.schema.update(b"]");
             return Ok(());
         }
+        let mut index = 0_usize;
         loop {
+            self.array_indices.push(index);
             self.parse_value(depth + 1, matching_path_index)?;
+            let _ = self.array_indices.pop();
             self.input.skip_whitespace()?;
             match self.input.required_byte()? {
-                b',' => {}
+                b',' => {
+                    index = index.checked_add(1).ok_or(DecodeError::OutputTooLarge)?;
+                }
                 b']' => {
                     self.schema.update(b"]");
                     return Ok(());
@@ -405,6 +609,20 @@ impl<'a, R: Read> Parser<'a, R> {
                 }
                 self.scalar = Some(value.prefix);
             }
+            SelectionMode::Matches { max_matches } => {
+                self.push_match(
+                    max_matches,
+                    CapturedValue::String(CapturedString {
+                        bytes: value.prefix,
+                        total_bytes: value.total,
+                        hash: value.hash,
+                        truncated: value.truncated,
+                    }),
+                )?;
+            }
+            SelectionMode::RawMatches { .. } => {
+                return Err(DecodeError::Malformed("raw-selection-state".to_owned()));
+            }
         }
         Ok(())
     }
@@ -433,6 +651,21 @@ impl<'a, R: Read> Parser<'a, R> {
                         return Err(DecodeError::OutputTooLarge);
                     }
                     self.scalar = Some(literal.to_vec());
+                }
+                SelectionMode::Matches { max_matches } => {
+                    self.push_match(
+                        max_matches,
+                        CapturedValue::Scalar(
+                            std::str::from_utf8(literal)
+                                .map_err(|_| {
+                                    DecodeError::Malformed("invalid-decoded-scalar".to_owned())
+                                })?
+                                .to_owned(),
+                        ),
+                    )?;
+                }
+                SelectionMode::RawMatches { .. } => {
+                    return Err(DecodeError::Malformed("raw-selection-state".to_owned()));
                 }
             }
         }
@@ -468,8 +701,27 @@ impl<'a, R: Read> Parser<'a, R> {
                     validate_bounded_number_with_struson(&bytes)?;
                     self.scalar = Some(bytes);
                 }
+                SelectionMode::Matches { max_matches } => {
+                    let value = String::from_utf8(bytes)
+                        .map_err(|_| DecodeError::Malformed("invalid-decoded-scalar".to_owned()))?;
+                    self.push_match(max_matches, CapturedValue::Scalar(value))?;
+                }
+                SelectionMode::RawMatches { .. } => {
+                    return Err(DecodeError::Malformed("raw-selection-state".to_owned()));
+                }
             }
         }
+        Ok(())
+    }
+
+    fn push_match(&mut self, max_matches: usize, value: CapturedValue) -> Result<(), DecodeError> {
+        if self.matches.len() == max_matches {
+            return Err(DecodeError::OutputTooLarge);
+        }
+        self.matches.push(CapturedMatch {
+            array_indices: self.array_indices.clone(),
+            value,
+        });
         Ok(())
     }
 
