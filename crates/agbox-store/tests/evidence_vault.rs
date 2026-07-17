@@ -189,3 +189,81 @@ fn concurrent_writers_publish_once_and_leave_no_temporary_files() {
             .ends_with(".tmp")
     }));
 }
+
+#[test]
+fn evidence_ids_longer_than_task_one_wire_limit_are_rejected() {
+    let dir = private_tempdir();
+    let vault = EvidenceVault::open(
+        dir.path().to_path_buf(),
+        Arc::new(MemoryKeyProvider::fixed([10_u8; 32])),
+    )
+    .unwrap();
+    let id = EvidenceId::for_test(&"e".repeat(129));
+    let project = ProjectId::for_test("project_limit");
+    let work = WorkId::for_test("work_limit");
+
+    assert!(
+        vault
+            .put(
+                &id,
+                EvidenceContext {
+                    project_id: &project,
+                    owner: EvidenceOwnerRef::Work(&work),
+                },
+                b"bounded",
+            )
+            .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_directory_rejects_user_owned_intermediate_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let target = private_tempdir();
+    let parent = private_tempdir();
+    let linked = parent.path().join("linked");
+    symlink(target.path(), &linked).unwrap();
+    let root = linked.join("evidence");
+
+    assert!(EvidenceVault::open(root, Arc::new(MemoryKeyProvider::fixed([11_u8; 32])),).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn replacing_the_named_root_does_not_redirect_a_vault() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let container = private_tempdir();
+    let root = container.path().join("root");
+    let old_root = container.path().join("old-root");
+    let replacement = container.path().join("replacement");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&replacement).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let vault = EvidenceVault::open(
+        root.clone(),
+        Arc::new(MemoryKeyProvider::fixed([12_u8; 32])),
+    )
+    .unwrap();
+    std::fs::rename(&root, &old_root).unwrap();
+    std::fs::rename(&replacement, &root).unwrap();
+
+    let id = EvidenceId::for_test("ev_root_swap");
+    let project = ProjectId::for_test("project_root_swap");
+    let work = WorkId::for_test("work_root_swap");
+    let context = EvidenceContext {
+        project_id: &project,
+        owner: EvidenceOwnerRef::Work(&work),
+    };
+    let put_result = vault.put(&id, context, b"old-root-only");
+    assert!(put_result.is_ok(), "put failed: {put_result:?}");
+    assert!(!root.join("ev_root_swap.agbx").exists());
+    assert!(old_root.join("ev_root_swap.agbx").exists());
+    assert_eq!(
+        vault.get(&id, context).unwrap().as_slice(),
+        b"old-root-only"
+    );
+}

@@ -1,9 +1,4 @@
-use std::{
-    fs::{self, OpenOptions},
-    io::Write,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{ffi::OsString, fs::File, io::Write, path::PathBuf, sync::Arc};
 
 use agbox_core::{EventId, EvidenceId, ProjectId, WorkId, limits::MAX_INLINE_BYTES};
 use zeroize::Zeroizing;
@@ -11,7 +6,8 @@ use zeroize::Zeroizing;
 use crate::{
     crypto::{CryptoError, KeyProvider, open, seal},
     fs_security::{
-        ensure_owner_directory, read_owner_file_nofollow, set_owner_file_mode, validate_owner_file,
+        create_owner_temp_file, ensure_owner_directory, link_owner_file, open_owner_directory,
+        read_owner_file_nofollow, remove_owner_file, set_owner_file_mode, validate_owner_file,
     },
 };
 
@@ -50,6 +46,7 @@ pub enum EvidenceError {
 
 pub struct EvidenceVault {
     root: PathBuf,
+    root_directory: File,
     key: Zeroizing<[u8; 32]>,
 }
 
@@ -74,7 +71,12 @@ impl EvidenceVault {
         let key = keys.master_key()?;
         let root = root.canonicalize()?;
         ensure_owner_directory(&root)?;
-        Ok(Self { root, key })
+        let root_directory = open_owner_directory(&root)?;
+        Ok(Self {
+            root,
+            root_directory,
+            key,
+        })
     }
 
     fn aad(id: &EvidenceId, context: EvidenceContext<'_>) -> Vec<u8> {
@@ -132,9 +134,14 @@ impl EvidenceVault {
             return Err(EvidenceError::TooLarge);
         }
         let path = self.path(id)?;
-        match fs::symlink_metadata(&path) {
-            Ok(_) => {
-                validate_owner_file(&path)?;
+        let destination = path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "evidence target has no file name",
+            )
+        })?;
+        match validate_owner_file(&self.root_directory, destination) {
+            Ok(()) => {
                 return if self.get(id, context)?.as_slice() == plaintext {
                     Ok(())
                 } else {
@@ -145,38 +152,32 @@ impl EvidenceVault {
             Err(error) => return Err(error.into()),
         }
         let envelope = seal(&self.key, &Self::aad(id, context), plaintext)?;
-        let temporary = self.root.join(format!(
+        let temporary = OsString::from(format!(
             ".{}.{}.tmp",
             id.as_str(),
             uuid::Uuid::new_v4().simple()
         ));
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut file = options.open(&temporary)?;
+        let mut file = create_owner_temp_file(&self.root_directory, &temporary)?;
+        let mut cleanup = TempCleanup::new(&self.root_directory, temporary.clone());
         set_owner_file_mode(&file)?;
         file.write_all(&envelope)?;
         file.sync_all()?;
-        match fs::hard_link(&temporary, &path) {
+        match link_owner_file(&self.root_directory, &temporary, destination) {
             Ok(()) => {
-                fs::remove_file(&temporary)?;
-                fs::File::open(&self.root)?.sync_all()?;
+                cleanup.remove_now()?;
+                self.root_directory.sync_all()?;
                 Ok(())
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                fs::remove_file(&temporary)?;
-                validate_owner_file(&path)?;
+                cleanup.remove_now()?;
+                validate_owner_file(&self.root_directory, destination)?;
                 if self.get(id, context)?.as_slice() == plaintext {
                     Ok(())
                 } else {
                     Err(EvidenceError::Conflict)
                 }
             }
-            Err(error) => {
-                let _cleanup = fs::remove_file(&temporary);
-                Err(error.into())
-            }
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -192,7 +193,13 @@ impl EvidenceVault {
         context: EvidenceContext<'_>,
     ) -> Result<Zeroizing<Vec<u8>>, EvidenceError> {
         let path = self.path(id)?;
-        let envelope = read_owner_file_nofollow(&path, MAX_INLINE_BYTES + 64)?;
+        let name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "evidence target has no file name",
+            )
+        })?;
+        let envelope = read_owner_file_nofollow(&self.root_directory, name, MAX_INLINE_BYTES + 64)?;
         Ok(Zeroizing::new(open(
             &self.key,
             &Self::aad(id, context),
@@ -201,8 +208,50 @@ impl EvidenceVault {
     }
 }
 
+struct TempCleanup<'a> {
+    directory: &'a File,
+    name: OsString,
+    active: bool,
+}
+
+impl<'a> TempCleanup<'a> {
+    fn new(directory: &'a File, name: OsString) -> Self {
+        Self {
+            directory,
+            name,
+            active: true,
+        }
+    }
+
+    fn remove_now(&mut self) -> std::io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        match remove_owner_file(self.directory, &self.name) {
+            Ok(()) => {
+                self.active = false;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.active = false;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Drop for TempCleanup<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = remove_owner_file(self.directory, &self.name);
+        }
+    }
+}
+
 fn safe_component(value: &str) -> bool {
     !value.is_empty()
+        && value.len() <= 128
         && value != "."
         && value != ".."
         && value

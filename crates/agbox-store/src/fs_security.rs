@@ -1,10 +1,11 @@
 use std::{
+    ffi::OsStr,
     fs::{self, File},
     io::{self, Read},
     path::{Component, Path, PathBuf},
 };
 
-use rustix::fs::{self as rustix_fs, Mode, OFlags};
+use rustix::fs::{self as rustix_fs, AtFlags, FileType, Mode, OFlags};
 
 const OWNER_DIRECTORY_MODE: u32 = 0o700;
 const OWNER_FILE_MODE: u32 = 0o600;
@@ -91,6 +92,16 @@ pub(crate) fn ensure_owner_directory(path: &Path) -> io::Result<()> {
                             if current == absolute {
                                 return Err(security_error("evidence root must not be a symlink"));
                             }
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::MetadataExt;
+
+                                if metadata.uid() == rustix::process::geteuid().as_raw() {
+                                    return Err(security_error(
+                                        "evidence root contains a user-owned symlink",
+                                    ));
+                                }
+                            }
                             if !fs::metadata(&current)?.is_dir() {
                                 return Err(security_error(
                                     "evidence root contains a symlink or non-directory",
@@ -132,6 +143,112 @@ pub(crate) fn set_owner_file_mode(file: &File) -> io::Result<()> {
     Ok(())
 }
 
+fn ensure_owner_stat(stat: &rustix_fs::Stat, expected: FileType) -> io::Result<()> {
+    if FileType::from_raw_mode(stat.st_mode) != expected {
+        return Err(if expected == FileType::Directory {
+            security_error("evidence root is not a directory")
+        } else {
+            security_error("evidence target is not a regular file")
+        });
+    }
+    #[cfg(unix)]
+    {
+        let mode = u32::from(stat.st_mode);
+        #[allow(clippy::verbose_bit_mask)]
+        let mode_ok = if expected == FileType::Directory {
+            mode & 0o077 == 0
+        } else {
+            mode & 0o7777 == OWNER_FILE_MODE
+        };
+        if stat.st_uid != rustix::process::geteuid().as_raw() || !mode_ok {
+            return Err(if expected == FileType::Directory {
+                security_error("evidence root is not owner-controlled")
+            } else {
+                security_error("evidence target is not owner-controlled")
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn open_owner_directory(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    let directory = File::from(
+        rustix_fs::open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?,
+    );
+    #[cfg(not(unix))]
+    let directory = File::open(path)?;
+    #[cfg(unix)]
+    ensure_owner_stat(
+        &rustix_fs::fstat(&directory).map_err(io::Error::from)?,
+        FileType::Directory,
+    )?;
+    #[cfg(not(unix))]
+    ensure_directory_metadata(&directory.metadata()?)?;
+    Ok(directory)
+}
+
+pub(crate) fn create_owner_temp_file(directory: &File, name: &OsStr) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        Ok(File::from(
+            rustix_fs::openat(
+                directory,
+                name,
+                OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW,
+                Mode::from_raw_mode(0o600),
+            )
+            .map_err(io::Error::from)?,
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+        File::create(Path::new(name))
+    }
+}
+
+pub(crate) fn link_owner_file(
+    directory: &File,
+    temporary: &OsStr,
+    destination: &OsStr,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        rustix_fs::linkat(
+            directory,
+            temporary,
+            directory,
+            destination,
+            AtFlags::empty(),
+        )
+        .map_err(io::Error::from)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+        fs::hard_link(Path::new(temporary), Path::new(destination))
+    }
+}
+
+pub(crate) fn remove_owner_file(directory: &File, name: &OsStr) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        rustix_fs::unlinkat(directory, name, AtFlags::empty()).map_err(io::Error::from)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+        fs::remove_file(Path::new(name))
+    }
+}
+
+#[cfg(not(unix))]
 fn ensure_file_metadata(metadata: &fs::Metadata) -> io::Result<()> {
     if !metadata.is_file() {
         return Err(security_error("evidence target is not a regular file"));
@@ -150,60 +267,55 @@ fn ensure_file_metadata(metadata: &fs::Metadata) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn same_file(before: &fs::Metadata, after: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    before.dev() == after.dev() && before.ino() == after.ino()
+#[cfg(unix)]
+fn same_stat(before: &rustix_fs::Stat, after: &rustix_fs::Stat) -> bool {
+    before.st_dev == after.st_dev && before.st_ino == after.st_ino
 }
 
-#[cfg(not(unix))]
-fn same_file(_before: &fs::Metadata, _after: &fs::Metadata) -> bool {
-    true
-}
-
-fn open_owner_file(path: &Path) -> io::Result<File> {
-    let before = fs::symlink_metadata(path)?;
-    if before.file_type().is_symlink() {
-        return Err(security_error("evidence target must not be a symlink"));
-    }
-    ensure_file_metadata(&before)?;
-
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid_path_error("evidence target has no parent"))?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| invalid_path_error("evidence target has no file name"))?;
-    let directory = File::open(parent)?;
-
-    #[cfg(unix)]
+#[cfg(unix)]
+fn open_owner_file(directory: &File, name: &OsStr) -> io::Result<File> {
+    let before =
+        rustix_fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+    ensure_owner_stat(&before, FileType::RegularFile)?;
     let file = File::from(
         rustix_fs::openat(
-            &directory,
+            directory,
             name,
             OFlags::RDONLY | OFlags::NOFOLLOW,
             Mode::empty(),
         )
         .map_err(io::Error::from)?,
     );
-    #[cfg(not(unix))]
-    let file = File::open(path)?;
-
-    let after = file.metadata()?;
-    if !same_file(&before, &after) {
+    let after = rustix_fs::fstat(&file).map_err(io::Error::from)?;
+    if !same_stat(&before, &after) {
         return Err(security_error("evidence target changed during open"));
     }
-    ensure_file_metadata(&after)?;
+    ensure_owner_stat(&after, FileType::RegularFile)?;
     Ok(file)
 }
 
-pub(crate) fn validate_owner_file(path: &Path) -> io::Result<()> {
-    let _file = open_owner_file(path)?;
+#[cfg(not(unix))]
+fn open_owner_file(directory: &File, name: &OsStr) -> io::Result<File> {
+    let _ = directory;
+    let path = Path::new(name);
+    let before = fs::symlink_metadata(path)?;
+    ensure_file_metadata(&before)?;
+    let file = File::open(path)?;
+    ensure_file_metadata(&file.metadata()?)?;
+    Ok(file)
+}
+
+pub(crate) fn validate_owner_file(directory: &File, name: &OsStr) -> io::Result<()> {
+    let _file = open_owner_file(directory, name)?;
     Ok(())
 }
 
-pub(crate) fn read_owner_file_nofollow(path: &Path, cap: usize) -> io::Result<Vec<u8>> {
-    let file = open_owner_file(path)?;
+pub(crate) fn read_owner_file_nofollow(
+    directory: &File,
+    name: &OsStr,
+    cap: usize,
+) -> io::Result<Vec<u8>> {
+    let file = open_owner_file(directory, name)?;
     let metadata = file.metadata()?;
     let size = usize::try_from(metadata.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "evidence file is too large"))?;
