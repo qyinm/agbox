@@ -1,17 +1,29 @@
 mod adapter;
 mod claude;
+mod codex;
 mod json;
 
 pub use adapter::{
     DecodeContext, DecodeDisposition, DecodeError, DecodedEvidence, DecodedRecord,
     DecodedRecordDraft, DecoderState, DiscoveredSource, MAX_DECODER_STATE_BYTES,
     MAX_EVENTS_PER_RECORD, MAX_EVIDENCE_PER_RECORD, MAX_RECORD_SEMANTIC_BYTES, NativeIdentifier,
-    RecordSource, RootClass, RootSpec, SourceAdapter, adapters,
+    RecordSource, RootClass, RootSpec, SourceAdapter,
 };
 #[cfg(feature = "test-support")]
 pub use adapter::{MemoryRecordSource, decode_fixture};
 pub use claude::ClaudeAdapter;
+pub use codex::{CodexAdapter, HistoryMode};
 pub use json::{BoundedJsonReader, CapturedString, MAX_CAPTURE_BYTES};
+
+const _: fn() -> &'static [&'static dyn SourceAdapter] = adapter::adapters;
+
+#[must_use]
+pub fn adapters() -> &'static [&'static dyn SourceAdapter] {
+    static CLAUDE: ClaudeAdapter = ClaudeAdapter;
+    static CODEX: CodexAdapter = CodexAdapter;
+    static ADAPTERS: [&dyn SourceAdapter; 2] = [&CLAUDE, &CODEX];
+    &ADAPTERS
+}
 
 #[cfg(feature = "test-support")]
 pub mod test_support {
@@ -24,8 +36,8 @@ pub mod test_support {
     use time::OffsetDateTime;
 
     use crate::{
-        ClaudeAdapter, DecodeContext, DecodeError, DecodedRecord, DecoderState, MemoryRecordSource,
-        SourceAdapter,
+        ClaudeAdapter, CodexAdapter, DecodeContext, DecodeError, DecodedRecord, DecoderState,
+        MemoryRecordSource, SourceAdapter,
     };
 
     /// Decodes a sanitized JSONL fixture while preserving decoder state across
@@ -39,9 +51,11 @@ pub mod test_support {
         provider: &str,
         path: impl AsRef<Path>,
     ) -> Result<Vec<DecodedRecord>, DecodeError> {
-        if provider != "claude" {
-            return Err(DecodeError::MissingIdentity("provider"));
-        }
+        let adapter: &dyn SourceAdapter = match provider {
+            "claude" => &ClaudeAdapter,
+            "codex" => &CodexAdapter,
+            _ => return Err(DecodeError::MissingIdentity("provider")),
+        };
         let path = path.as_ref();
         let file = std::fs::File::open(path)?;
         let mut reader = BufReader::new(file);
@@ -58,7 +72,10 @@ pub mod test_support {
             source_id,
             observed_at: OffsetDateTime::UNIX_EPOCH,
             source_generation: 0,
-            format: "claude-transcript-2.1".to_owned(),
+            format: match provider {
+                "codex" => "codex-rollout-1".to_owned(),
+                _ => "claude-transcript-2.1".to_owned(),
+            },
         };
         loop {
             line.clear();
@@ -76,7 +93,7 @@ pub mod test_support {
                 continue;
             }
             let source = MemoryRecordSource::new(std::mem::take(&mut line));
-            let decoded = ClaudeAdapter.decode(&source, &context, &state)?;
+            let decoded = adapter.decode(&source, &context, &state)?;
             state = decoded.next_state().clone();
             records.push(decoded);
         }
