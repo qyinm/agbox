@@ -4,6 +4,7 @@ use std::{
 };
 
 use struson::reader::{JsonReader, JsonStreamReader};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::adapter::DecodeError;
 
@@ -20,9 +21,40 @@ pub struct CapturedString {
 }
 
 #[derive(Clone, Eq, PartialEq)]
+pub(crate) struct SecureCapturedString {
+    pub bytes: Zeroizing<Vec<u8>>,
+    pub total_bytes: u64,
+    pub hash: String,
+    pub truncated: bool,
+}
+
+impl fmt::Debug for SecureCapturedString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SecureCapturedString")
+            .field("retained_bytes", &self.bytes.len())
+            .field("total_bytes", &self.total_bytes)
+            .field("hash", &self.hash)
+            .field("truncated", &self.truncated)
+            .finish()
+    }
+}
+
+impl SecureCapturedString {
+    pub(crate) fn take_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut *self.bytes)
+    }
+
+    pub(crate) fn take_hash(&mut self) -> String {
+        std::mem::take(&mut self.hash)
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) enum CapturedValue {
-    String(CapturedString),
+    String(SecureCapturedString),
     Scalar(String),
+    Container,
 }
 
 impl fmt::Debug for CapturedValue {
@@ -33,6 +65,7 @@ impl fmt::Debug for CapturedValue {
                 .debug_struct("Scalar")
                 .field("byte_length", &value.len())
                 .finish(),
+            Self::Container => formatter.write_str("Container"),
         }
     }
 }
@@ -136,6 +169,7 @@ impl<R: Read> BoundedJsonReader<R> {
         path: &[&str],
         limit: usize,
         max_matches: usize,
+        max_retained_bytes: usize,
     ) -> Result<Vec<CapturedMatch>, DecodeError> {
         if limit > MAX_CAPTURE_BYTES || max_matches > agbox_core::limits::MAX_EVENTS_PER_RECORD {
             if !self.parsed {
@@ -146,7 +180,14 @@ impl<R: Read> BoundedJsonReader<R> {
             }
             return Err(DecodeError::OutputTooLarge);
         }
-        let outcome = self.parse(path, SelectionMode::Matches { max_matches }, limit)?;
+        let outcome = self.parse(
+            path,
+            SelectionMode::Matches {
+                max_matches,
+                max_retained_bytes,
+            },
+            limit,
+        )?;
         Ok(outcome.matches)
     }
 
@@ -230,6 +271,7 @@ impl<R: Read> BoundedJsonReader<R> {
                 let bytes = match &captured.value {
                     CapturedValue::String(value) => value.bytes.len(),
                     CapturedValue::Scalar(value) => value.len(),
+                    CapturedValue::Container => 0,
                 };
                 total.checked_add(bytes)
             })
@@ -341,6 +383,7 @@ enum SelectionMode {
     Scalar,
     Matches {
         max_matches: usize,
+        max_retained_bytes: usize,
     },
     RawMatches {
         max_matches: usize,
@@ -427,10 +470,12 @@ impl<'a, R: Read> Parser<'a, R> {
                 max_retained_bytes,
             } = self.mode
         {
-            self.input.start_capture(self.selection_limit)?;
+            let remaining = max_retained_bytes.saturating_sub(self.retained_match_bytes()?);
+            self.input
+                .start_capture(self.selection_limit.min(remaining))?;
             self.parse_unselected_value(depth, None)?;
-            let value = self.input.finish_capture()?;
-            let mut prefix = value.prefix;
+            let mut value = self.input.finish_capture()?;
+            let mut prefix = value.take_prefix();
             if let Err(error) = std::str::from_utf8(&prefix) {
                 prefix.truncate(error.valid_up_to());
             }
@@ -441,6 +486,7 @@ impl<'a, R: Read> Parser<'a, R> {
                     let bytes = match &captured.value {
                         CapturedValue::String(value) => value.bytes.len(),
                         CapturedValue::Scalar(value) => value.len(),
+                        CapturedValue::Container => 0,
                     };
                     total.checked_add(bytes)
                 })
@@ -450,19 +496,20 @@ impl<'a, R: Read> Parser<'a, R> {
             }
             self.push_match(
                 max_matches,
-                CapturedValue::String(CapturedString {
-                    bytes: prefix,
+                CapturedValue::String(SecureCapturedString {
+                    bytes: Zeroizing::new(prefix),
                     total_bytes: value.total,
-                    hash: value.hash,
+                    hash: value.take_hash(),
                     truncated: value.truncated,
                 }),
             )?;
             return Ok(());
         }
         if selected_here
-            && matches!(self.mode, SelectionMode::Matches { .. })
+            && let SelectionMode::Matches { max_matches, .. } = self.mode
             && matches!(self.input.peek_byte()?, Some(b'{' | b'['))
         {
+            self.push_match(max_matches, CapturedValue::Container)?;
             return self.parse_unselected_value(depth, None);
         }
         self.parse_unselected_or_selected_value(depth, matching_path_index, selected_here)
@@ -585,11 +632,18 @@ impl<'a, R: Read> Parser<'a, R> {
     fn parse_string_value(&mut self, selected_here: bool) -> Result<(), DecodeError> {
         self.schema.update(b"S");
         let capture_limit = if selected_here {
-            Some(self.selection_limit)
+            Some(match self.mode {
+                SelectionMode::Matches {
+                    max_retained_bytes, ..
+                } => self
+                    .selection_limit
+                    .min(max_retained_bytes.saturating_sub(self.retained_match_bytes()?)),
+                _ => self.selection_limit,
+            })
         } else {
             Some(0)
         };
-        let value = self.parse_string(capture_limit.unwrap_or_default())?;
+        let mut value = self.parse_string(capture_limit.unwrap_or_default())?;
         if !selected_here {
             return Ok(());
         }
@@ -597,9 +651,9 @@ impl<'a, R: Read> Parser<'a, R> {
         match self.mode {
             SelectionMode::String => {
                 self.string = Some(CapturedString {
-                    bytes: value.prefix,
+                    bytes: value.take_prefix(),
                     total_bytes: value.total,
-                    hash: value.hash,
+                    hash: value.take_hash(),
                     truncated: value.truncated,
                 });
             }
@@ -607,15 +661,15 @@ impl<'a, R: Read> Parser<'a, R> {
                 if value.truncated {
                     return Err(DecodeError::OutputTooLarge);
                 }
-                self.scalar = Some(value.prefix);
+                self.scalar = Some(value.take_prefix());
             }
-            SelectionMode::Matches { max_matches } => {
+            SelectionMode::Matches { max_matches, .. } => {
                 self.push_match(
                     max_matches,
-                    CapturedValue::String(CapturedString {
-                        bytes: value.prefix,
+                    CapturedValue::String(SecureCapturedString {
+                        bytes: Zeroizing::new(value.take_prefix()),
                         total_bytes: value.total,
-                        hash: value.hash,
+                        hash: value.take_hash(),
                         truncated: value.truncated,
                     }),
                 )?;
@@ -652,7 +706,7 @@ impl<'a, R: Read> Parser<'a, R> {
                     }
                     self.scalar = Some(literal.to_vec());
                 }
-                SelectionMode::Matches { max_matches } => {
+                SelectionMode::Matches { max_matches, .. } => {
                     self.push_match(
                         max_matches,
                         CapturedValue::Scalar(
@@ -701,7 +755,7 @@ impl<'a, R: Read> Parser<'a, R> {
                     validate_bounded_number_with_struson(&bytes)?;
                     self.scalar = Some(bytes);
                 }
-                SelectionMode::Matches { max_matches } => {
+                SelectionMode::Matches { max_matches, .. } => {
                     let value = String::from_utf8(bytes)
                         .map_err(|_| DecodeError::Malformed("invalid-decoded-scalar".to_owned()))?;
                     self.push_match(max_matches, CapturedValue::Scalar(value))?;
@@ -718,11 +772,43 @@ impl<'a, R: Read> Parser<'a, R> {
         if self.matches.len() == max_matches {
             return Err(DecodeError::OutputTooLarge);
         }
+        let retained_limit = match self.mode {
+            SelectionMode::Matches {
+                max_retained_bytes, ..
+            }
+            | SelectionMode::RawMatches {
+                max_retained_bytes, ..
+            } => max_retained_bytes,
+            SelectionMode::String | SelectionMode::Scalar => usize::MAX,
+        };
+        let value_bytes = match &value {
+            CapturedValue::String(value) => value.bytes.len(),
+            CapturedValue::Scalar(value) => value.len(),
+            CapturedValue::Container => 0,
+        };
+        if self
+            .retained_match_bytes()?
+            .checked_add(value_bytes)
+            .is_none_or(|bytes| bytes > retained_limit)
+        {
+            return Err(DecodeError::OutputTooLarge);
+        }
         self.matches.push(CapturedMatch {
             array_indices: self.array_indices.clone(),
             value,
         });
         Ok(())
+    }
+
+    fn retained_match_bytes(&self) -> Result<usize, DecodeError> {
+        self.matches.iter().try_fold(0_usize, |total, captured| {
+            let bytes = match &captured.value {
+                CapturedValue::String(value) => value.bytes.len(),
+                CapturedValue::Scalar(value) => value.len(),
+                CapturedValue::Container => 0,
+            };
+            total.checked_add(bytes).ok_or(DecodeError::OutputTooLarge)
+        })
     }
 
     fn parse_string(&mut self, capture_limit: usize) -> Result<StringInfo, DecodeError> {
@@ -838,13 +924,19 @@ impl StringAccumulator {
         Ok(())
     }
 
-    fn finish(self) -> StringInfo {
+    fn finish(mut self) -> StringInfo {
         StringInfo {
-            prefix: self.prefix,
+            prefix: std::mem::take(&mut self.prefix),
             total: self.total,
             hash: self.hash.finalize().to_hex().to_string(),
             truncated: !self.capture_open,
         }
+    }
+}
+
+impl Drop for StringAccumulator {
+    fn drop(&mut self) {
+        self.prefix.zeroize();
     }
 }
 
@@ -856,6 +948,14 @@ struct StringInfo {
 }
 
 impl StringInfo {
+    fn take_prefix(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.prefix)
+    }
+
+    fn take_hash(&mut self) -> String {
+        std::mem::take(&mut self.hash)
+    }
+
     fn equals(&self, expected: &[u8]) -> bool {
         if u64::try_from(expected.len()) != Ok(self.total) {
             return false;
@@ -864,6 +964,12 @@ impl StringInfo {
             return self.prefix == expected;
         }
         expected.starts_with(&self.prefix) && self.hash == blake3::hash(expected).to_hex().as_str()
+    }
+}
+
+impl Drop for StringInfo {
+    fn drop(&mut self) {
+        self.prefix.zeroize();
     }
 }
 

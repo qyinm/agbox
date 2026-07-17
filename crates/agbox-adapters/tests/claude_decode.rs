@@ -253,8 +253,12 @@ fn write_artifact_requires_success_and_a_trusted_project_path() {
     .unwrap();
     assert!(success.events().iter().any(|event| matches!(
         event.payload(),
-        EventPayload::ArtifactChanged { path, .. }
-            if path.redacted_excerpt() == Some("$PROJECT/src/lib.rs")
+        EventPayload::ArtifactChanged {
+            path,
+            content_hash,
+            ..
+        } if path.redacted_excerpt() == Some("$PROJECT/src/lib.rs")
+            && content_hash.is_none()
     )));
 
     let failed_request = decode_one(
@@ -276,6 +280,30 @@ fn write_artifact_requires_success_and_a_trusted_project_path() {
     )));
     assert!(
         !failed
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::ArtifactChanged { .. }))
+    );
+}
+
+#[test]
+fn relative_write_path_without_trusted_project_root_never_authorizes_artifact() {
+    let mut untrusted = context();
+    untrusted.project_root = None;
+    let request_source = MemoryRecordSource::new(
+        br#"{"type":"assistant","uuid":"a-untrusted","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"tool_use","id":"untrusted-write","name":"Write","input":{"file_path":"src/lib.rs"}}]}}"#.to_vec(),
+    );
+    let request = ClaudeAdapter
+        .decode(&request_source, &untrusted, &DecoderState::default())
+        .unwrap();
+    let result_source = MemoryRecordSource::new(
+        br#"{"type":"user","uuid":"u-untrusted","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"untrusted-write","content":"ok","is_error":false}]}}"#.to_vec(),
+    );
+    let result = ClaudeAdapter
+        .decode(&result_source, &untrusted, request.next_state())
+        .unwrap();
+    assert!(
+        !result
             .events()
             .iter()
             .any(|event| matches!(event.payload(), EventPayload::ArtifactChanged { .. }))
@@ -346,6 +374,13 @@ fn duplicate_sibling_fields_are_rejected() {
     )
     .unwrap_err();
     assert!(matches!(error, DecodeError::Malformed(_)));
+
+    let heterogeneous = decode_one(
+        r#"{"type":"assistant","uuid":"a2","sessionId":"s","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"text","text":"safe","text":{"nested":"ambiguous"}}]}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(heterogeneous, DecodeError::Malformed(_)));
 }
 
 #[test]
@@ -384,6 +419,21 @@ fn context_change_uses_only_trusted_project_labels_and_branch_hashes() {
             .iter()
             .any(|event| matches!(event.payload(), EventPayload::SessionContextChanged { .. }))
     );
+
+    let partial = decode_one(
+        r#"{"type":"system","uuid":"sys3","sessionId":"s1","timestamp":"2026-07-17T01:00:02Z","mode":"build"}"#,
+        repeated.next_state(),
+    )
+    .unwrap();
+    let partial_json = event_json(&partial);
+    assert!(partial_json.contains("$PROJECT/sub"));
+    assert!(partial_json.contains("mode=build"));
+    assert!(partial_json.contains("permission=safe"));
+    let EventPayload::SessionContextChanged { branch_hash, .. } = partial.events()[0].payload()
+    else {
+        panic!("expected merged context");
+    };
+    assert!(branch_hash.is_some());
 }
 
 #[test]
@@ -480,7 +530,7 @@ fn content_media_types_distinguish_text_structured_json_and_paths() {
 }
 
 #[test]
-fn structured_array_and_top_level_tool_results_are_streamed_as_whole_values() {
+fn structured_input_is_hashed_whole_but_tool_result_keeps_only_safe_text() {
     let request = decode_one(
         r#"{"type":"assistant","uuid":"a-raw","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"tool_use","id":"raw-array","name":"Read","input":["src/a.rs",{"line":1}]}]}}"#,
         &DecoderState::default(),
@@ -494,7 +544,7 @@ fn structured_array_and_top_level_tool_results_are_streamed_as_whole_values() {
     assert_eq!(input.byte_length(), u64::try_from(raw_input.len()).unwrap());
 
     let result = decode_one(
-        r#"{"type":"user","uuid":"u-raw","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"raw-array","is_error":false}]},"toolUseResult":[{"type":"text","text":"ok"}]}"#,
+        r#"{"type":"user","uuid":"u-raw","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"raw-array","content":[{"type":"image","source":{"type":"base64","data":"PRIVATE_BASE64"}},{"type":"thinking","thinking":"PRIVATE_THINKING"}],"is_error":false}]},"toolUseResult":[{"type":"text","text":"ok"},{"type":"image","source":{"data":"TOP_PRIVATE_BASE64"}},{"type":"redacted_thinking","data":"TOP_PRIVATE_REASONING"}]}"#,
         request.next_state(),
     )
     .unwrap();
@@ -509,8 +559,9 @@ fn structured_array_and_top_level_tool_results_are_streamed_as_whole_values() {
             _ => None,
         })
         .unwrap();
-    let raw_output = br#"[{"type":"text","text":"ok"}]"#;
-    assert_eq!(output.hash(), blake3::hash(raw_output).to_hex().as_str());
+    let safe_output = b"ok";
+    assert_eq!(output.hash(), blake3::hash(safe_output).to_hex().as_str());
+    assert_eq!(output.media_type(), "text/plain");
     assert_eq!(
         result
             .evidence()
@@ -519,8 +570,31 @@ fn structured_array_and_top_level_tool_results_are_streamed_as_whole_values() {
             .unwrap()
             .plaintext
             .as_slice(),
-        raw_output
+        safe_output
     );
+    let event_json = event_json(&result);
+    let debug = format!("{result:?}");
+    let state = result.next_state().as_bytes();
+    for forbidden in [
+        "PRIVATE_BASE64",
+        "PRIVATE_THINKING",
+        "TOP_PRIVATE_BASE64",
+        "TOP_PRIVATE_REASONING",
+    ] {
+        assert!(!event_json.contains(forbidden));
+        assert!(!debug.contains(forbidden));
+        assert!(
+            !state
+                .windows(forbidden.len())
+                .any(|window| window == forbidden.as_bytes())
+        );
+        assert!(!result.evidence().iter().any(|evidence| {
+            evidence
+                .plaintext
+                .windows(forbidden.len())
+                .any(|window| window == forbidden.as_bytes())
+        }));
+    }
 }
 
 #[test]
@@ -560,17 +634,42 @@ fn invalid_trusted_project_root_fails_closed() {
 }
 
 #[test]
-fn multi_block_utf8_prefix_never_splits_a_scalar() {
-    let first = "a".repeat(65_534);
-    let json = format!(
-        r#"{{"type":"assistant","uuid":"utf8","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{{"content":[{{"type":"text","text":"{first}"}},{{"type":"text","text":"🦀"}}]}}}}"#
-    );
-    let decoded = decode_one(&json, &DecoderState::default()).unwrap();
+fn multi_block_hash_matches_exact_joined_evidence_bytes() {
+    let json = r#"{"type":"assistant","uuid":"joined","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"text","text":"alpha🦀"},{"type":"text","text":"beta"}]}}"#;
+    let decoded = decode_one(json, &DecoderState::default()).unwrap();
     let EventPayload::MessageCreated { content } = decoded.events()[0].payload() else {
         panic!("expected message");
     };
-    assert!(content.is_truncated());
-    assert!(content.hash().starts_with("seq:b3:"));
+    let joined = "alpha🦀\nbeta".as_bytes();
+    assert_eq!(content.hash(), blake3::hash(joined).to_hex().as_str());
+    let evidence = decoded
+        .evidence()
+        .iter()
+        .find(|evidence| &evidence.content == content)
+        .unwrap();
+    assert_eq!(evidence.plaintext.as_slice(), joined);
+}
+
+#[test]
+fn shared_projection_budget_stops_before_sixty_four_full_captures() {
+    let text = "x".repeat(64 * 1024);
+    let blocks = (0..64)
+        .map(|_| format!(r#"{{"type":"text","text":"{text}"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let decoded = decode_one(
+        &format!(
+            r#"{{"type":"assistant","uuid":"budget","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{{"content":[{blocks}]}}}}"#
+        ),
+        &DecoderState::default(),
+    )
+    .unwrap();
+    assert!(decoded.events().is_empty());
+    assert!(decoded.evidence().is_empty());
+    assert!(matches!(
+        decoded.disposition(),
+        DecodeDisposition::Oversized { .. }
+    ));
 }
 
 #[test]

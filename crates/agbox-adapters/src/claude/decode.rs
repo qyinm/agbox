@@ -17,7 +17,7 @@ use crate::{
     DecodedRecord, DecodedRecordDraft, DecoderState, MAX_CAPTURE_BYTES, MAX_EVENTS_PER_RECORD,
     MAX_EVIDENCE_PER_RECORD, MAX_RECORD_SEMANTIC_BYTES, RecordSource, RootClass, RootSpec,
     SourceAdapter,
-    json::{CapturedMatch, CapturedString, CapturedValue},
+    json::{CapturedMatch, CapturedValue, SecureCapturedString},
 };
 
 use super::state::{ClaudeStateV1, ToolLink, bounded_identifier};
@@ -456,13 +456,13 @@ fn decode_assistant(
 #[derive(Default)]
 struct Block {
     kind: Option<String>,
-    text: Option<CapturedString>,
+    text: Option<SecureCapturedString>,
     tool_id: Option<String>,
     tool_name: Option<String>,
-    raw_input: Option<CapturedString>,
-    file_path: Option<String>,
+    raw_input: Option<SecureCapturedString>,
+    file_path: Option<Zeroizing<String>>,
     result_id: Option<String>,
-    raw_output: Option<CapturedString>,
+    result_text: Vec<(usize, SecureCapturedString)>,
     is_error: Option<bool>,
 }
 
@@ -472,7 +472,7 @@ fn emit_context_change(
     state: &mut ClaudeStateV1,
     output: &mut Output,
 ) -> Result<(), DecodeError> {
-    let cwd = optional_bounded_text(record, &["cwd"], MAX_PATH_BYTES)?;
+    let cwd = optional_bounded_text(record, &["cwd"], MAX_PATH_BYTES)?.map(Zeroizing::new);
     let normalized_cwd = cwd
         .as_deref()
         .and_then(|value| normalize_context_path(value, scope.context.project_root.as_deref()));
@@ -489,22 +489,24 @@ fn emit_context_change(
         hasher.update(value.hash.as_bytes());
         hasher.finalize().to_hex().to_string()
     });
-
+    let mode = mode.filter(|value| bounded_identifier(value, MAX_TOOL_NAME_BYTES));
+    let permission_mode =
+        permission_mode.filter(|value| bounded_identifier(value, MAX_TOOL_NAME_BYTES));
+    let Some(snapshot) = state.merge_context(normalized_cwd, mode, permission_mode, branch_hash)?
+    else {
+        return Ok(());
+    };
     let mut fields = Vec::new();
-    if let Some(cwd) = normalized_cwd {
+    if let Some(cwd) = snapshot.cwd {
         fields.push(format!("cwd={cwd}"));
     }
-    if let Some(mode) = mode.filter(|value| bounded_identifier(value, MAX_TOOL_NAME_BYTES)) {
+    if let Some(mode) = snapshot.mode {
         fields.push(format!("mode={mode}"));
     }
-    if let Some(permission) =
-        permission_mode.filter(|value| bounded_identifier(value, MAX_TOOL_NAME_BYTES))
-    {
+    if let Some(permission) = snapshot.permission {
         fields.push(format!("permission={permission}"));
     }
-    if fields.is_empty() && branch_hash.is_none() {
-        return Ok(());
-    }
+    let branch_hash = snapshot.branch_hash;
     let context_text = fields.join(";");
     let mut fingerprint = blake3::Hasher::new();
     fingerprint.update(b"agbox-claude-context-v1");
@@ -513,9 +515,6 @@ fn emit_context_change(
         fingerprint.update(branch_hash.as_bytes());
     }
     let context_hash = fingerprint.finalize().to_hex().to_string();
-    if !state.update_context(context_hash.clone())? {
-        return Ok(());
-    }
 
     let source_identity = source_identity(scope.source, scope.context);
     let event_id = EventId::from_source(&source_identity, 256);
@@ -551,56 +550,41 @@ fn emit_context_change(
     output.push_event(event)
 }
 
-fn combine_text(parts: Vec<CapturedString>) -> Result<Option<CapturedString>, DecodeError> {
+fn combine_text(
+    parts: Vec<SecureCapturedString>,
+) -> Result<Option<SecureCapturedString>, DecodeError> {
     if parts.is_empty() {
         return Ok(None);
     }
     if parts.len() == 1 {
         return Ok(parts.into_iter().next());
     }
-    let separators = u64::try_from(parts.len() - 1).map_err(|_| DecodeError::OutputTooLarge)?;
+    if parts.iter().any(|part| part.truncated) {
+        return Err(DecodeError::OutputTooLarge);
+    }
     let total_bytes = parts
         .iter()
-        .try_fold(separators, |total, part| {
-            total.checked_add(part.total_bytes)
+        .try_fold(parts.len() - 1, |total, part| {
+            total.checked_add(part.bytes.len())
         })
         .ok_or(DecodeError::OutputTooLarge)?;
-    let mut bytes = Vec::with_capacity(
-        MAX_CAPTURE_BYTES.min(usize::try_from(total_bytes).unwrap_or(MAX_CAPTURE_BYTES)),
-    );
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"agbox-claude-message-parts-v1");
-    let mut capture_open = true;
-    for (index, part) in parts.into_iter().enumerate() {
-        if index > 0 && capture_open {
-            if bytes.len() < MAX_CAPTURE_BYTES {
-                bytes.push(b'\n');
-            } else {
-                capture_open = false;
-            }
-        }
-        hasher.update(&part.total_bytes.to_le_bytes());
-        hasher.update(part.hash.as_bytes());
-        if capture_open {
-            let remaining = MAX_CAPTURE_BYTES.saturating_sub(bytes.len());
-            let mut retained = part.bytes.len().min(remaining);
-            while retained > 0
-                && std::str::from_utf8(&part.bytes)
-                    .is_ok_and(|text| !text.is_char_boundary(retained))
-            {
-                retained -= 1;
-            }
-            bytes.extend_from_slice(&part.bytes[..retained]);
-            if retained < part.bytes.len() || part.truncated {
-                capture_open = false;
-            }
-        }
+    if total_bytes > MAX_CAPTURE_BYTES {
+        return Err(DecodeError::OutputTooLarge);
     }
-    Ok(Some(CapturedString {
-        bytes,
-        total_bytes,
-        hash: format!("seq:b3:{}", hasher.finalize().to_hex()),
-        truncated: total_bytes > MAX_CAPTURE_BYTES as u64,
+    let total_bytes_u64 = u64::try_from(total_bytes).map_err(|_| DecodeError::OutputTooLarge)?;
+    let mut bytes = Vec::with_capacity(total_bytes);
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            bytes.push(b'\n');
+        }
+        bytes.extend_from_slice(&part.bytes);
+    }
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    Ok(Some(SecureCapturedString {
+        bytes: Zeroizing::new(bytes),
+        total_bytes: total_bytes_u64,
+        hash,
+        truncated: false,
     }))
 }
 
@@ -629,9 +613,15 @@ fn collect_request_fields(
             )
         },
     )?;
+    let remaining = projection_budget.saturating_sub(projected_bytes(blocks)?);
     insert_capture_field(
         blocks,
-        capture_matches(record, &["message", "content", "text"], MAX_CAPTURE_BYTES)?,
+        capture_matches_bounded(
+            record,
+            &["message", "content", "text"],
+            MAX_CAPTURE_BYTES.min(remaining),
+            remaining,
+        )?,
         |block, value| set_once(&mut block.text, value),
     )?;
     ensure_projection_budget(blocks, projection_budget)?;
@@ -669,12 +659,14 @@ fn collect_request_fields(
         insert_string_field(
             blocks,
             capture_matches(record, path, MAX_PATH_BYTES)?,
-            |block, value| {
+            |block, mut value| {
                 if value.truncated || value.total_bytes > MAX_PATH_BYTES as u64 {
                     return Ok(());
                 }
-                let value = String::from_utf8(value.bytes)
-                    .map_err(|_| DecodeError::Malformed("invalid-tool-path".to_owned()))?;
+                let value = Zeroizing::new(
+                    String::from_utf8(value.take_bytes())
+                        .map_err(|_| DecodeError::Malformed("invalid-tool-path".to_owned()))?,
+                );
                 match &block.file_path {
                     Some(existing) if existing != &value => {
                         Err(DecodeError::Malformed("ambiguous-tool-path".to_owned()))
@@ -707,11 +699,9 @@ fn collect_result_fields(
         },
     )?;
     let remaining = projection_budget.saturating_sub(projected_bytes(blocks)?);
-    insert_capture_field(
-        blocks,
-        capture_raw_matches(record, &["message", "content", "content"], remaining)?,
-        |block, value| set_once(&mut block.raw_output, value),
-    )?;
+    collect_direct_result_text(record, blocks, remaining)?;
+    let remaining = projection_budget.saturating_sub(projected_bytes(blocks)?);
+    collect_nested_result_text(record, blocks, remaining)?;
     ensure_projection_budget(blocks, projection_budget)?;
     insert_bool_field(
         blocks,
@@ -721,16 +711,152 @@ fn collect_result_fields(
     Ok(())
 }
 
+fn collect_direct_result_text(
+    record: &dyn RecordSource,
+    blocks: &mut BTreeMap<usize, Block>,
+    remaining: usize,
+) -> Result<(), DecodeError> {
+    let matches = capture_matches_bounded(
+        record,
+        &["message", "content", "content"],
+        MAX_CAPTURE_BYTES.min(remaining),
+        remaining,
+    )?;
+    let mut seen = HashSet::new();
+    for captured in matches {
+        let index = array_index(&captured)?;
+        if !seen.insert(index) {
+            return Err(DecodeError::Malformed("duplicate-content-field".to_owned()));
+        }
+        match captured.value {
+            CapturedValue::String(value) => {
+                blocks
+                    .entry(index)
+                    .or_default()
+                    .result_text
+                    .push((0, value));
+            }
+            CapturedValue::Container => {}
+            CapturedValue::Scalar(_) => {
+                return Err(DecodeError::Malformed(
+                    "invalid-tool-result-content".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct TypedText {
+    kind: Option<String>,
+    text: Option<SecureCapturedString>,
+}
+
+fn collect_nested_result_text(
+    record: &dyn RecordSource,
+    blocks: &mut BTreeMap<usize, Block>,
+    remaining: usize,
+) -> Result<(), DecodeError> {
+    let mut nested = BTreeMap::<(usize, usize), TypedText>::new();
+    insert_nested_kind(
+        &mut nested,
+        capture_matches(
+            record,
+            &["message", "content", "content", "type"],
+            MAX_ID_BYTES,
+        )?,
+    )?;
+    insert_nested_text(
+        &mut nested,
+        capture_matches_bounded(
+            record,
+            &["message", "content", "content", "text"],
+            MAX_CAPTURE_BYTES.min(remaining),
+            remaining,
+        )?,
+    )?;
+    for ((outer, inner), value) in nested {
+        if value.kind.as_deref() == Some("text")
+            && let Some(text) = value.text
+        {
+            blocks
+                .entry(outer)
+                .or_default()
+                .result_text
+                .push((inner.saturating_add(1), text));
+        }
+    }
+    Ok(())
+}
+
+fn insert_nested_kind(
+    nested: &mut BTreeMap<(usize, usize), TypedText>,
+    matches: Vec<CapturedMatch>,
+) -> Result<(), DecodeError> {
+    let mut seen = HashSet::new();
+    for captured in matches {
+        let key = nested_index(&captured)?;
+        if !seen.insert(key) {
+            return Err(DecodeError::Malformed(
+                "duplicate-nested-result-field".to_owned(),
+            ));
+        }
+        if let CapturedValue::String(value) = captured.value {
+            nested.entry(key).or_default().kind =
+                Some(required_identifier(value, MAX_ID_BYTES, "result.type")?);
+        }
+    }
+    Ok(())
+}
+
+fn insert_nested_text(
+    nested: &mut BTreeMap<(usize, usize), TypedText>,
+    matches: Vec<CapturedMatch>,
+) -> Result<(), DecodeError> {
+    let mut seen = HashSet::new();
+    for captured in matches {
+        let key = nested_index(&captured)?;
+        if !seen.insert(key) {
+            return Err(DecodeError::Malformed(
+                "duplicate-nested-result-field".to_owned(),
+            ));
+        }
+        if let CapturedValue::String(value) = captured.value {
+            nested.entry(key).or_default().text = Some(value);
+        }
+    }
+    Ok(())
+}
+
+fn nested_index(captured: &CapturedMatch) -> Result<(usize, usize), DecodeError> {
+    match captured.array_indices.as_slice() {
+        [outer] => Ok((*outer, 0)),
+        [outer, inner] => Ok((*outer, *inner)),
+        _ => Err(DecodeError::Malformed(
+            "invalid-nested-result-location".to_owned(),
+        )),
+    }
+}
+
 fn projected_bytes(blocks: &BTreeMap<usize, Block>) -> Result<usize, DecodeError> {
     blocks.values().try_fold(0_usize, |total, block| {
-        [&block.text, &block.raw_input, &block.raw_output]
+        [&block.text, &block.raw_input]
             .into_iter()
             .flatten()
             .try_fold(total, |subtotal, capture| {
                 subtotal
                     .checked_add(capture.bytes.len())
                     .ok_or(DecodeError::OutputTooLarge)
-            })
+            })?
+            .checked_add(
+                block
+                    .result_text
+                    .iter()
+                    .map(|(_, capture)| capture.bytes.len())
+                    .sum::<usize>(),
+            )
+            .ok_or(DecodeError::OutputTooLarge)
     })
 }
 
@@ -748,7 +874,7 @@ fn ensure_projection_budget(
 fn emit_message(
     scope: EventScope<'_>,
     actor: Actor,
-    captured_content: CapturedString,
+    captured_content: SecureCapturedString,
     local_ordinal: u32,
     output: &mut Output,
 ) -> Result<(), DecodeError> {
@@ -861,7 +987,7 @@ fn emit_tool_result(
     state: &mut ClaudeStateV1,
     output: &mut Output,
     index: usize,
-    block: Block,
+    mut block: Block,
 ) -> Result<(), DecodeError> {
     let result_id = block
         .result_id
@@ -869,9 +995,22 @@ fn emit_tool_result(
     let Some(link) = state.take_tool(&result_id) else {
         return Ok(());
     };
-    let top_output = capture_single_raw(record, &["toolUseResult"])?;
-    let raw_output = block.raw_output.or(top_output);
-    let result_content_hash = raw_output.as_ref().map(|value| value.hash.clone());
+    block.result_text.sort_by_key(|(ordinal, _)| *ordinal);
+    let mut result_parts = block
+        .result_text
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>();
+    let retained = result_parts.iter().try_fold(0_usize, |total, value| {
+        total
+            .checked_add(value.bytes.len())
+            .ok_or(DecodeError::OutputTooLarge)
+    })?;
+    result_parts.extend(collect_top_result_text(
+        record,
+        MAX_CAPTURE_BYTES.saturating_sub(retained),
+    )?);
+    let safe_output = combine_text(result_parts)?;
     let top_error = optional_bool(record, &["toolUseResult", "isError"])?;
     let failed = block.is_error.or(top_error).unwrap_or(false);
     let outcome = if failed {
@@ -882,12 +1021,12 @@ fn emit_tool_result(
     let local_ordinal = ordinal(index, 2)?;
     let source_identity = source_identity(scope.source, scope.context);
     let event_id = EventId::from_source(&source_identity, local_ordinal);
-    let output_ref = raw_output
+    let output_ref = safe_output
         .map(|value| {
             make_content(
                 value,
                 DisclosureClass::ToolResult,
-                "application/json",
+                "text/plain",
                 ContentOwner {
                     project_root: None,
                     event_id: &event_id,
@@ -918,46 +1057,155 @@ fn emit_tool_result(
     )?;
     output.push_event(event)?;
 
-    if !failed
-        && is_write_tool(&link.tool_name)
-        && let Some(path) = link.project_relative_path
-    {
-        let artifact_ordinal = ordinal(index, 3)?;
-        let artifact_event_id = EventId::from_source(&source_identity, artifact_ordinal);
-        let path_capture = capture_from_derived(path.as_bytes())?;
-        let path_ref = make_content(
-            path_capture,
-            DisclosureClass::ObservedState,
-            "text/uri-list",
-            ContentOwner {
-                project_root: None,
-                event_id: &artifact_event_id,
-                source_identity: &source_identity,
-                ordinal: artifact_ordinal,
-            },
-            output,
-        )?;
-        let event = make_event(
-            scope,
-            artifact_event_id,
-            SemanticKey::from_native(
-                Provider::Claude,
-                &scope.identity.session_id,
-                "artifact",
-                &result_id,
-            ),
-            Actor::Tool,
-            Some(result_id),
-            Some(event_id.as_str().to_owned()),
-            EventPayload::ArtifactChanged {
-                path: path_ref,
-                operation: link.tool_name,
-                content_hash: result_content_hash,
-            },
-        )?;
-        output.push_event(event)?;
-    }
+    emit_artifact_change(
+        scope,
+        output,
+        index,
+        failed,
+        result_id,
+        (&source_identity, &event_id),
+        link,
+    )?;
     Ok(())
+}
+
+fn emit_artifact_change(
+    scope: EventScope<'_>,
+    output: &mut Output,
+    index: usize,
+    failed: bool,
+    result_id: String,
+    identity: (&SourceIdentity, &EventId),
+    link: ToolLink,
+) -> Result<(), DecodeError> {
+    if failed || !is_write_tool(&link.tool_name) {
+        return Ok(());
+    }
+    let Some(path) = link.project_relative_path else {
+        return Ok(());
+    };
+    let (source_identity, parent_event_id) = identity;
+    let artifact_ordinal = ordinal(index, 3)?;
+    let artifact_event_id = EventId::from_source(source_identity, artifact_ordinal);
+    let path_capture = capture_from_derived(path.as_bytes())?;
+    let path_ref = make_content(
+        path_capture,
+        DisclosureClass::ObservedState,
+        "text/uri-list",
+        ContentOwner {
+            project_root: None,
+            event_id: &artifact_event_id,
+            source_identity,
+            ordinal: artifact_ordinal,
+        },
+        output,
+    )?;
+    let event = make_event(
+        scope,
+        artifact_event_id,
+        SemanticKey::from_native(
+            Provider::Claude,
+            &scope.identity.session_id,
+            "artifact",
+            &result_id,
+        ),
+        Actor::Tool,
+        Some(result_id),
+        Some(parent_event_id.as_str().to_owned()),
+        EventPayload::ArtifactChanged {
+            path: path_ref,
+            operation: link.tool_name,
+            content_hash: None,
+        },
+    )?;
+    output.push_event(event)
+}
+
+fn collect_top_result_text(
+    record: &dyn RecordSource,
+    retained_budget: usize,
+) -> Result<Vec<SecureCapturedString>, DecodeError> {
+    let mut output = Vec::new();
+    let mut remaining = retained_budget;
+    for path in [&["toolUseResult"][..], &["toolUseResult", "content"][..]] {
+        if let Some(value) =
+            capture_single_string(record, path, remaining.min(MAX_CAPTURE_BYTES), true)?.0
+        {
+            remaining = remaining.saturating_sub(value.bytes.len());
+            output.push(value);
+        }
+    }
+    let retained = output.iter().try_fold(0_usize, |total, value| {
+        total
+            .checked_add(value.bytes.len())
+            .ok_or(DecodeError::OutputTooLarge)
+    })?;
+    let remaining = retained_budget.saturating_sub(retained);
+    output.extend(collect_top_typed_text(
+        record,
+        &["toolUseResult", "type"],
+        &["toolUseResult", "text"],
+        remaining,
+    )?);
+    let retained = output.iter().try_fold(0_usize, |total, value| {
+        total
+            .checked_add(value.bytes.len())
+            .ok_or(DecodeError::OutputTooLarge)
+    })?;
+    output.extend(collect_top_typed_text(
+        record,
+        &["toolUseResult", "content", "type"],
+        &["toolUseResult", "content", "text"],
+        retained_budget.saturating_sub(retained),
+    )?);
+    Ok(output)
+}
+
+fn collect_top_typed_text(
+    record: &dyn RecordSource,
+    type_path: &[&str],
+    text_path: &[&str],
+    retained_budget: usize,
+) -> Result<Vec<SecureCapturedString>, DecodeError> {
+    let mut values = BTreeMap::<Vec<usize>, TypedText>::new();
+    let mut seen = HashSet::new();
+    for captured in capture_matches(record, type_path, MAX_ID_BYTES)? {
+        let key = captured.array_indices;
+        if !seen.insert(key.clone()) {
+            return Err(DecodeError::Malformed(
+                "duplicate-top-result-field".to_owned(),
+            ));
+        }
+        if let CapturedValue::String(value) = captured.value {
+            values.entry(key).or_default().kind =
+                Some(required_identifier(value, MAX_ID_BYTES, "result.type")?);
+        }
+    }
+    seen.clear();
+    for captured in capture_matches_bounded(
+        record,
+        text_path,
+        MAX_CAPTURE_BYTES.min(retained_budget),
+        retained_budget,
+    )? {
+        let key = captured.array_indices;
+        if !seen.insert(key.clone()) {
+            return Err(DecodeError::Malformed(
+                "duplicate-top-result-field".to_owned(),
+            ));
+        }
+        if let CapturedValue::String(value) = captured.value {
+            values.entry(key).or_default().text = Some(value);
+        }
+    }
+    Ok(values
+        .into_values()
+        .filter_map(|value| {
+            (value.kind.as_deref() == Some("text"))
+                .then_some(value.text)
+                .flatten()
+        })
+        .collect())
 }
 
 fn make_event(
@@ -991,13 +1239,13 @@ fn make_event(
 }
 
 fn make_content(
-    mut capture: CapturedString,
+    mut capture: SecureCapturedString,
     disclosure: DisclosureClass,
     media_type: &'static str,
     owner: ContentOwner<'_>,
     output: &mut Output,
 ) -> Result<ContentRef, DecodeError> {
-    let plaintext = Zeroizing::new(std::mem::take(&mut capture.bytes));
+    let plaintext = std::mem::take(&mut capture.bytes);
     let text = std::str::from_utf8(&plaintext)
         .map_err(|_| DecodeError::Malformed("invalid-content-utf8".to_owned()))?;
     let redacted = RedactionPolicy::new()
@@ -1008,7 +1256,7 @@ fn make_content(
         evidence_id: evidence_id.clone(),
     });
     let content = ContentRef::bounded(
-        capture.hash,
+        capture.take_hash(),
         capture.total_bytes,
         media_type,
         locator,
@@ -1117,8 +1365,21 @@ fn capture_matches(
     path: &[&str],
     limit: usize,
 ) -> Result<Vec<CapturedMatch>, DecodeError> {
+    let aggregate = limit
+        .checked_mul(MAX_MATCHES)
+        .unwrap_or(MAX_RECORD_SEMANTIC_BYTES)
+        .min(MAX_RECORD_SEMANTIC_BYTES);
+    capture_matches_bounded(record, path, limit, aggregate)
+}
+
+fn capture_matches_bounded(
+    record: &dyn RecordSource,
+    path: &[&str],
+    limit: usize,
+    max_retained_bytes: usize,
+) -> Result<Vec<CapturedMatch>, DecodeError> {
     let mut reader = BoundedJsonReader::new(record.open()?);
-    reader.capture_matches(path, limit, MAX_MATCHES)
+    reader.capture_matches(path, limit, MAX_MATCHES, max_retained_bytes)
 }
 
 fn capture_raw_matches(
@@ -1135,9 +1396,9 @@ fn capture_single_string(
     path: &[&str],
     limit: usize,
     require_direct: bool,
-) -> Result<(Option<CapturedString>, String), DecodeError> {
+) -> Result<(Option<SecureCapturedString>, String), DecodeError> {
     let mut reader = BoundedJsonReader::new(record.open()?);
-    let matches = reader.capture_matches(path, limit, 2)?;
+    let matches = reader.capture_matches(path, limit, 2, limit.saturating_mul(2))?;
     let schema = reader
         .schema_fingerprint()
         .ok_or_else(|| DecodeError::Malformed("missing-schema".to_owned()))?
@@ -1147,47 +1408,23 @@ fn capture_single_string(
             "duplicate-selected-field".to_owned(),
         ));
     }
-    let value = matches
-        .into_iter()
-        .next()
-        .map(|captured| {
-            if require_direct && !captured.array_indices.is_empty() {
-                return Err(DecodeError::Malformed(
-                    "invalid-identity-location".to_owned(),
-                ));
-            }
-            match captured.value {
-                CapturedValue::String(value) => Ok(value),
-                CapturedValue::Scalar(_) => {
-                    Err(DecodeError::Malformed("selected-non-string".to_owned()))
-                }
-            }
-        })
-        .transpose()?;
-    Ok((value, schema))
-}
-
-fn capture_single_raw(
-    record: &dyn RecordSource,
-    path: &[&str],
-) -> Result<Option<CapturedString>, DecodeError> {
-    let mut reader = BoundedJsonReader::new(record.open()?);
-    let matches = reader.capture_raw_matches(path, MAX_CAPTURE_BYTES, 2, MAX_CAPTURE_BYTES)?;
-    if matches.len() > 1 {
-        return Err(DecodeError::Malformed(
-            "duplicate-selected-field".to_owned(),
-        ));
-    }
-    matches
-        .into_iter()
-        .next()
-        .map(|captured| match captured.value {
-            CapturedValue::String(value) => Ok(value),
+    let value = if let Some(captured) = matches.into_iter().next() {
+        if require_direct && !captured.array_indices.is_empty() {
+            return Err(DecodeError::Malformed(
+                "invalid-identity-location".to_owned(),
+            ));
+        }
+        match captured.value {
+            CapturedValue::String(value) => Some(value),
+            CapturedValue::Container => None,
             CapturedValue::Scalar(_) => {
-                Err(DecodeError::Malformed("invalid-raw-selection".to_owned()))
+                return Err(DecodeError::Malformed("selected-non-string".to_owned()));
             }
-        })
-        .transpose()
+        }
+    } else {
+        None
+    };
+    Ok((value, schema))
 }
 
 fn optional_identifier(
@@ -1207,13 +1444,13 @@ fn optional_bounded_text(
     limit: usize,
 ) -> Result<Option<String>, DecodeError> {
     let value = capture_single_string(record, path, limit, true)?.0;
-    let Some(value) = value else {
+    let Some(mut value) = value else {
         return Ok(None);
     };
     if value.truncated || value.total_bytes > limit as u64 {
         return Ok(None);
     }
-    String::from_utf8(value.bytes)
+    String::from_utf8(value.take_bytes())
         .map(Some)
         .map_err(|_| DecodeError::Malformed("invalid-context-text".to_owned()))
 }
@@ -1233,7 +1470,7 @@ fn optional_bool(record: &dyn RecordSource, path: &[&str]) -> Result<Option<bool
 }
 
 fn required_identifier(
-    value: CapturedString,
+    value: SecureCapturedString,
     limit: usize,
     field: &'static str,
 ) -> Result<String, DecodeError> {
@@ -1245,25 +1482,25 @@ fn required_identifier(
     }
 }
 
-fn safe_native_type(value: CapturedString) -> String {
+fn safe_native_type(mut value: SecureCapturedString) -> String {
     if value.truncated || value.total_bytes > MAX_ID_BYTES as u64 {
         return "invalid-native-type".to_owned();
     }
-    String::from_utf8(value.bytes)
+    String::from_utf8(value.take_bytes())
         .ok()
         .filter(|value| bounded_identifier(value, MAX_ID_BYTES))
         .unwrap_or_else(|| "invalid-native-type".to_owned())
 }
 
 fn captured_text(
-    value: CapturedString,
+    mut value: SecureCapturedString,
     limit: usize,
     field: &'static str,
 ) -> Result<String, DecodeError> {
     if value.truncated || value.total_bytes > limit as u64 {
         return Err(DecodeError::Malformed(format!("oversized-{field}")));
     }
-    String::from_utf8(value.bytes)
+    String::from_utf8(value.take_bytes())
         .map_err(|_| DecodeError::Malformed(format!("invalid-{field}-utf8")))
 }
 
@@ -1290,7 +1527,7 @@ fn insert_capture_field<F>(
     mut insert: F,
 ) -> Result<(), DecodeError>
 where
-    F: FnMut(&mut Block, CapturedString) -> Result<(), DecodeError>,
+    F: FnMut(&mut Block, SecureCapturedString) -> Result<(), DecodeError>,
 {
     let mut seen = HashSet::new();
     for captured in matches {
@@ -1312,7 +1549,7 @@ fn insert_string_field<F>(
     insert: F,
 ) -> Result<(), DecodeError>
 where
-    F: FnMut(&mut Block, CapturedString) -> Result<(), DecodeError>,
+    F: FnMut(&mut Block, SecureCapturedString) -> Result<(), DecodeError>,
 {
     insert_capture_field(blocks, matches, insert)
 }
@@ -1350,9 +1587,10 @@ fn normalize_project_path(value: &str, root: Option<&Path>) -> Option<String> {
     if value.len() > MAX_PATH_BYTES || value.chars().any(char::is_control) {
         return None;
     }
+    let root = root?;
     let path = Path::new(value);
     let relative = if path.is_absolute() {
-        path.strip_prefix(root?).ok()?
+        path.strip_prefix(root).ok()?
     } else {
         path
     };
@@ -1409,10 +1647,10 @@ fn ordinal(index: usize, kind: u32) -> Result<u32, DecodeError> {
         .ok_or(DecodeError::OutputTooLarge)
 }
 
-fn capture_from_derived(value: &[u8]) -> Result<CapturedString, DecodeError> {
+fn capture_from_derived(value: &[u8]) -> Result<SecureCapturedString, DecodeError> {
     let length = u64::try_from(value.len()).map_err(|_| DecodeError::OutputTooLarge)?;
-    Ok(CapturedString {
-        bytes: value.to_vec(),
+    Ok(SecureCapturedString {
+        bytes: Zeroizing::new(value.to_vec()),
         total_bytes: length,
         hash: blake3::hash(value).to_hex().to_string(),
         truncated: false,

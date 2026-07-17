@@ -17,10 +17,11 @@ const MAX_HASH_BYTES: usize = 128;
 const MAX_PROJECT_PATH_BYTES: usize = 512;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub(super) struct ClaudeStateV1 {
     unresolved_tools: VecDeque<ToolLink>,
     last_human_turn: Option<String>,
-    last_context_hash: Option<String>,
+    context: ContextSnapshot,
 }
 
 impl fmt::Debug for ClaudeStateV1 {
@@ -29,7 +30,31 @@ impl fmt::Debug for ClaudeStateV1 {
             .debug_struct("ClaudeStateV1")
             .field("unresolved_tool_count", &self.unresolved_tools.len())
             .field("has_last_human_turn", &self.last_human_turn.is_some())
-            .field("has_context_hash", &self.last_context_hash.is_some())
+            .field("has_context_cwd", &self.context.cwd.is_some())
+            .field("has_context_mode", &self.context.mode.is_some())
+            .field("has_context_permission", &self.context.permission.is_some())
+            .field("has_context_branch", &self.context.branch_hash.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub(super) struct ContextSnapshot {
+    pub cwd: Option<String>,
+    pub mode: Option<String>,
+    pub permission: Option<String>,
+    pub branch_hash: Option<String>,
+}
+
+impl fmt::Debug for ContextSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ContextSnapshot")
+            .field("has_cwd", &self.cwd.is_some())
+            .field("has_mode", &self.mode.is_some())
+            .field("has_permission", &self.permission.is_some())
+            .field("has_branch_hash", &self.branch_hash.is_some())
             .finish()
     }
 }
@@ -98,18 +123,33 @@ impl ClaudeStateV1 {
         self.unresolved_tools.remove(index)
     }
 
-    pub fn update_context(&mut self, context_hash: String) -> Result<bool, DecodeError> {
-        if !bounded_identifier(&context_hash, MAX_HASH_BYTES) {
-            return Err(DecodeError::Malformed(
-                "invalid-claude-context-hash".to_owned(),
-            ));
+    pub fn merge_context(
+        &mut self,
+        cwd: Option<String>,
+        mode: Option<String>,
+        permission: Option<String>,
+        branch_hash: Option<String>,
+    ) -> Result<Option<ContextSnapshot>, DecodeError> {
+        let mut merged = self.context.clone();
+        if let Some(cwd) = cwd {
+            merged.cwd = Some(cwd);
         }
-        if self.last_context_hash.as_ref() == Some(&context_hash) {
-            return Ok(false);
+        if let Some(mode) = mode {
+            merged.mode = Some(mode);
         }
-        self.last_context_hash = Some(context_hash);
+        if let Some(permission) = permission {
+            merged.permission = Some(permission);
+        }
+        if let Some(branch_hash) = branch_hash {
+            merged.branch_hash = Some(branch_hash);
+        }
+        merged.validate()?;
+        if merged == self.context {
+            return Ok(None);
+        }
+        self.context = merged.clone();
         self.fit_serialized_bound()?;
-        Ok(true)
+        Ok(Some(merged))
     }
 
     pub fn encode_bounded(mut self) -> Result<DecoderState, DecodeError> {
@@ -136,15 +176,7 @@ impl ClaudeStateV1 {
                 "invalid-claude-state-turn".to_owned(),
             ));
         }
-        if self
-            .last_context_hash
-            .as_ref()
-            .is_some_and(|value| !bounded_identifier(value, MAX_HASH_BYTES))
-        {
-            return Err(DecodeError::Malformed(
-                "invalid-claude-state-context".to_owned(),
-            ));
-        }
+        self.context.validate()?;
         for link in &self.unresolved_tools {
             link.validate()?;
         }
@@ -161,6 +193,40 @@ impl ClaudeStateV1 {
             }
         }
         Ok(())
+    }
+}
+
+impl ContextSnapshot {
+    fn validate(&self) -> Result<(), DecodeError> {
+        let valid_cwd = self.cwd.as_ref().is_none_or(|value| {
+            value == "$PROJECT"
+                || (value.starts_with("$PROJECT/")
+                    && value.len() <= MAX_PROJECT_PATH_BYTES
+                    && !value.chars().any(char::is_control)
+                    && Path::new(value.trim_start_matches("$PROJECT/"))
+                        .components()
+                        .all(|component| matches!(component, Component::Normal(_))))
+        });
+        let valid = valid_cwd
+            && self
+                .mode
+                .as_ref()
+                .is_none_or(|value| bounded_identifier(value, MAX_TOOL_NAME_BYTES))
+            && self
+                .permission
+                .as_ref()
+                .is_none_or(|value| bounded_identifier(value, MAX_TOOL_NAME_BYTES))
+            && self
+                .branch_hash
+                .as_ref()
+                .is_none_or(|value| bounded_identifier(value, MAX_HASH_BYTES));
+        if valid {
+            Ok(())
+        } else {
+            Err(DecodeError::Malformed(
+                "invalid-claude-state-context".to_owned(),
+            ))
+        }
     }
 }
 
