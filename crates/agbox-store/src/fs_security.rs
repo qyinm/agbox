@@ -1,3 +1,10 @@
+//! Filesystem confinement for the local evidence vault.
+//!
+//! The owner-only policy treats processes running as the current account as
+//! trusted to mutate the vault, while ownership, exact modes, no-follow opens,
+//! and descriptor-relative operations exclude other OS users. Intermediate
+//! symlink components are accepted only when owned by the system root account.
+
 use std::{
     ffi::OsStr,
     fs::{self, File},
@@ -7,8 +14,61 @@ use std::{
 
 use rustix::fs::{self as rustix_fs, AtFlags, FileType, Mode, OFlags};
 
+#[cfg(test)]
+mod tests {
+    use super::{DirectoryIdentity, is_trusted_intermediate_symlink_owner, require_identity_match};
+
+    #[test]
+    fn intermediate_symlink_owner_policy_allows_only_root() {
+        assert!(is_trusted_intermediate_symlink_owner(0));
+        assert!(!is_trusted_intermediate_symlink_owner(1));
+        assert!(!is_trusted_intermediate_symlink_owner(501));
+        assert!(!is_trusted_intermediate_symlink_owner(u32::MAX));
+    }
+
+    #[test]
+    fn startup_identity_mismatch_is_rejected() {
+        let held = DirectoryIdentity {
+            device: 11,
+            inode: 22,
+        };
+        let same = DirectoryIdentity {
+            device: 11,
+            inode: 22,
+        };
+        let replaced = DirectoryIdentity {
+            device: 11,
+            inode: 23,
+        };
+
+        assert!(require_identity_match(held, same).is_ok());
+        assert!(require_identity_match(held, replaced).is_err());
+    }
+}
+
 const OWNER_DIRECTORY_MODE: u32 = 0o700;
 const OWNER_FILE_MODE: u32 = 0o600;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn require_identity_match(
+    expected: DirectoryIdentity,
+    observed: DirectoryIdentity,
+) -> io::Result<()> {
+    if expected == observed {
+        Ok(())
+    } else {
+        Err(security_error("evidence root changed during startup"))
+    }
+}
+
+fn is_trusted_intermediate_symlink_owner(uid: u32) -> bool {
+    uid == 0
+}
 
 fn security_error(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
@@ -26,7 +86,9 @@ fn ensure_directory_metadata(metadata: &fs::Metadata) -> io::Result<()> {
     {
         use std::os::unix::fs::MetadataExt;
 
-        if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
+        if metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.mode() & 0o7777 != OWNER_DIRECTORY_MODE
+        {
             return Err(security_error("evidence root is not owner-controlled"));
         }
     }
@@ -93,14 +155,17 @@ pub(crate) fn ensure_owner_directory(path: &Path) -> io::Result<()> {
                                 return Err(security_error("evidence root must not be a symlink"));
                             }
                             #[cfg(unix)]
-                            {
+                            let trusted_system_symlink = {
                                 use std::os::unix::fs::MetadataExt;
 
-                                if metadata.uid() == rustix::process::geteuid().as_raw() {
-                                    return Err(security_error(
-                                        "evidence root contains a user-owned symlink",
-                                    ));
-                                }
+                                is_trusted_intermediate_symlink_owner(metadata.uid())
+                            };
+                            #[cfg(not(unix))]
+                            let trusted_system_symlink = false;
+                            if !trusted_system_symlink {
+                                return Err(security_error(
+                                    "evidence root contains an untrusted symlink",
+                                ));
                             }
                             if !fs::metadata(&current)?.is_dir() {
                                 return Err(security_error(
@@ -156,7 +221,7 @@ fn ensure_owner_stat(stat: &rustix_fs::Stat, expected: FileType) -> io::Result<(
         let mode = u32::from(stat.st_mode);
         #[allow(clippy::verbose_bit_mask)]
         let mode_ok = if expected == FileType::Directory {
-            mode & 0o077 == 0
+            mode & 0o7777 == OWNER_DIRECTORY_MODE
         } else {
             mode & 0o7777 == OWNER_FILE_MODE
         };
@@ -193,6 +258,63 @@ pub(crate) fn open_owner_directory(path: &Path) -> io::Result<File> {
     Ok(directory)
 }
 
+#[cfg(unix)]
+fn metadata_identity(metadata: &fs::Metadata) -> DirectoryIdentity {
+    use std::os::unix::fs::MetadataExt;
+
+    DirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(unix)]
+fn verify_directory_path_identity(path: &Path, expected: DirectoryIdentity) -> io::Result<()> {
+    let link_metadata = fs::symlink_metadata(path)?;
+    if link_metadata.file_type().is_symlink() {
+        return Err(security_error("evidence root must not be a symlink"));
+    }
+    let metadata = fs::metadata(path)?;
+    ensure_directory_metadata(&metadata)?;
+    require_identity_match(expected, metadata_identity(&metadata))
+}
+
+#[cfg(not(unix))]
+fn verify_directory_path_identity(path: &Path) -> io::Result<()> {
+    let link_metadata = fs::symlink_metadata(path)?;
+    if link_metadata.file_type().is_symlink() {
+        return Err(security_error("evidence root must not be a symlink"));
+    }
+    ensure_directory_metadata(&fs::metadata(path)?)
+}
+
+pub(crate) fn open_bound_owner_directory(path: &Path) -> io::Result<(PathBuf, File)> {
+    ensure_owner_directory(path)?;
+    let directory = open_owner_directory(path)?;
+
+    #[cfg(unix)]
+    let expected = {
+        let metadata = directory.metadata()?;
+        ensure_directory_metadata(&metadata)?;
+        metadata_identity(&metadata)
+    };
+
+    // Canonicalize only after the no-follow descriptor is held, then compare
+    // both the original spelling and resolved path against that descriptor.
+    let canonical = path.canonicalize()?;
+    #[cfg(unix)]
+    {
+        verify_directory_path_identity(path, expected)?;
+        verify_directory_path_identity(&canonical, expected)?;
+    }
+    #[cfg(not(unix))]
+    {
+        verify_directory_path_identity(path)?;
+        verify_directory_path_identity(&canonical)?;
+    }
+    Ok((canonical, directory))
+}
+
 pub(crate) fn create_owner_temp_file(directory: &File, name: &OsStr) -> io::Result<File> {
     #[cfg(unix)]
     {
@@ -213,11 +335,36 @@ pub(crate) fn create_owner_temp_file(directory: &File, name: &OsStr) -> io::Resu
     }
 }
 
+#[cfg(unix)]
+fn verify_name_matches_file(directory: &File, name: &OsStr, file: &File) -> io::Result<()> {
+    let expected = rustix_fs::fstat(file).map_err(io::Error::from)?;
+    ensure_owner_stat(&expected, FileType::RegularFile)?;
+    let observed =
+        rustix_fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+    if !same_stat(&expected, &observed) {
+        return Err(security_error(
+            "evidence temporary file changed during publish",
+        ));
+    }
+    ensure_owner_stat(&observed, FileType::RegularFile)
+}
+
+#[cfg(not(unix))]
+fn verify_name_matches_file(directory: &File, name: &OsStr, file: &File) -> io::Result<()> {
+    let _ = directory;
+    let _ = name;
+    ensure_file_metadata(&file.metadata()?)
+}
+
 pub(crate) fn link_owner_file(
     directory: &File,
     temporary: &OsStr,
     destination: &OsStr,
+    temporary_file: &File,
 ) -> io::Result<()> {
+    // Keep the descriptor open and verify the source name immediately before
+    // linking, so a replaced temporary path cannot be published.
+    verify_name_matches_file(directory, temporary, temporary_file)?;
     #[cfg(unix)]
     {
         rustix_fs::linkat(
@@ -227,12 +374,25 @@ pub(crate) fn link_owner_file(
             destination,
             AtFlags::empty(),
         )
-        .map_err(io::Error::from)
+        .map_err(io::Error::from)?;
+
+        // A successful hard link must resolve to the same inode as the held
+        // temporary descriptor. Remove the destination if the identity check
+        // observes a concurrent replacement and fail closed.
+        if let Err(error) = verify_name_matches_file(directory, destination, temporary_file) {
+            let _ = remove_owner_file(directory, destination);
+            return Err(error);
+        }
+        Ok(())
     }
     #[cfg(not(unix))]
     {
-        let _ = directory;
-        fs::hard_link(Path::new(temporary), Path::new(destination))
+        fs::hard_link(Path::new(temporary), Path::new(destination))?;
+        if let Err(error) = verify_name_matches_file(directory, destination, temporary_file) {
+            let _ = remove_owner_file(directory, destination);
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -266,7 +426,6 @@ fn ensure_file_metadata(metadata: &fs::Metadata) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 #[cfg(unix)]
 fn same_stat(before: &rustix_fs::Stat, after: &rustix_fs::Stat) -> bool {
     before.st_dev == after.st_dev && before.st_ino == after.st_ino

@@ -6,8 +6,9 @@ use zeroize::Zeroizing;
 use crate::{
     crypto::{CryptoError, KeyProvider, open, seal},
     fs_security::{
-        create_owner_temp_file, ensure_owner_directory, link_owner_file, open_owner_directory,
-        read_owner_file_nofollow, remove_owner_file, set_owner_file_mode, validate_owner_file,
+        create_owner_temp_file, ensure_owner_directory, link_owner_file,
+        open_bound_owner_directory, read_owner_file_nofollow, remove_owner_file,
+        set_owner_file_mode, validate_owner_file,
     },
 };
 
@@ -64,14 +65,14 @@ impl EvidenceVault {
     /// # Errors
     ///
     /// Returns [`EvidenceError`] when the root is not owner-controlled or the
-    /// credential store cannot provide the master key.
+    /// credential store cannot provide the master key. Owner-only mode treats
+    /// the current account as trusted to mutate its vault; other OS users are
+    /// excluded by ownership, exact permissions, and no-follow checks.
     #[allow(clippy::needless_pass_by_value)]
     pub fn open(root: PathBuf, keys: Arc<dyn KeyProvider>) -> Result<Self, EvidenceError> {
         ensure_owner_directory(&root)?;
         let key = keys.master_key()?;
-        let root = root.canonicalize()?;
-        ensure_owner_directory(&root)?;
-        let root_directory = open_owner_directory(&root)?;
+        let (root, root_directory) = open_bound_owner_directory(&root)?;
         Ok(Self {
             root,
             root_directory,
@@ -162,7 +163,7 @@ impl EvidenceVault {
         set_owner_file_mode(&file)?;
         file.write_all(&envelope)?;
         file.sync_all()?;
-        match link_owner_file(&self.root_directory, &temporary, destination) {
+        match link_owner_file(&self.root_directory, &temporary, destination, &file) {
             Ok(()) => {
                 cleanup.remove_now()?;
                 self.root_directory.sync_all()?;
