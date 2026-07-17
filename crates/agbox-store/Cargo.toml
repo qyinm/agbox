@@ -1,0 +1,25 @@
+[package]
+name = "agbox-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+agbox-core.workspace = true
+chacha20poly1305.workspace = true
+keyring.workspace = true
+rustix.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+agbox-core = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true
