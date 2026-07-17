@@ -1,12 +1,12 @@
 #![allow(clippy::unwrap_used)]
 
-use std::path::Path;
+use std::{fs, path::Path};
 
 use agbox_adapters::{
     CodexAdapter, DecodeContext, DecodeDisposition, DecoderState, MemoryRecordSource, RootClass,
     SourceAdapter, adapters, test_support::decode_fixture_file,
 };
-use agbox_core::{EventPayload, ProjectId, Provider};
+use agbox_core::{ActionOutcome, EventPayload, ProjectId, Provider};
 use time::OffsetDateTime;
 
 fn context() -> DecodeContext {
@@ -103,15 +103,47 @@ fn registry_roots_matcher_and_dates_are_codex_specific() {
             .collect::<Vec<_>>(),
         vec![Provider::Claude, Provider::Codex]
     );
-    let roots = CodexAdapter.roots(Path::new("/home/test"));
+    let temp = tempfile::tempdir().unwrap();
+    let roots = CodexAdapter.roots(temp.path());
     assert_eq!(roots.len(), 2);
     assert_eq!(roots[0].class, RootClass::Active);
     assert!(roots[0].path.ends_with(".codex/sessions"));
     assert_eq!(roots[1].class, RootClass::Archive);
     assert!(roots[1].path.ends_with(".codex/archived_sessions"));
-    assert!(CodexAdapter.matches(&roots[0], Path::new("2026/07/17/rollout.jsonl")));
+    let active_file = Path::new("2026/07/17/rollout.jsonl");
+    fs::create_dir_all(
+        active_file
+            .parent()
+            .map(|path| roots[0].path.join(path))
+            .unwrap(),
+    )
+    .unwrap();
+    fs::write(roots[0].path.join(active_file), b"{}\n").unwrap();
+    fs::create_dir_all(roots[0].path.join("directory.jsonl")).unwrap();
+    assert!(CodexAdapter.matches(&roots[0], active_file));
+    assert!(!CodexAdapter.matches(&roots[0], Path::new("missing.jsonl")));
+    assert!(!CodexAdapter.matches(&roots[0], Path::new("directory.jsonl")));
     assert!(!CodexAdapter.matches(&roots[0], Path::new("../rollout.jsonl")));
     assert!(!CodexAdapter.matches(&roots[0], Path::new("rollout.json")));
+    let not_a_root = temp.path().join("not-a-directory");
+    fs::write(&not_a_root, b"x").unwrap();
+    let metadata_error_root = agbox_adapters::RootSpec {
+        path: not_a_root,
+        class: RootClass::Active,
+        recursive: true,
+    };
+    assert!(!CodexAdapter.matches(&metadata_error_root, Path::new("child/file.jsonl")));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        symlink(
+            roots[0].path.join(active_file),
+            roots[0].path.join("linked.jsonl"),
+        )
+        .unwrap();
+        assert!(!CodexAdapter.matches(&roots[0], Path::new("linked.jsonl")));
+    }
     assert!(
         CodexAdapter
             .trusted_session_time(
@@ -182,6 +214,126 @@ fn result_precedence_upgrades_rank_without_duplicate_finish() {
 }
 
 #[test]
+fn late_authoritative_result_replaces_staged_failure_with_typed_success() {
+    let records = decode_lines(
+        r#"{"timestamp":"2026-07-17T03:00:00Z","ordinal":0,"type":"session_meta","payload":{"history_mode":"paginated"}}
+{"timestamp":"2026-07-17T03:00:01Z","ordinal":1,"type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"patch","call_id":"call-1"}}
+{"timestamp":"2026-07-17T03:00:02Z","ordinal":2,"type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call-1","status":"failed","output":"weak failure","path":"src/weak.rs"}}
+{"timestamp":"2026-07-17T03:00:03Z","ordinal":3,"type":"event_msg","payload":{"type":"item_completed","item":{"type":"file_change","call_id":"call-1","status":"completed","output":"typed success","changes":[{"path":"src/lib.rs","kind":"update"}]}}}"#,
+    );
+    assert_eq!(finished_count(&records[2]), 0);
+    let request_id = records[1]
+        .events()
+        .iter()
+        .find(|event| matches!(event.payload(), EventPayload::ActionRequested { .. }))
+        .unwrap()
+        .event_id()
+        .as_str();
+    let finished = records[3]
+        .events()
+        .iter()
+        .find(|event| matches!(event.payload(), EventPayload::ActionFinished { .. }))
+        .unwrap();
+    assert_eq!(finished.causation_id(), Some(request_id));
+    let EventPayload::ActionFinished {
+        outcome, output, ..
+    } = finished.payload()
+    else {
+        unreachable!();
+    };
+    assert_eq!(*outcome, ActionOutcome::Succeeded);
+    let output = output.as_ref().unwrap();
+    assert_eq!(output.byte_length(), "typed success".len() as u64);
+    assert_eq!(
+        output.hash(),
+        blake3::hash(b"typed success").to_hex().as_str()
+    );
+    assert!(
+        records[3]
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::ArtifactChanged { .. }))
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(records[3].next_state().as_bytes()).unwrap();
+    assert!(state["pending_results"].as_array().unwrap().is_empty());
+    assert_eq!(state["completed_semantic_keys"][0]["rank"], 3);
+}
+
+#[test]
+fn pending_fallback_survives_reload_and_flushes_at_terminal_boundary() {
+    let first = decode_one(
+        r#"{"timestamp":"2026-07-17T03:00:00Z","ordinal":0,"type":"session_meta","payload":{"history_mode":"paginated"}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let request = decode_one(
+        r#"{"timestamp":"2026-07-17T03:00:01Z","ordinal":1,"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call-1"}}"#,
+        first.next_state(),
+    )
+    .unwrap();
+    let request_id = request.events()[0].event_id().as_str().to_owned();
+    let weak = decode_one(
+        r#"{"timestamp":"2026-07-17T03:00:02Z","ordinal":2,"type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-1","exit_code":17,"stdout":"persisted fallback"}}"#,
+        request.next_state(),
+    )
+    .unwrap();
+    assert_eq!(finished_count(&weak), 0);
+    let staged: serde_json::Value = serde_json::from_slice(weak.next_state().as_bytes()).unwrap();
+    assert_eq!(staged["pending_results"].as_array().unwrap().len(), 1);
+    let reloaded = weak.next_state().clone();
+    let terminal = decode_one(
+        r#"{"timestamp":"2026-07-17T03:00:03Z","ordinal":3,"type":"event_msg","payload":{"type":"task_complete"}}"#,
+        &reloaded,
+    )
+    .unwrap();
+    let finished = terminal
+        .events()
+        .iter()
+        .find(|event| matches!(event.payload(), EventPayload::ActionFinished { .. }))
+        .unwrap();
+    assert_eq!(finished.causation_id(), Some(request_id.as_str()));
+    let EventPayload::ActionFinished {
+        outcome, output, ..
+    } = finished.payload()
+    else {
+        unreachable!();
+    };
+    assert_eq!(*outcome, ActionOutcome::Failed);
+    let output = output.as_ref().unwrap();
+    assert_eq!(output.byte_length(), "persisted fallback".len() as u64);
+    assert_eq!(
+        output.hash(),
+        blake3::hash(b"persisted fallback").to_hex().as_str()
+    );
+    assert!(terminal.evidence().is_empty());
+    let final_state: serde_json::Value =
+        serde_json::from_slice(terminal.next_state().as_bytes()).unwrap();
+    assert!(
+        final_state["pending_results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(final_state["completed_semantic_keys"][0]["rank"], 1);
+}
+
+#[test]
+fn legacy_response_output_flushes_as_rank_two_fallback() {
+    let records = decode_lines(
+        r#"{"timestamp":"2026-07-17T02:00:00Z","type":"session_meta","payload":{}}
+{"timestamp":"2026-07-17T02:00:01Z","type":"response_item","payload":{"type":"function_call","name":"tool","arguments":"{}","call_id":"call-1"}}
+{"timestamp":"2026-07-17T02:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"response fallback"}}
+{"timestamp":"2026-07-17T02:00:03Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+    );
+    assert_eq!(finished_count(&records[2]), 0);
+    assert_eq!(finished_count(&records[3]), 1);
+    let state: serde_json::Value =
+        serde_json::from_slice(records[3].next_state().as_bytes()).unwrap();
+    assert_eq!(state["completed_semantic_keys"][0]["rank"], 2);
+}
+
+#[test]
 fn legacy_item_completed_rank_zero_does_not_finish_a_call() {
     let records = decode_lines(
         r#"{"timestamp":"2026-07-17T02:00:00Z","type":"session_meta","payload":{}}
@@ -205,7 +357,8 @@ fn higher_rank_first_suppresses_later_lower_rank_and_replay() {
         r#"{"timestamp":"2026-07-17T02:00:00Z","type":"session_meta","payload":{}}
 {"timestamp":"2026-07-17T02:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call-1"}}
 {"timestamp":"2026-07-17T02:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"one"}}
-{"timestamp":"2026-07-17T02:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"replay"}}"#,
+{"timestamp":"2026-07-17T02:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"replay"}}
+{"timestamp":"2026-07-17T02:00:04Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
     );
     assert_eq!(legacy.iter().map(finished_count).sum::<usize>(), 1);
 }
@@ -230,6 +383,55 @@ fn unknown_variant_advances_paginated_ordinal_and_valid_record_recovers() {
 }
 
 #[test]
+fn unknown_variant_ignores_malformed_history_hint_and_recovers_after_reload() {
+    let first = decode_one(
+        r#"{"timestamp":"2026-07-17T03:00:00Z","ordinal":0,"type":"session_meta","payload":{"history_mode":"paginated"}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let oversized = "x".repeat(1024);
+    let unknown = decode_one(
+        &format!(
+            r#"{{"timestamp":"2026-07-17T03:00:01Z","ordinal":1,"type":"response_item","payload":{{"type":"future_item","history_mode":{{"secret":"DO_NOT_PARSE"}},"history_mode":"{oversized}"}}}}"#
+        ),
+        first.next_state(),
+    )
+    .unwrap();
+    assert!(matches!(
+        unknown.disposition(),
+        DecodeDisposition::UnknownType { .. }
+    ));
+    assert!(unknown.events().is_empty());
+    assert!(!String::from_utf8_lossy(unknown.next_state().as_bytes()).contains("DO_NOT_PARSE"));
+    let reloaded = unknown.next_state().clone();
+    let recovered = decode_one(
+        r#"{"timestamp":"2026-07-17T03:00:02Z","ordinal":2,"type":"compacted","payload":{"replacement_history":[]}}"#,
+        &reloaded,
+    )
+    .unwrap();
+    assert!(matches!(recovered.disposition(), DecodeDisposition::Known));
+}
+
+#[test]
+fn ordinal_exhaustion_rejects_repeated_u64_max_without_progression() {
+    let first = decode_one(
+        r#"{"timestamp":"2026-07-17T03:00:00Z","ordinal":18446744073709551615,"type":"session_meta","payload":{"history_mode":"paginated"}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let repeated = decode_one(
+        r#"{"timestamp":"2026-07-17T03:00:01Z","ordinal":18446744073709551615,"type":"compacted","payload":{}}"#,
+        first.next_state(),
+    )
+    .unwrap();
+    assert!(matches!(
+        repeated.disposition(),
+        DecodeDisposition::Malformed { .. }
+    ));
+    assert_eq!(repeated.next_state(), first.next_state());
+}
+
+#[test]
 fn reasoning_world_state_and_identityless_known_items_emit_no_activity() {
     let records = decode_lines(
         r#"{"timestamp":"2026-07-17T02:00:00Z","type":"session_meta","payload":{}}
@@ -247,7 +449,7 @@ fn reasoning_world_state_and_identityless_known_items_emit_no_activity() {
 }
 
 #[test]
-fn duplicate_and_invalid_selected_fields_are_isolated_and_rollback_state() {
+fn malformed_semantics_are_quarantined_while_envelope_progression_recovers() {
     let first = decode_one(
         r#"{"timestamp":"2026-07-17T03:00:00Z","ordinal":0,"type":"session_meta","payload":{"history_mode":"paginated"}}"#,
         &DecoderState::default(),
@@ -263,8 +465,24 @@ fn duplicate_and_invalid_selected_fields_are_isolated_and_rollback_state() {
             decoded.disposition(),
             DecodeDisposition::Malformed { .. }
         ));
-        assert_eq!(decoded.next_state(), first.next_state());
         assert!(decoded.events().is_empty());
+        let progressed: serde_json::Value =
+            serde_json::from_slice(decoded.next_state().as_bytes()).unwrap();
+        assert_eq!(progressed["last_ordinal"], 1);
+        assert_eq!(progressed["unresolved_calls"].as_array().unwrap().len(), 0);
+        let reloaded = decoded.next_state().clone();
+        let recovered = decode_one(
+            r#"{"timestamp":"2026-07-17T03:00:02Z","ordinal":2,"type":"compacted","payload":{"replacement_history":[]}}"#,
+            &reloaded,
+        )
+        .unwrap();
+        assert!(matches!(recovered.disposition(), DecodeDisposition::Known));
+        assert!(
+            recovered
+                .events()
+                .iter()
+                .any(|event| matches!(event.payload(), EventPayload::ContextCompacted { .. }))
+        );
     }
 }
 
@@ -394,6 +612,117 @@ fn artifact_changes_require_a_trusted_contained_path() {
 }
 
 #[test]
+fn duplicate_change_kind_variants_quarantine_and_following_record_recovers() {
+    for duplicate in [
+        r#""kind":"update","kind":"delete""#,
+        r#""kind":"update","kind":{"future":true}"#,
+        r#""kind":"update","kind":7"#,
+    ] {
+        let first = decode_one(
+            r#"{"timestamp":"2026-07-17T03:00:00Z","ordinal":0,"type":"session_meta","payload":{"history_mode":"paginated"}}"#,
+            &DecoderState::default(),
+        )
+        .unwrap();
+        let request = decode_one(
+            r#"{"timestamp":"2026-07-17T03:00:01Z","ordinal":1,"type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"patch","call_id":"call-1"}}"#,
+            first.next_state(),
+        )
+        .unwrap();
+        let malformed = decode_one(
+            &format!(
+                r#"{{"timestamp":"2026-07-17T03:00:02Z","ordinal":2,"type":"event_msg","payload":{{"type":"item_completed","item":{{"type":"file_change","call_id":"call-1","status":"completed","changes":[{{"path":"src/bad.rs",{duplicate}}}]}}}}}}"#
+            ),
+            request.next_state(),
+        )
+        .unwrap();
+        assert!(matches!(
+            malformed.disposition(),
+            DecodeDisposition::Malformed { .. }
+        ));
+        assert!(malformed.events().is_empty());
+        let quarantined: serde_json::Value =
+            serde_json::from_slice(malformed.next_state().as_bytes()).unwrap();
+        assert_eq!(quarantined["last_ordinal"], 2);
+        assert_eq!(quarantined["unresolved_calls"].as_array().unwrap().len(), 1);
+        let recovered = decode_one(
+            r#"{"timestamp":"2026-07-17T03:00:03Z","ordinal":3,"type":"event_msg","payload":{"type":"item_completed","item":{"type":"file_change","call_id":"call-1","status":"completed","changes":[{"path":"src/good.rs","kind":"update"}]}}}"#,
+            malformed.next_state(),
+        )
+        .unwrap();
+        assert_eq!(finished_count(&recovered), 1);
+        assert!(
+            recovered
+                .events()
+                .iter()
+                .any(|event| matches!(event.payload(), EventPayload::ArtifactChanged { .. }))
+        );
+    }
+}
+
+#[test]
+fn maximum_file_change_cardinality_shares_one_retained_budget() {
+    let first = decode_one(
+        r#"{"timestamp":"2026-07-17T03:00:00Z","ordinal":0,"type":"session_meta","payload":{"history_mode":"paginated"}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let request = decode_one(
+        r#"{"timestamp":"2026-07-17T03:00:01Z","ordinal":1,"type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"patch","call_id":"call-1"}}"#,
+        first.next_state(),
+    )
+    .unwrap();
+    let changes = (0..agbox_adapters::MAX_EVENTS_PER_RECORD)
+        .map(|index| {
+            format!(
+                r#"{{"path":"src/{index}/{}.rs","kind":"update"}}"#,
+                "p".repeat(450)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let result_text = "q".repeat(50 * 1024);
+    let completed = decode_one(
+        &format!(
+            r#"{{"timestamp":"2026-07-17T03:00:02Z","ordinal":2,"type":"event_msg","payload":{{"type":"item_completed","item":{{"type":"file_change","call_id":"call-1","status":"completed","output":"{result_text}","changes":[{changes}]}}}}}}"#
+        ),
+        request.next_state(),
+    )
+    .unwrap();
+    assert!(matches!(completed.disposition(), DecodeDisposition::Known));
+    assert_eq!(
+        completed.events().len(),
+        agbox_adapters::MAX_EVENTS_PER_RECORD
+    );
+    assert_eq!(finished_count(&completed), 1);
+    assert_eq!(
+        completed
+            .events()
+            .iter()
+            .filter(|event| matches!(event.payload(), EventPayload::ArtifactChanged { .. }))
+            .count(),
+        agbox_adapters::MAX_EVENTS_PER_RECORD - 1
+    );
+    let output = completed
+        .events()
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::ActionFinished {
+                output: Some(output),
+                ..
+            } => Some(output),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(output.byte_length(), result_text.len() as u64);
+    assert_eq!(
+        output.hash(),
+        blake3::hash(result_text.as_bytes()).to_hex().as_str()
+    );
+    assert!(completed.evidence().is_empty());
+    assert!(completed.next_state().as_bytes().len() <= agbox_adapters::MAX_DECODER_STATE_BYTES);
+}
+
+#[test]
 fn completed_window_evicts_the_129th_oldest_key() {
     let mut state = decode_one(
         r#"{"timestamp":"2026-07-17T02:00:00Z","type":"session_meta","payload":{}}"#,
@@ -413,7 +742,7 @@ fn completed_window_evicts_the_129th_oldest_key() {
         .unwrap();
         let result = decode_one(
             &format!(
-                r#"{{"timestamp":"2026-07-17T02:00:02Z","type":"response_item","payload":{{"type":"function_call_output","call_id":"{call_id}","output":"ok"}}}}"#
+                r#"{{"timestamp":"2026-07-17T02:00:02Z","type":"event_msg","payload":{{"type":"exec_command_end","call_id":"{call_id}","exit_code":0,"stdout":"ok"}}}}"#
             ),
             request.next_state(),
         )
@@ -435,7 +764,7 @@ fn completed_window_evicts_the_129th_oldest_key() {
     )
     .unwrap();
     let replay = decode_one(
-        r#"{"timestamp":"2026-07-17T02:00:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-0","output":"again"}}"#,
+        r#"{"timestamp":"2026-07-17T02:00:04Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-0","exit_code":0,"stdout":"again"}}"#,
         request.next_state(),
     )
     .unwrap();
@@ -462,7 +791,7 @@ fn historical_pressure_is_evicted_before_128_live_calls() {
         .unwrap();
         let result = decode_one(
             &format!(
-                r#"{{"timestamp":"2026-07-17T02:00:02Z","type":"response_item","payload":{{"type":"function_call_output","call_id":"{call_id}","output":"ok"}}}}"#
+                r#"{{"timestamp":"2026-07-17T02:00:02Z","type":"event_msg","payload":{{"type":"exec_command_end","call_id":"{call_id}","exit_code":0,"stdout":"ok"}}}}"#
             ),
             request.next_state(),
         )
@@ -488,12 +817,63 @@ fn historical_pressure_is_evicted_before_128_live_calls() {
     );
     assert!(state.as_bytes().len() <= agbox_adapters::MAX_DECODER_STATE_BYTES);
 
-    let result = decode_one(
+    let staged = decode_one(
         r#"{"timestamp":"2026-07-17T02:00:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-live-0","output":"still-correlated"}}"#,
         &state,
     )
     .unwrap();
-    assert_eq!(finished_count(&result), 1);
+    assert_eq!(finished_count(&staged), 0);
+    let terminal = decode_one(
+        r#"{"timestamp":"2026-07-17T02:00:05Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+        staged.next_state(),
+    )
+    .unwrap();
+    assert_eq!(finished_count(&terminal), 1);
+}
+
+#[test]
+fn pending_window_retains_128_hash_only_results_under_state_bound() {
+    let mut state = decode_one(
+        r#"{"timestamp":"2026-07-17T03:00:00Z","ordinal":0,"type":"session_meta","payload":{"history_mode":"paginated"}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap()
+    .next_state()
+    .clone();
+    for index in 0_u64..128 {
+        let call_id = format!("call-pending-{index}");
+        let request_ordinal = 1 + index * 2;
+        let result_ordinal = request_ordinal + 1;
+        let request = decode_one(
+            &format!(
+                r#"{{"timestamp":"2026-07-17T03:00:01Z","ordinal":{request_ordinal},"type":"response_item","payload":{{"type":"custom_tool_call","name":"apply_patch","input":"patch","call_id":"{call_id}"}}}}"#
+            ),
+            &state,
+        )
+        .unwrap();
+        let staged = decode_one(
+            &format!(
+                r#"{{"timestamp":"2026-07-17T03:00:02Z","ordinal":{result_ordinal},"type":"event_msg","payload":{{"type":"patch_apply_end","call_id":"{call_id}","status":"completed","output":"raw-output-pending-{index}","path":"src/{}.rs"}}}}"#,
+                "p".repeat(400)
+            ),
+            request.next_state(),
+        )
+        .unwrap();
+        assert_eq!(finished_count(&staged), 0);
+        state = staged.next_state().clone();
+    }
+    let state_json: serde_json::Value = serde_json::from_slice(state.as_bytes()).unwrap();
+    assert_eq!(state_json["pending_results"].as_array().unwrap().len(), 128);
+    assert!(
+        state_json["unresolved_calls"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(state.as_bytes().len() <= agbox_adapters::MAX_DECODER_STATE_BYTES);
+    let state_text = String::from_utf8(state.as_bytes().to_vec()).unwrap();
+    assert!(!state_text.contains("src/"));
+    assert!(!state_text.contains("raw-output"));
 }
 
 #[test]
@@ -516,7 +896,13 @@ fn large_result_keeps_exact_hash_and_length_without_plaintext_evidence() {
         request.next_state(),
     )
     .unwrap();
-    let output = result
+    assert_eq!(finished_count(&result), 0);
+    let terminal = decode_one(
+        r#"{"timestamp":"2026-07-17T02:00:03Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+        result.next_state(),
+    )
+    .unwrap();
+    let output = terminal
         .events()
         .iter()
         .find_map(|event| match event.payload() {
@@ -533,7 +919,7 @@ fn large_result_keeps_exact_hash_and_length_without_plaintext_evidence() {
         blake3::hash(large.as_bytes()).to_hex().as_str()
     );
     assert!(output.is_truncated());
-    assert!(result.evidence().is_empty());
+    assert!(terminal.evidence().is_empty());
 }
 
 #[test]
@@ -545,7 +931,8 @@ fn current_call_variants_require_durable_identity_and_status() {
 {"timestamp":"2026-07-17T02:00:03Z","type":"response_item","payload":{"type":"tool_search_output","call_id":"call-search","output":"found"}}
 {"timestamp":"2026-07-17T02:00:04Z","type":"response_item","payload":{"type":"web_search_call","id":"call-web","status":"completed","query":"rust"}}
 {"timestamp":"2026-07-17T02:00:05Z","type":"response_item","payload":{"type":"image_generation_call","id":"call-image","status":"failed","prompt":"diagram"}}
-{"timestamp":"2026-07-17T02:00:06Z","type":"response_item","payload":{"type":"web_search_call","query":"identityless"}}"#,
+{"timestamp":"2026-07-17T02:00:06Z","type":"response_item","payload":{"type":"web_search_call","query":"identityless"}}
+{"timestamp":"2026-07-17T02:00:07Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
     );
     assert_eq!(
         records
@@ -556,7 +943,7 @@ fn current_call_variants_require_durable_identity_and_status() {
         4
     );
     assert_eq!(records.iter().map(finished_count).sum::<usize>(), 3);
-    assert!(records.last().unwrap().events().is_empty());
+    assert!(records[6].events().is_empty());
 }
 
 #[cfg(unix)]

@@ -21,7 +21,10 @@ use crate::{
     json::{CapturedMatch, CapturedValue, SecureCapturedString},
 };
 
-use super::state::{CallLink, CodexStateV1, HistoryMode, bounded_identifier};
+use super::state::{
+    CallLink, CodexStateV1, HistoryMode, PendingResult, StagedArtifact, StagedContent,
+    bounded_identifier,
+};
 
 const DECODER_VERSION: &str = "codex-rollout-1";
 const MAX_ID_BYTES: usize = 128;
@@ -75,7 +78,7 @@ impl SourceAdapter for CodexAdapter {
             return false;
         }
         std::fs::symlink_metadata(root.path.join(relative))
-            .map_or(true, |metadata| metadata.file_type().is_file())
+            .is_ok_and(|metadata| metadata.file_type().is_file())
     }
 
     fn trusted_session_time(
@@ -118,6 +121,22 @@ impl SourceAdapter for CodexAdapter {
         };
         let session_id = session_id(context);
         let source = make_source(record, context, &session_id, &top_type, ordinal)?;
+        let mut progression_state = CodexStateV1::decode(prior_state)?;
+        if let Err(error) = progress_envelope(&top_type, ordinal, &mut progression_state) {
+            let observation = make_observation(
+                record,
+                context,
+                source,
+                &schema_fingerprint,
+                DecodeStatus::Malformed,
+            )?;
+            return Ok(classified_empty(
+                observation,
+                DecodeDisposition::malformed(error_class(&error)),
+                prior_state,
+            ));
+        }
+        let progressed_decoder_state = progression_state.clone().encode_bounded()?;
 
         if !known_top_type(&top_type) {
             let observation = make_observation(
@@ -127,21 +146,12 @@ impl SourceAdapter for CodexAdapter {
                 &schema_fingerprint,
                 DecodeStatus::UnknownType,
             )?;
-            let mut state = CodexStateV1::decode(prior_state)?;
-            if let Err(error) = observe_envelope_mode(record, &top_type, ordinal, &mut state) {
-                return Ok(classified_empty(
-                    observation,
-                    DecodeDisposition::malformed(error_class(&error)),
-                    prior_state,
-                ));
-            }
-            let next_state = state.encode_bounded()?;
             return Ok(record_with(
                 observation,
                 DecodeDisposition::unknown_type(&top_type),
                 Vec::new(),
                 Vec::new(),
-                next_state,
+                progressed_decoder_state,
                 prior_state,
             ));
         }
@@ -158,9 +168,10 @@ impl SourceAdapter for CodexAdapter {
                             &schema_fingerprint,
                             DecodeStatus::Malformed,
                         )?;
-                        return Ok(classified_empty(
+                        return Ok(empty_with_next_state(
                             observation,
                             DecodeDisposition::malformed(error_class(&error)),
+                            progressed_decoder_state,
                             prior_state,
                         ));
                     }
@@ -178,37 +189,21 @@ impl SourceAdapter for CodexAdapter {
                 &schema_fingerprint,
                 DecodeStatus::UnknownType,
             )?;
-            let mut state = CodexStateV1::decode(prior_state)?;
-            if let Err(error) = observe_envelope_mode(record, &top_type, ordinal, &mut state) {
-                return Ok(classified_empty(
-                    observation,
-                    DecodeDisposition::malformed(error_class(&error)),
-                    prior_state,
-                ));
-            }
-            let next_state = state.encode_bounded()?;
             return Ok(record_with(
                 observation,
                 DecodeDisposition::unknown_type(nested),
                 Vec::new(),
                 Vec::new(),
-                next_state,
+                progressed_decoder_state,
                 prior_state,
             ));
         }
 
-        let observation = make_observation(
-            record,
-            context,
-            source.clone(),
-            &schema_fingerprint,
-            DecodeStatus::Known,
-        )?;
-        let mut state = CodexStateV1::decode(prior_state)?;
+        let mut state = progression_state;
         let mut output = Output::default();
         let mut retained = RetainedBudget::default();
         let result = (|| {
-            observe_envelope_mode(record, &top_type, ordinal, &mut state)?;
+            observe_known_history_mode(record, &mut state)?;
             let timestamp = capture_timestamp(record)?.unwrap_or(context.observed_at);
             let mut scope = Scope {
                 context,
@@ -219,7 +214,10 @@ impl SourceAdapter for CodexAdapter {
             match top_type.as_str() {
                 "session_meta" => decode_session_meta(record, scope, &mut output, &mut retained),
                 "turn_context" => decode_turn_context(record, scope, &mut output, &mut retained),
-                "compacted" => decode_compaction(record, scope, &mut output),
+                "compacted" => {
+                    reconcile_pending_results(scope, &mut state, &mut output, 1)?;
+                    decode_compaction(record, scope, &mut output)
+                }
                 "response_item" => decode_response_item(
                     record,
                     &mut scope,
@@ -242,6 +240,13 @@ impl SourceAdapter for CodexAdapter {
 
         match result {
             Ok(()) => {
+                let observation = make_observation(
+                    record,
+                    context,
+                    source,
+                    &schema_fingerprint,
+                    DecodeStatus::Known,
+                )?;
                 let next_state = state.encode_bounded()?;
                 Ok(record_with(
                     observation,
@@ -253,16 +258,36 @@ impl SourceAdapter for CodexAdapter {
                 ))
             }
             Err(DecodeError::Io(error)) => Err(DecodeError::Io(error)),
-            Err(DecodeError::OutputTooLarge | DecodeError::StateTooLarge) => Ok(classified_empty(
-                observation,
-                DecodeDisposition::oversized("codex-output"),
-                prior_state,
-            )),
-            Err(error) => Ok(classified_empty(
-                observation,
-                DecodeDisposition::malformed(error_class(&error)),
-                prior_state,
-            )),
+            Err(DecodeError::OutputTooLarge | DecodeError::StateTooLarge) => {
+                let observation = make_observation(
+                    record,
+                    context,
+                    source,
+                    &schema_fingerprint,
+                    DecodeStatus::Oversized,
+                )?;
+                Ok(empty_with_next_state(
+                    observation,
+                    DecodeDisposition::oversized("codex-output"),
+                    progressed_decoder_state,
+                    prior_state,
+                ))
+            }
+            Err(error) => {
+                let observation = make_observation(
+                    record,
+                    context,
+                    source,
+                    &schema_fingerprint,
+                    DecodeStatus::Malformed,
+                )?;
+                Ok(empty_with_next_state(
+                    observation,
+                    DecodeDisposition::malformed(error_class(&error)),
+                    progressed_decoder_state,
+                    prior_state,
+                ))
+            }
         }
     }
 }
@@ -542,7 +567,10 @@ fn decode_response_item(
                 None,
             )
         }
-        "compaction" => decode_compaction(record, *scope, output),
+        "compaction" => {
+            reconcile_pending_results(*scope, state, output, 1)?;
+            decode_compaction(record, *scope, output)
+        }
         _ => Ok(()),
     }
 }
@@ -562,7 +590,9 @@ fn decode_action_request(
     };
     let result_key =
         SemanticKey::from_native(Provider::Codex, scope.session_id, "codex.call", &call_id);
-    if state.completed_rank(result_key.as_str()).is_some() {
+    if state.completed_rank(result_key.as_str()).is_some()
+        || state.pending_result(&call_id).is_some()
+    {
         return Ok(());
     }
     let tool_name = match item_type {
@@ -651,23 +681,32 @@ fn decode_event_message(
     retained: &mut RetainedBudget,
 ) -> Result<(), DecodeError> {
     match event_type {
-        "task_started" => emit_event(
-            *scope,
-            output,
-            Actor::System,
-            None,
-            None,
-            SemanticKey::from_native(
-                Provider::Codex,
-                scope.session_id,
-                "codex.turn",
-                scope.source.record_hash(),
-            ),
-            EventPayload::TurnStarted { prompt_id: None },
-            PrivacyLabel::SyncEligible,
-        ),
-        "task_complete" => emit_turn_finished(*scope, output, ActionOutcome::Succeeded),
-        "turn_aborted" => emit_turn_finished(*scope, output, ActionOutcome::Cancelled),
+        "task_started" => {
+            reconcile_pending_results(*scope, state, output, 1)?;
+            emit_event(
+                *scope,
+                output,
+                Actor::System,
+                None,
+                None,
+                SemanticKey::from_native(
+                    Provider::Codex,
+                    scope.session_id,
+                    "codex.turn",
+                    scope.source.record_hash(),
+                ),
+                EventPayload::TurnStarted { prompt_id: None },
+                PrivacyLabel::SyncEligible,
+            )
+        }
+        "task_complete" => {
+            reconcile_pending_results(*scope, state, output, 1)?;
+            emit_turn_finished(*scope, output, ActionOutcome::Succeeded)
+        }
+        "turn_aborted" => {
+            reconcile_pending_results(*scope, state, output, 1)?;
+            emit_turn_finished(*scope, output, ActionOutcome::Cancelled)
+        }
         "user_message" | "agent_message" => {
             if let Some(content) = capture_event_message_content(record, retained)? {
                 emit_message(
@@ -683,7 +722,10 @@ fn decode_event_message(
             }
             Ok(())
         }
-        "context_compacted" => decode_compaction(record, *scope, output),
+        "context_compacted" => {
+            reconcile_pending_results(*scope, state, output, 1)?;
+            decode_compaction(record, *scope, output)
+        }
         "exec_command_end" | "mcp_tool_call_end" | "patch_apply_end" => {
             let call_id = capture_call_id(record, &["payload", "call_id"])?
                 .or(capture_call_id(record, &["payload", "id"])?);
@@ -719,7 +761,7 @@ fn decode_event_message(
             let item_kind =
                 capture_optional_plain(record, &["payload", "item", "type"], MAX_ID_BYTES)?;
             let changes = if item_kind.as_deref() == Some("file_change") {
-                capture_file_changes(record, scope.context.project_root.as_deref())?
+                capture_file_changes(record, scope.context.project_root.as_deref(), retained)?
             } else {
                 Vec::new()
             };
@@ -761,16 +803,14 @@ fn decode_ranked_result(
     }
     let semantic_key =
         SemanticKey::from_native(Provider::Codex, scope.session_id, "codex.call", &call_id);
-    let existing_rank = state.completed_rank(semantic_key.as_str());
+    if state.completed_rank(semantic_key.as_str()).is_some() {
+        return Ok(());
+    }
     let link = state.call(&call_id).cloned();
-    if link.is_none() && existing_rank.is_none() {
+    let pending = state.pending_result(&call_id).cloned();
+    if link.is_none() && pending.is_none() {
         return Ok(());
     }
-    let should_emit = state.observe_result(semantic_key.as_str().to_owned(), rank)?;
-    if !should_emit {
-        return Ok(());
-    }
-    let link = state.take_call(&call_id).or(link);
     let outcome = capture_outcome(record)?;
     let result_capture = capture_first_value(
         record,
@@ -782,10 +822,43 @@ fn decode_ranked_result(
         ],
         retained.remaining(),
     )?;
+    if let Some(capture) = &result_capture {
+        retained.charge(capture)?;
+    }
+    let request_event_id = pending
+        .as_ref()
+        .map(|candidate| candidate.request_event_id.clone())
+        .or_else(|| {
+            link.as_ref()
+                .map(|candidate| candidate.request_event_id.clone())
+        });
+    let Some(request_event_id) = request_event_id else {
+        return Ok(());
+    };
+    let artifact_values = result_artifacts(outcome, artifacts, link.as_ref());
+
+    if rank < 3 {
+        let _ = state.take_call(&call_id);
+        return stage_ranked_result(
+            state,
+            call_id,
+            request_event_id,
+            rank,
+            outcome,
+            result_capture.as_ref(),
+            &artifact_values,
+        );
+    }
+
+    let _ = state.take_pending_result(&call_id);
+    let _ = state.take_call(&call_id);
+    let should_emit = state.observe_result(semantic_key.as_str().to_owned(), rank)?;
+    if !should_emit {
+        return Ok(());
+    }
     let event_id = output.event_id(scope)?;
     let output_ref = result_capture
         .map(|capture| {
-            retained.charge(&capture)?;
             make_content_with_event(
                 scope,
                 output,
@@ -798,13 +871,12 @@ fn decode_ranked_result(
             )
         })
         .transpose()?;
-    let causation_id = link.as_ref().map(|value| value.request_event_id.clone());
     let event = make_event(
         scope,
         event_id.clone(),
         Actor::Tool,
         Some(call_id.clone()),
-        causation_id,
+        Some(request_event_id),
         semantic_key,
         EventPayload::ActionFinished {
             native_action_id: call_id.clone(),
@@ -814,23 +886,180 @@ fn decode_ranked_result(
         PrivacyLabel::SyncEligible,
     )?;
     output.push_event(event)?;
-
-    let mut artifact_values = artifacts.unwrap_or_default();
-    if artifact_values.is_empty()
-        && outcome == ActionOutcome::Succeeded
-        && link
-            .as_ref()
-            .is_some_and(|value| is_patch_tool(&value.tool_name))
-        && let Some(path) = link.and_then(|value| value.project_relative_path)
-    {
-        artifact_values.push((path, "update".to_owned()));
-    }
     for (path, operation) in artifact_values {
         emit_artifact(
             scope, output, retained, &call_id, &event_id, &path, &operation,
         )?;
     }
     Ok(())
+}
+
+fn result_artifacts(
+    outcome: ActionOutcome,
+    artifacts: Option<Vec<(String, String)>>,
+    link: Option<&CallLink>,
+) -> Vec<(String, String)> {
+    if outcome != ActionOutcome::Succeeded {
+        return Vec::new();
+    }
+    let mut artifacts = artifacts.unwrap_or_default();
+    if artifacts.is_empty()
+        && link.is_some_and(|value| is_patch_tool(&value.tool_name))
+        && let Some(path) = link.and_then(|value| value.project_relative_path.clone())
+    {
+        artifacts.push((path, "update".to_owned()));
+    }
+    artifacts
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_ranked_result(
+    state: &mut CodexStateV1,
+    call_id: String,
+    request_event_id: String,
+    rank: u8,
+    outcome: ActionOutcome,
+    result: Option<&SecureCapturedString>,
+    artifacts: &[(String, String)],
+) -> Result<(), DecodeError> {
+    let artifact = artifacts.first().map(|(path, operation)| {
+        StagedArtifact(
+            blake3::hash(path.as_bytes()).to_hex().to_string(),
+            u64::try_from(path.len()).unwrap_or(u64::MAX),
+            canonical_operation(operation),
+        )
+    });
+    state.stage_result(PendingResult {
+        call_id,
+        request_event_id,
+        rank,
+        outcome: outcome.into(),
+        output: result.map(|capture| StagedContent(capture.hash.clone(), capture.total_bytes)),
+        artifact,
+    })
+}
+
+fn reconcile_pending_results(
+    scope: Scope<'_>,
+    state: &mut CodexStateV1,
+    output: &mut Output,
+    reserved_events: usize,
+) -> Result<(), DecodeError> {
+    let available = MAX_EVENTS_PER_RECORD
+        .saturating_sub(output.events.len())
+        .saturating_sub(reserved_events);
+    let to_flush = available.min(state.pending_result_count());
+    for _ in 0..to_flush {
+        if output.events.len() + reserved_events >= MAX_EVENTS_PER_RECORD {
+            break;
+        }
+        let Some(pending) = state.pop_pending_result() else {
+            break;
+        };
+        let semantic_key = SemanticKey::from_native(
+            Provider::Codex,
+            scope.session_id,
+            "codex.call",
+            &pending.call_id,
+        );
+        if !state.observe_result(semantic_key.as_str().to_owned(), pending.rank)? {
+            continue;
+        }
+        let event_id = output.event_id(scope)?;
+        let output_ref = staged_content(
+            pending.output.as_ref(),
+            DisclosureClass::ToolResult,
+            "text/plain",
+        )?;
+        let event = make_event(
+            scope,
+            event_id.clone(),
+            Actor::Tool,
+            Some(pending.call_id.clone()),
+            Some(pending.request_event_id),
+            semantic_key,
+            EventPayload::ActionFinished {
+                native_action_id: pending.call_id.clone(),
+                outcome: pending.outcome.into(),
+                output: output_ref,
+            },
+            PrivacyLabel::SyncEligible,
+        )?;
+        output.push_event(event)?;
+        if let Some(StagedArtifact(hash, bytes, operation)) = pending.artifact {
+            if output.events.len() + reserved_events >= MAX_EVENTS_PER_RECORD {
+                continue;
+            }
+            emit_staged_artifact(
+                scope,
+                output,
+                &pending.call_id,
+                &event_id,
+                hash,
+                bytes,
+                operation,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn staged_content(
+    staged: Option<&StagedContent>,
+    disclosure: DisclosureClass,
+    media_type: &'static str,
+) -> Result<Option<ContentRef>, DecodeError> {
+    match staged {
+        Some(StagedContent(hash, bytes)) => {
+            ContentRef::bounded(hash.clone(), *bytes, media_type, None, disclosure, None)
+                .map(Some)
+                .map_err(|_| DecodeError::Malformed("invalid-codex-staged-content".to_owned()))
+        }
+        None => Ok(None),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_staged_artifact(
+    scope: Scope<'_>,
+    output: &mut Output,
+    call_id: &str,
+    parent_id: &EventId,
+    path_hash: String,
+    path_bytes: u64,
+    operation: String,
+) -> Result<(), DecodeError> {
+    let event_id = output.event_id(scope)?;
+    let path = ContentRef::bounded(
+        path_hash,
+        path_bytes,
+        "text/uri-list",
+        None,
+        DisclosureClass::ObservedState,
+        None,
+    )
+    .map_err(|_| DecodeError::Malformed("invalid-codex-staged-artifact".to_owned()))?;
+    let semantic_id = path.hash().to_owned();
+    let event = make_event(
+        scope,
+        event_id,
+        Actor::Tool,
+        Some(call_id.to_owned()),
+        Some(parent_id.as_str().to_owned()),
+        SemanticKey::from_native(
+            Provider::Codex,
+            scope.session_id,
+            "codex.artifact",
+            &format!("{call_id}:{semantic_id}"),
+        ),
+        EventPayload::ArtifactChanged {
+            path,
+            operation,
+            content_hash: None,
+        },
+        PrivacyLabel::SyncEligible,
+    )?;
+    output.push_event(event)
 }
 
 fn emit_message(
@@ -1111,22 +1340,34 @@ fn make_content_with_event(
     Ok(content)
 }
 
-fn observe_envelope_mode(
-    record: &dyn RecordSource,
+fn progress_envelope(
     top_type: &str,
     ordinal: Option<u64>,
+    state: &mut CodexStateV1,
+) -> Result<(), DecodeError> {
+    let observed = if ordinal.is_some() {
+        HistoryMode::Paginated
+    } else if top_type == "session_meta" {
+        HistoryMode::Legacy
+    } else {
+        HistoryMode::Unknown
+    };
+    state.observe_history_mode(observed);
+    state.observe_ordinal(ordinal)
+}
+
+fn observe_known_history_mode(
+    record: &dyn RecordSource,
     state: &mut CodexStateV1,
 ) -> Result<(), DecodeError> {
     let explicit = capture_optional_plain(record, &["payload", "history_mode"], MAX_ID_BYTES)?;
     let observed = match explicit.as_deref() {
         Some("paginated") => HistoryMode::Paginated,
         Some("legacy") => HistoryMode::Legacy,
-        None if ordinal.is_some() => HistoryMode::Paginated,
-        None if top_type == "session_meta" => HistoryMode::Legacy,
         Some(_) | None => HistoryMode::Unknown,
     };
     state.observe_history_mode(observed);
-    state.observe_ordinal(ordinal)
+    Ok(())
 }
 
 fn capture_timestamp(record: &dyn RecordSource) -> Result<Option<OffsetDateTime>, DecodeError> {
@@ -1407,35 +1648,49 @@ fn capture_optional_i64(
 fn capture_file_changes(
     record: &dyn RecordSource,
     root: Option<&Path>,
+    retained: &mut RetainedBudget,
 ) -> Result<Vec<(String, String)>, DecodeError> {
     let paths = capture_matches(
         record,
         &["payload", "item", "changes", "path"],
         MAX_PATH_BYTES,
-        MAX_PATH_BYTES * MAX_MATCHES,
+        retained.remaining(),
     )?;
+    for captured in &paths {
+        if let CapturedValue::String(value) = &captured.value {
+            retained.charge(value)?;
+        }
+    }
     let kinds = capture_matches(
         record,
         &["payload", "item", "changes", "kind"],
         MAX_ID_BYTES,
-        MAX_ID_BYTES * MAX_MATCHES,
+        retained.remaining(),
     )?;
+    for captured in &kinds {
+        if let CapturedValue::String(value) = &captured.value {
+            retained.charge(value)?;
+        }
+    }
     let mut kind_by_index = std::collections::BTreeMap::new();
+    let mut seen_kinds = HashSet::new();
     for captured in kinds {
         let [index] = captured.array_indices.as_slice() else {
             return Err(DecodeError::Malformed(
                 "invalid-codex-change-location".to_owned(),
             ));
         };
+        if !seen_kinds.insert(*index) {
+            return Err(DecodeError::Malformed(
+                "duplicate-codex-change-kind".to_owned(),
+            ));
+        }
         let CapturedValue::String(value) = captured.value else {
             return Err(DecodeError::Malformed(
                 "invalid-codex-change-kind".to_owned(),
             ));
         };
-        kind_by_index.insert(
-            *index,
-            strict_identifier(value, MAX_ID_BYTES, "change-kind")?,
-        );
+        kind_by_index.insert(*index, canonical_change_kind(value)?);
     }
     let mut output = Vec::new();
     let mut seen = HashSet::new();
@@ -1458,10 +1713,13 @@ fn capture_file_changes(
         if value.truncated || value.total_bytes > MAX_PATH_BYTES as u64 {
             continue;
         }
-        let Ok(raw) = String::from_utf8(value.take_bytes()) else {
+        let raw = Zeroizing::new(value.take_bytes());
+        let Ok(raw) = std::str::from_utf8(&raw) else {
             continue;
         };
-        if let Some(path) = normalize_project_path(&raw, root) {
+        if let Some(path) = normalize_project_path(raw, root)
+            && output.len() < MAX_EVENTS_PER_RECORD.saturating_sub(1)
+        {
             output.push((
                 path,
                 kind_by_index
@@ -1471,6 +1729,24 @@ fn capture_file_changes(
         }
     }
     Ok(output)
+}
+
+fn canonical_change_kind(mut value: SecureCapturedString) -> Result<String, DecodeError> {
+    if value.truncated || value.total_bytes == 0 || value.total_bytes > MAX_ID_BYTES as u64 {
+        return Err(DecodeError::Malformed(
+            "invalid-codex-change-kind".to_owned(),
+        ));
+    }
+    let raw = std::str::from_utf8(&value.bytes)
+        .map_err(|_| DecodeError::Malformed("invalid-codex-change-kind".to_owned()))?;
+    if !bounded_identifier(raw, MAX_ID_BYTES) {
+        return Err(DecodeError::Malformed(
+            "invalid-codex-change-kind".to_owned(),
+        ));
+    }
+    let canonical = canonical_operation(raw);
+    value.bytes.zeroize();
+    Ok(canonical)
 }
 
 fn capture_context_path(
@@ -1807,12 +2083,21 @@ fn classified_empty(
     disposition: DecodeDisposition,
     prior_state: &DecoderState,
 ) -> DecodedRecord {
+    empty_with_next_state(observation, disposition, prior_state.clone(), prior_state)
+}
+
+fn empty_with_next_state(
+    observation: SourceObservation,
+    disposition: DecodeDisposition,
+    next_state: DecoderState,
+    prior_state: &DecoderState,
+) -> DecodedRecord {
     record_with(
         observation,
         disposition,
         Vec::new(),
         Vec::new(),
-        prior_state.clone(),
+        next_state,
         prior_state,
     )
 }
