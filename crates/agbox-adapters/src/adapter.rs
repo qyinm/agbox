@@ -369,6 +369,13 @@ impl DecodedRecord {
         self.semantic_bytes
     }
 
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn retained_capacities_for_test(&self) -> (usize, usize) {
+        (self.events.capacity(), self.evidence.capacity())
+    }
+
     /// Revalidates a previously constructed record against all output bounds.
     #[must_use]
     pub fn enforce_limits(mut self, prior_state: &DecoderState) -> Self {
@@ -380,8 +387,8 @@ impl DecodedRecord {
             None => true,
         };
         if too_large {
-            self.events.clear();
-            self.evidence.clear();
+            self.events = Vec::new();
+            self.evidence = Vec::new();
             self.disposition = DecodeDisposition::oversized("normalized-output");
             self.next_state = prior_state.clone();
             self.semantic_bytes = self
@@ -409,6 +416,7 @@ impl DecodedRecord {
         }
 
         let mut counter = SemanticCounter::default();
+        counter.serialized(&self.observation).ok()?;
         counter.add(self.next_state.as_bytes().len())?;
         counter.add(
             self.disposition

@@ -611,8 +611,7 @@ impl StringInfo {
         if expected.len() <= MAX_FIELD_NAME_BYTES {
             return self.prefix == expected;
         }
-        self.prefix == expected[..MAX_FIELD_NAME_BYTES]
-            && self.hash == blake3::hash(expected).to_hex().as_str()
+        expected.starts_with(&self.prefix) && self.hash == blake3::hash(expected).to_hex().as_str()
     }
 }
 

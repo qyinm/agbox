@@ -7,7 +7,10 @@ use agbox_adapters::{
     DecodedRecordDraft, DecoderState, MAX_CAPTURE_BYTES, MAX_DECODER_STATE_BYTES,
     MAX_EVENTS_PER_RECORD, MAX_RECORD_SEMANTIC_BYTES, MemoryRecordSource, RecordSource,
 };
-use agbox_core::{ActivityEventV1, ContentRef, DisclosureClass, EvidenceId};
+use agbox_core::{
+    ActivityEventV1, ContentRef, DisclosureClass, EvidenceId, RedactionPolicy, SourceObservation,
+    SourceObservationDraft,
+};
 use agbox_ingest::{RecordScanner, ScanOutcome};
 use proptest::prelude::*;
 use struson::reader::{JsonReader, JsonStreamReader};
@@ -209,7 +212,7 @@ fn overlong_field_names_are_streamed_and_debug_is_sanitized() {
 
 #[test]
 fn overlong_borrowed_path_selects_and_duplicate_rejects_by_streaming_hash() {
-    let field = "selected-field-".repeat(32);
+    let field = format!("{}🦀suffix", "a".repeat(127));
     let input = format!(r#"{{"{field}":"selected"}}"#);
     let mut reader = BoundedJsonReader::new(input.as_bytes());
     assert_eq!(
@@ -224,6 +227,136 @@ fn overlong_borrowed_path_selects_and_duplicate_rejects_by_streaming_hash() {
     let duplicate = format!(r#"{{"{field}":"first","{field}":"second"}}"#);
     let mut reader = BoundedJsonReader::new(duplicate.as_bytes());
     assert!(reader.capture_string(&[field.as_str()]).is_err());
+}
+
+#[test]
+fn oversized_cardinality_releases_large_vector_capacities() {
+    let source = MemoryRecordSource::new(br#"{"type":"future-record"}"#.to_vec());
+    let base = agbox_adapters::decode_fixture("claude", &source).unwrap();
+    let event = ActivityEventV1::fixture_message();
+    let mut events = Vec::with_capacity(65_536);
+    events.extend(std::iter::repeat_n(event, MAX_EVENTS_PER_RECORD + 1));
+    assert!(events.capacity() >= 65_536);
+
+    let oversized = DecodedRecord::new(
+        DecodedRecordDraft {
+            observation: base.observation().clone(),
+            events,
+            evidence: Vec::new(),
+            disposition: base.disposition().clone(),
+            next_state: DecoderState::default(),
+            semantic_bytes: 0,
+        },
+        &DecoderState::default(),
+    );
+    assert!(matches!(
+        oversized.disposition(),
+        DecodeDisposition::Oversized { .. }
+    ));
+    assert_eq!(oversized.retained_capacities_for_test(), (0, 0));
+}
+
+#[test]
+fn observation_preview_is_included_in_internal_semantic_measurement() {
+    let source = MemoryRecordSource::new(br#"{"type":"future-record"}"#.to_vec());
+    let base = agbox_adapters::decode_fixture("claude", &source).unwrap();
+    let event = ActivityEventV1::fixture_message();
+    let evidence = DecodedEvidence {
+        evidence_id: EvidenceId::for_test("semantic_evidence"),
+        owner_event_id: event.event_id().clone(),
+        content: ContentRef::bounded(
+            "semantic-content".to_owned(),
+            1,
+            "text/plain",
+            None,
+            DisclosureClass::ObservedState,
+            None,
+        )
+        .unwrap(),
+        plaintext: zeroize::Zeroizing::new(vec![b'x'; MAX_CAPTURE_BYTES]),
+    };
+
+    let mut evidence_without_tail =
+        vec![evidence.clone(); agbox_adapters::MAX_EVIDENCE_PER_RECORD - 1];
+    evidence_without_tail.push(DecodedEvidence {
+        plaintext: zeroize::Zeroizing::new(Vec::new()),
+        ..evidence.clone()
+    });
+    let baseline = DecodedRecord::new(
+        DecodedRecordDraft {
+            observation: base.observation().clone(),
+            events: Vec::new(),
+            evidence: evidence_without_tail,
+            disposition: base.disposition().clone(),
+            next_state: DecoderState::default(),
+            semantic_bytes: 0,
+        },
+        &DecoderState::default(),
+    );
+    assert!(!matches!(
+        baseline.disposition(),
+        DecodeDisposition::Oversized { .. }
+    ));
+    let tail_bytes = MAX_RECORD_SEMANTIC_BYTES - baseline.semantic_bytes();
+    assert!(tail_bytes <= MAX_CAPTURE_BYTES);
+
+    let mut exact_evidence = vec![evidence.clone(); agbox_adapters::MAX_EVIDENCE_PER_RECORD - 1];
+    exact_evidence.push(DecodedEvidence {
+        plaintext: zeroize::Zeroizing::new(vec![b'y'; tail_bytes]),
+        ..evidence
+    });
+    let exact = DecodedRecord::new(
+        DecodedRecordDraft {
+            observation: base.observation().clone(),
+            events: Vec::new(),
+            evidence: exact_evidence.clone(),
+            disposition: base.disposition().clone(),
+            next_state: DecoderState::default(),
+            semantic_bytes: 0,
+        },
+        &DecoderState::default(),
+    );
+    assert_eq!(exact.semantic_bytes(), MAX_RECORD_SEMANTIC_BYTES);
+
+    let preview = "p".repeat(agbox_core::limits::MAX_PREVIEW_BYTES);
+    let redacted = RedactionPolicy::new()
+        .unwrap()
+        .redact(&preview, None, DisclosureClass::ObservedState)
+        .unwrap();
+    let bounded_record = ContentRef::bounded(
+        "preview-content".to_owned(),
+        preview.len() as u64,
+        "text/plain",
+        None,
+        DisclosureClass::ObservedState,
+        Some(redacted),
+    )
+    .unwrap();
+    let observation_with_preview = SourceObservation::new(SourceObservationDraft {
+        observation_id: base.observation().observation_id().to_owned(),
+        source: base.observation().source().clone(),
+        range: base.observation().range().clone(),
+        observed_at: base.observation().observed_at(),
+        status: base.observation().status(),
+        bounded_record: Some(bounded_record),
+        schema_fingerprint: base.observation().schema_fingerprint().to_owned(),
+    })
+    .unwrap();
+    let tipped_over = DecodedRecord::new(
+        DecodedRecordDraft {
+            observation: observation_with_preview,
+            events: Vec::new(),
+            evidence: exact_evidence,
+            disposition: base.disposition().clone(),
+            next_state: DecoderState::default(),
+            semantic_bytes: 0,
+        },
+        &DecoderState::default(),
+    );
+    assert!(matches!(
+        tipped_over.disposition(),
+        DecodeDisposition::Oversized { .. }
+    ));
 }
 
 #[test]
@@ -346,6 +479,31 @@ fn normalized_output_limits_discard_partial_results_and_preserve_identity_state(
         base.semantic_bytes(),
         "caller-reported semantic bytes must be ignored"
     );
+}
+
+#[test]
+fn task_eight_output_api_smoke_uses_bounded_constructors_and_read_accessors() {
+    let source = MemoryRecordSource::new(br#"{"type":"future-record"}"#.to_vec());
+    let fixture = agbox_adapters::decode_fixture("claude", &source).unwrap();
+    let prior = DecoderState::default();
+    let record = DecodedRecord::new(
+        DecodedRecordDraft {
+            observation: fixture.observation().clone(),
+            events: fixture.events().to_vec(),
+            evidence: fixture.evidence().to_vec(),
+            disposition: DecodeDisposition::unknown_type("future-record"),
+            next_state: fixture.next_state().clone(),
+            semantic_bytes: usize::MAX,
+        },
+        &prior,
+    );
+
+    assert_eq!(record.observation(), fixture.observation());
+    assert!(record.events().is_empty());
+    assert!(record.evidence().is_empty());
+    assert_eq!(record.disposition().native_type(), Some("future-record"));
+    assert_eq!(record.next_state(), &prior);
+    assert!(record.semantic_bytes() < MAX_RECORD_SEMANTIC_BYTES);
 }
 
 fn assert_oversized_is_bounded(

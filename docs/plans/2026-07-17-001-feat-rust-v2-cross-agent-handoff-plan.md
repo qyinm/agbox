@@ -2829,6 +2829,13 @@ retain at most a 128-byte field-name prefix plus hash/length, and compares
 longer borrowed selected paths by length and BLAKE3 hash. Every error path
 drains the source to terminal EOF so `RecordWindow` integrity errors take
 precedence over an earlier syntax, type, duplicate, or size diagnostic.
+The Task 8/9 snippets below predate the hardened output API: implementations
+must create output with `DecodedRecord::new(DecodedRecordDraft { ... },
+prior_state)`, construct unknown/malformed/oversized dispositions through
+`DecodeDisposition` constructors, and read normalized output through
+`observation()`, `events()`, `evidence()`, `disposition()`, `next_state()`, and
+`semantic_bytes()` rather than direct `DecodedRecord` fields or raw disposition
+strings.
 
 Add `zeroize.workspace = true` to the adapter manifest. Add `MemoryRecordSource` only behind the `test-support` feature. The registry in `lib.rs` returns exactly `ClaudeAdapter` and `CodexAdapter` after Tasks 8 and 10; until those tasks it returns an empty vector and the fixture helper explicitly selects its test decoder.
 
