@@ -40,6 +40,8 @@ CREATE TABLE source_cursors (
     generation INTEGER NOT NULL,
     cursor_offset INTEGER NOT NULL CHECK (cursor_offset >= 0),
     parser_state BLOB NOT NULL,
+    -- Bounded whole-chunk identity for exact replay of only the latest commit.
+    last_commit_digest TEXT NOT NULL CHECK (length(last_commit_digest) = 64),
     updated_at TEXT NOT NULL,
     PRIMARY KEY (source_id, generation),
     FOREIGN KEY (source_id, generation)

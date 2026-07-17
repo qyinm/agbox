@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc};
+use std::{collections::HashSet, fmt, sync::Arc};
 
 use agbox_core::{
     ActivityEventV1, ContentRef, DisclosureClass, EventId, EvidenceId, PrivacyLabel, ProjectId,
@@ -310,10 +310,17 @@ impl IngestionChunk {
         for item in &self.evidence {
             add_len(&mut total, item.evidence_id.as_str().len())?;
             add_len(&mut total, item.project_id.as_str().len())?;
+            add_len(&mut total, owner_kind(&item.owner).len())?;
             add_len(&mut total, owner_id(&item.owner).len())?;
             add_len(&mut total, item.content_hash.len())?;
             add_len(&mut total, item.media_type.len())?;
+            add_len(&mut total, privacy(item.privacy).len())?;
+            add_len(&mut total, disclosure(item.disclosure_class).len())?;
             add_len(&mut total, item.redacted_excerpt.len())?;
+            add_len(&mut total, 1)?;
+            if let Some(expires_at) = item.expires_at {
+                add_len(&mut total, format_timestamp(expires_at)?.len())?;
+            }
             add_len(&mut total, item.plaintext.len())?;
         }
         for item in &self.evidence_links {
@@ -325,6 +332,7 @@ impl IngestionChunk {
             add_len(&mut total, item.content_ref_id.len())?;
             add_len(&mut total, item.project_id.as_str().len())?;
             add_len(&mut total, serde_json::to_vec(&item.content)?.len())?;
+            add_len(&mut total, privacy(item.privacy).len())?;
         }
         for item in &self.fingerprints {
             add_len(&mut total, item.provider.len())?;
@@ -345,6 +353,128 @@ impl IngestionChunk {
             )?;
         }
         Ok(total)
+    }
+
+    fn commit_digest(&self) -> Result<String, StoreError> {
+        let mut manifest = ManifestHasher::new();
+        manifest.bytes(
+            "expected.source_id",
+            self.expected_cursor.source_id.as_bytes(),
+        )?;
+        manifest.u64("expected.generation", self.expected_cursor.generation)?;
+        manifest.u64("expected.offset", self.expected_cursor.offset)?;
+        manifest.bytes("expected.parser_state", &self.expected_cursor.parser_state)?;
+        manifest.bytes("next.source_id", self.next_cursor.source_id.as_bytes())?;
+        manifest.u64("next.generation", self.next_cursor.generation)?;
+        manifest.u64("next.offset", self.next_cursor.offset)?;
+        manifest.bytes("next.parser_state", &self.next_cursor.parser_state)?;
+
+        manifest.vector_len("observations", self.observations.len())?;
+        for item in &self.observations {
+            manifest.bytes("observation", &serde_json::to_vec(item)?)?;
+        }
+        manifest.vector_len("events", self.events.len())?;
+        for item in &self.events {
+            manifest.bytes("event", &serde_json::to_vec(item)?)?;
+        }
+        manifest.vector_len("evidence", self.evidence.len())?;
+        for item in &self.evidence {
+            manifest.bytes("evidence.id", item.evidence_id.as_str().as_bytes())?;
+            manifest.bytes("evidence.project", item.project_id.as_str().as_bytes())?;
+            manifest.bytes("evidence.owner_kind", owner_kind(&item.owner).as_bytes())?;
+            manifest.bytes("evidence.owner_id", owner_id(&item.owner).as_bytes())?;
+            manifest.bytes("evidence.content_hash", item.content_hash.as_bytes())?;
+            manifest.bytes("evidence.media_type", item.media_type.as_bytes())?;
+            manifest.bytes("evidence.privacy", privacy(item.privacy).as_bytes())?;
+            manifest.bytes(
+                "evidence.disclosure",
+                disclosure(item.disclosure_class).as_bytes(),
+            )?;
+            manifest.bytes(
+                "evidence.redacted_excerpt",
+                item.redacted_excerpt.as_bytes(),
+            )?;
+            manifest.u64(
+                "evidence.byte_length",
+                u64::try_from(item.plaintext.len()).map_err(|_| StoreError::InvalidBatch)?,
+            )?;
+            match item.expires_at {
+                Some(value) => {
+                    manifest.u64("evidence.expires.present", 1)?;
+                    manifest.bytes(
+                        "evidence.expires.value",
+                        format_timestamp(value)?.as_bytes(),
+                    )?;
+                }
+                None => manifest.u64("evidence.expires.present", 0)?,
+            }
+        }
+        manifest.vector_len("evidence_links", self.evidence_links.len())?;
+        for item in &self.evidence_links {
+            manifest.bytes("link.event", item.event_id.as_bytes())?;
+            manifest.bytes("link.observation", item.observation_id.as_bytes())?;
+            manifest.bytes("link.evidence", item.evidence_id.as_bytes())?;
+        }
+        manifest.vector_len("content_refs", self.content_refs.len())?;
+        for item in &self.content_refs {
+            manifest.bytes("content.id", item.content_ref_id.as_bytes())?;
+            manifest.bytes("content.project", item.project_id.as_str().as_bytes())?;
+            manifest.bytes("content.value", &serde_json::to_vec(&item.content)?)?;
+            manifest.bytes("content.privacy", privacy(item.privacy).as_bytes())?;
+        }
+        manifest.vector_len("fingerprints", self.fingerprints.len())?;
+        for item in &self.fingerprints {
+            manifest.bytes("fingerprint.provider", item.provider.as_bytes())?;
+            manifest.bytes("fingerprint.format", item.format.as_bytes())?;
+            manifest.bytes("fingerprint.value", item.fingerprint.as_bytes())?;
+            manifest.bytes(
+                "fingerprint.observed_at",
+                format_timestamp(item.observed_at)?.as_bytes(),
+            )?;
+        }
+        manifest.vector_len("faults", self.faults.len())?;
+        for item in &self.faults {
+            manifest.bytes("fault.id", item.fault_id.as_bytes())?;
+            manifest.bytes("fault.source", item.source_id.as_bytes())?;
+            manifest.u64("fault.generation", item.generation)?;
+            manifest.u64("fault.byte_start", item.byte_start)?;
+            manifest.u64("fault.byte_end", item.byte_end)?;
+            manifest.bytes("fault.class", item.class.as_bytes())?;
+            manifest.bytes("fault.detail", item.bounded_detail.as_bytes())?;
+        }
+        Ok(manifest.finish())
+    }
+}
+
+struct ManifestHasher {
+    hasher: blake3::Hasher,
+}
+
+impl ManifestHasher {
+    fn new() -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"agbox.ingestion.commit.v1");
+        Self { hasher }
+    }
+
+    fn bytes(&mut self, label: &str, value: &[u8]) -> Result<(), StoreError> {
+        hash_part(&mut self.hasher, label.as_bytes())?;
+        hash_part(&mut self.hasher, value)
+    }
+
+    fn u64(&mut self, label: &str, value: u64) -> Result<(), StoreError> {
+        self.bytes(label, &value.to_le_bytes())
+    }
+
+    fn vector_len(&mut self, label: &str, value: usize) -> Result<(), StoreError> {
+        self.u64(
+            label,
+            u64::try_from(value).map_err(|_| StoreError::InvalidBatch)?,
+        )
+    }
+
+    fn finish(self) -> String {
+        self.hasher.finalize().to_hex().to_string()
     }
 }
 
@@ -434,9 +564,11 @@ fn commit(
     vault: &EvidenceVault,
     chunk: &IngestionChunk,
 ) -> Result<CommitReceipt, StoreError> {
+    let commit_digest = chunk.commit_digest()?;
     let preflight_cursor = load_cursor(connection, &chunk.expected_cursor)?;
     let registered = load_registered_source(connection, chunk)?;
     validate_project_and_provider(chunk, &registered)?;
+    validate_evidence_relations(connection, chunk, &registered)?;
 
     if cursor_matches(preflight_cursor.as_ref(), &chunk.next_cursor) {
         let transaction = connection.transaction()?;
@@ -444,8 +576,15 @@ fn commit(
         if !cursor_matches(current.as_ref(), &chunk.next_cursor) {
             return Err(StoreError::CursorConflict);
         }
+        if current
+            .as_ref()
+            .is_none_or(|cursor| cursor.last_commit_digest != commit_digest)
+        {
+            return Err(StoreError::ImmutableConflict);
+        }
         let registered = load_registered_source(&transaction, chunk)?;
         validate_project_and_provider(chunk, &registered)?;
+        validate_evidence_relations(&transaction, chunk, &registered)?;
         verify_retry(&transaction, chunk)?;
         transaction.commit()?;
         persist_evidence_blobs(vault, &chunk.evidence)?;
@@ -464,6 +603,7 @@ fn commit(
     }
     let registered = load_registered_source(&transaction, chunk)?;
     validate_project_and_provider(chunk, &registered)?;
+    validate_evidence_relations(&transaction, chunk, &registered)?;
 
     insert_observations(&transaction, chunk)?;
     let inserted_events = insert_events(&transaction, &chunk.events)?;
@@ -474,17 +614,20 @@ fn commit(
     insert_faults(&transaction, &chunk.faults)?;
     transaction.execute(
         "INSERT INTO source_cursors(
-             source_id, generation, cursor_offset, parser_state, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             source_id, generation, cursor_offset, parser_state,
+             last_commit_digest, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
          ON CONFLICT(source_id, generation) DO UPDATE SET
              cursor_offset = excluded.cursor_offset,
              parser_state = excluded.parser_state,
+             last_commit_digest = excluded.last_commit_digest,
              updated_at = excluded.updated_at",
         params![
             chunk.next_cursor.source_id,
             to_i64(chunk.next_cursor.generation)?,
             to_i64(chunk.next_cursor.offset)?,
             chunk.next_cursor.parser_state,
+            commit_digest,
         ],
     )?;
     transaction.commit()?;
@@ -569,38 +712,207 @@ fn validate_project_and_provider(
     Ok(())
 }
 
+fn validate_evidence_relations(
+    connection: &rusqlite::Connection,
+    chunk: &IngestionChunk,
+    registered: &RegisteredSource,
+) -> Result<(), StoreError> {
+    let chunk_events: HashSet<&str> = chunk
+        .events
+        .iter()
+        .map(|event| event.event_id().as_str())
+        .collect();
+    let chunk_evidence: HashSet<&str> = chunk
+        .evidence
+        .iter()
+        .map(|evidence| evidence.evidence_id.as_str())
+        .collect();
+    let chunk_observations: HashSet<&str> = chunk
+        .observations
+        .iter()
+        .map(SourceObservation::observation_id)
+        .collect();
+
+    for evidence in &chunk.evidence {
+        if !evidence_reference_is_valid(
+            connection,
+            evidence.evidence_id.as_str(),
+            &registered.project_id,
+            true,
+        )? {
+            return Err(StoreError::InvalidReference);
+        }
+        let owner_is_valid = match &evidence.owner {
+            EvidenceOwner::Event(event_id) => {
+                let created_in_chunk = chunk_events.contains(event_id.as_str());
+                event_reference_is_valid(
+                    connection,
+                    event_id.as_str(),
+                    &registered.project_id,
+                    created_in_chunk,
+                )?
+            }
+            EvidenceOwner::Work(work_id) => {
+                work_exists_in_project(connection, work_id.as_str(), &registered.project_id)?
+            }
+        };
+        if !owner_is_valid {
+            return Err(StoreError::InvalidReference);
+        }
+    }
+
+    for link in &chunk.evidence_links {
+        let event_in_chunk = chunk_events.contains(link.event_id.as_str());
+        let event_is_valid = event_reference_is_valid(
+            connection,
+            &link.event_id,
+            &registered.project_id,
+            event_in_chunk,
+        )?;
+        let evidence_in_chunk = chunk_evidence.contains(link.evidence_id.as_str());
+        let evidence_is_valid = evidence_reference_is_valid(
+            connection,
+            &link.evidence_id,
+            &registered.project_id,
+            evidence_in_chunk,
+        )?;
+        let observation_in_chunk = chunk_observations.contains(link.observation_id.as_str());
+        let observation_is_valid = observation_reference_is_valid(
+            connection,
+            &link.observation_id,
+            &chunk.expected_cursor,
+            &registered.project_id,
+            observation_in_chunk,
+        )?;
+        if !event_is_valid || !evidence_is_valid || !observation_is_valid {
+            return Err(StoreError::InvalidReference);
+        }
+    }
+    Ok(())
+}
+
+fn event_reference_is_valid(
+    connection: &rusqlite::Connection,
+    event_id: &str,
+    project_id: &ProjectId,
+    created_in_chunk: bool,
+) -> Result<bool, StoreError> {
+    let mut statement =
+        connection.prepare_cached("SELECT project_id FROM activity_events WHERE event_id = ?1")?;
+    let stored_project: Option<String> = statement
+        .query_row([event_id], |row| row.get(0))
+        .optional()?;
+    Ok(stored_project
+        .as_deref()
+        .map_or(created_in_chunk, |stored| stored == project_id.as_str()))
+}
+
+fn work_exists_in_project(
+    connection: &rusqlite::Connection,
+    work_id: &str,
+    project_id: &ProjectId,
+) -> Result<bool, StoreError> {
+    let mut statement = connection.prepare_cached(
+        "SELECT EXISTS(
+             SELECT 1 FROM work_items
+             WHERE work_id = ?1 AND project_id = ?2
+         )",
+    )?;
+    Ok(statement.query_row(params![work_id, project_id.as_str()], |row| row.get(0))?)
+}
+
+fn evidence_reference_is_valid(
+    connection: &rusqlite::Connection,
+    evidence_id: &str,
+    project_id: &ProjectId,
+    created_in_chunk: bool,
+) -> Result<bool, StoreError> {
+    let mut statement = connection
+        .prepare_cached("SELECT project_id FROM evidence_objects WHERE evidence_id = ?1")?;
+    let stored_project: Option<String> = statement
+        .query_row([evidence_id], |row| row.get(0))
+        .optional()?;
+    Ok(stored_project
+        .as_deref()
+        .map_or(created_in_chunk, |stored| stored == project_id.as_str()))
+}
+
+fn observation_reference_is_valid(
+    connection: &rusqlite::Connection,
+    observation_id: &str,
+    cursor: &CursorState,
+    project_id: &ProjectId,
+    created_in_chunk: bool,
+) -> Result<bool, StoreError> {
+    let mut statement = connection.prepare_cached(
+        "SELECT source_observations.source_id,
+                source_observations.generation,
+                sources.project_id
+             FROM source_observations
+             INNER JOIN sources USING (source_id)
+             WHERE observation_id = ?1
+         ",
+    )?;
+    let stored: Option<(String, i64, String)> = statement
+        .query_row([observation_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .optional()?;
+    stored.map_or_else(
+        || Ok(created_in_chunk),
+        |(source_id, generation, stored_project)| {
+            Ok(source_id == cursor.source_id
+                && generation == to_i64(cursor.generation)?
+                && stored_project == project_id.as_str())
+        },
+    )
+}
+
+struct StoredCursor {
+    offset: u64,
+    parser_state: Vec<u8>,
+    last_commit_digest: String,
+}
+
 fn load_cursor(
     connection: &rusqlite::Connection,
     cursor: &CursorState,
-) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
+) -> Result<Option<StoredCursor>, StoreError> {
     connection
         .query_row(
-            "SELECT cursor_offset, parser_state
+            "SELECT cursor_offset, parser_state, last_commit_digest
              FROM source_cursors
              WHERE source_id = ?1 AND generation = ?2",
             params![cursor.source_id, to_i64(cursor.generation)?],
             |row| {
                 let offset: i64 = row.get(0)?;
                 let parser_state = row.get(1)?;
-                Ok((offset, parser_state))
+                let last_commit_digest = row.get(2)?;
+                Ok((offset, parser_state, last_commit_digest))
             },
         )
         .optional()?
-        .map(|(offset, parser_state)| {
+        .map(|(offset, parser_state, last_commit_digest)| {
             let offset = u64::try_from(offset).map_err(|_| StoreError::InvalidBatch)?;
-            Ok((offset, parser_state))
+            Ok(StoredCursor {
+                offset,
+                parser_state,
+                last_commit_digest,
+            })
         })
         .transpose()
 }
 
-fn cursor_matches(current: Option<&(u64, Vec<u8>)>, wanted: &CursorState) -> bool {
-    current.is_some_and(|(offset, state)| *offset == wanted.offset && state == &wanted.parser_state)
+fn cursor_matches(current: Option<&StoredCursor>, wanted: &CursorState) -> bool {
+    current.is_some_and(|cursor| {
+        cursor.offset == wanted.offset && cursor.parser_state == wanted.parser_state
+    })
 }
 
-fn cursor_matches_expected(current: Option<&(u64, Vec<u8>)>, wanted: &CursorState) -> bool {
+fn cursor_matches_expected(current: Option<&StoredCursor>, wanted: &CursorState) -> bool {
     current.map_or_else(
         || wanted.offset == 0 && wanted.parser_state.is_empty(),
-        |(offset, state)| *offset == wanted.offset && state == &wanted.parser_state,
+        |cursor| cursor.offset == wanted.offset && cursor.parser_state == wanted.parser_state,
     )
 }
 
@@ -1171,14 +1483,9 @@ fn verify_retry(transaction: &Transaction<'_>, chunk: &IngestionChunk) -> Result
             "SELECT EXISTS(
                  SELECT 1 FROM schema_fingerprints
                  WHERE provider = ?1 AND format = ?2 AND fingerprint = ?3
-                   AND last_seen_at = ?4 AND count > 0
+                   AND count > 0
              )",
-            params![
-                item.provider,
-                item.format,
-                item.fingerprint,
-                format_timestamp(item.observed_at)?
-            ],
+            params![item.provider, item.format, item.fingerprint],
         )? {
             return Err(StoreError::ImmutableConflict);
         }
@@ -1329,7 +1636,7 @@ impl IngestionChunk {
         })
         .unwrap_or_else(|_| unreachable!("fixed fixture source is valid"));
         let observation = SourceObservation::new(SourceObservationDraft {
-            observation_id: format!("obs_{generation}_{expected_offset}_{next_offset}"),
+            observation_id: format!("obs_{source_id}_{generation}_{expected_offset}_{next_offset}"),
             source: source.clone(),
             range: ByteRange::new(expected_offset, next_offset)
                 .unwrap_or_else(|_| unreachable!("fixed fixture range is valid")),

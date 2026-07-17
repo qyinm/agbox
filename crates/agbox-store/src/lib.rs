@@ -42,6 +42,8 @@ pub enum StoreError {
     SourceNotFound,
     #[error("ingestion project or provider does not match the registered source")]
     ProjectMismatch,
+    #[error("evidence owner or link reference is invalid")]
+    InvalidReference,
     #[error("cursor conflict")]
     CursorConflict,
     #[error("immutable row conflict")]
@@ -67,6 +69,7 @@ impl fmt::Debug for StoreError {
             Self::InvalidContentRefId => "InvalidContentRefId",
             Self::SourceNotFound => "SourceNotFound",
             Self::ProjectMismatch => "ProjectMismatch",
+            Self::InvalidReference => "InvalidReference",
             Self::CursorConflict => "CursorConflict",
             Self::ImmutableConflict => "ImmutableConflict",
             Self::WriterStopped => "WriterStopped",

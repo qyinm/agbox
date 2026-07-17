@@ -302,4 +302,31 @@ mod tests {
         drop(permits);
         assert_eq!(pool.inner.available.available_permits(), READ_POOL_SIZE);
     }
+
+    #[tokio::test]
+    async fn checkout_returns_connection_after_query_error() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let database = directory.path().join("state.db");
+        let _store = crate::Store::open_new(&database).unwrap();
+        let pool = ReadPool::open(&database, READ_POOL_SIZE).unwrap();
+
+        let error = pool
+            .execute(|connection| {
+                connection.execute_batch("SELECT * FROM definitely_missing_table")?;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, crate::StoreError::Sqlite(_)));
+        assert_eq!(pool.inner.connections.lock().unwrap().len(), READ_POOL_SIZE);
+        assert_eq!(pool.inner.available.available_permits(), READ_POOL_SIZE);
+    }
 }

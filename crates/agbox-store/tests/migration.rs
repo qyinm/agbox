@@ -50,6 +50,17 @@ fn creates_v2_schema_without_touching_legacy_db() {
     ] {
         assert!(store.table_exists(table).unwrap(), "missing {table}");
     }
+    let connection = Connection::open(home.path().join("state.db")).unwrap();
+    let manifest_column: (String, i64) = connection
+        .query_row(
+            "SELECT type, \"notnull\"
+             FROM pragma_table_info('source_cursors')
+             WHERE name = 'last_commit_digest'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(manifest_column, ("TEXT".into(), 1));
 }
 
 #[test]
