@@ -30,6 +30,33 @@ pub enum Authority {
     HumanIntent,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisclosureClass {
+    HumanIntent,
+    AgentStatement,
+    ObservedState,
+    ToolResult,
+    Reasoning,
+    SystemInstruction,
+    DeveloperInstruction,
+    DerivedText,
+}
+
+impl DisclosureClass {
+    #[must_use]
+    pub fn is_transferable(self) -> bool {
+        matches!(
+            self,
+            Self::HumanIntent
+                | Self::AgentStatement
+                | Self::ObservedState
+                | Self::ToolResult
+                | Self::DerivedText
+        )
+    }
+}
+
 impl Authority {
     #[must_use]
     pub fn may_define_instruction(self) -> bool {
@@ -41,6 +68,7 @@ impl Authority {
 pub struct RedactedText {
     value: String,
     redactions: u16,
+    disclosure_class: DisclosureClass,
 }
 
 impl fmt::Debug for RedactedText {
@@ -49,6 +77,7 @@ impl fmt::Debug for RedactedText {
             .debug_struct("RedactedText")
             .field("byte_length", &self.value.len())
             .field("redactions", &self.redactions)
+            .field("disclosure_class", &self.disclosure_class)
             .finish()
     }
 }
@@ -62,6 +91,11 @@ impl RedactedText {
     #[must_use]
     pub fn redactions(&self) -> u16 {
         self.redactions
+    }
+
+    #[must_use]
+    pub fn disclosure_class(&self) -> DisclosureClass {
+        self.disclosure_class
     }
 
     pub(crate) fn into_value(self) -> String {
@@ -121,14 +155,16 @@ impl RedactionPolicy {
         &self,
         value: &str,
         project_root: Option<&Path>,
+        disclosure_class: DisclosureClass,
     ) -> Result<RedactedText, RedactionError> {
-        redact_bounded(value, project_root, &self.markers)
+        redact_bounded(value, project_root, disclosure_class, &self.markers)
     }
 }
 
 fn redact_bounded(
     value: &str,
     project_root: Option<&Path>,
+    disclosure_class: DisclosureClass,
     markers: &AhoCorasick,
 ) -> Result<RedactedText, RedactionError> {
     if value.len() > MAX_INLINE_BYTES {
@@ -198,6 +234,7 @@ fn redact_bounded(
     Ok(RedactedText {
         value: output,
         redactions,
+        disclosure_class,
     })
 }
 
@@ -213,7 +250,20 @@ fn adjacent_secret_range(value: &str, marker_end: usize, marker: &str) -> Option
 
     if marker.eq_ignore_ascii_case("bearer") {
         cursor = skip_ascii_whitespace(bytes, cursor);
-        return (cursor < value.len()).then(|| (cursor, scan_token_end(value, cursor)));
+        let quote = bytes
+            .get(cursor)
+            .copied()
+            .filter(|byte| matches!(byte, b'"' | b'\''));
+        if quote.is_some() {
+            cursor += 1;
+        }
+        return (cursor < value.len()).then(|| {
+            let end = quote.map_or_else(
+                || scan_token_end(value, cursor),
+                |quote| scan_quoted_value_end(value, cursor, quote),
+            );
+            (cursor, end)
+        });
     }
 
     cursor = skip_ascii_whitespace(bytes, cursor);
@@ -229,6 +279,13 @@ fn adjacent_secret_range(value: &str, marker_end: usize, marker: &str) -> Option
             cursor += 1;
         }
         cursor = skip_ascii_whitespace(bytes, cursor);
+        let quote = bytes
+            .get(cursor)
+            .copied()
+            .filter(|byte| matches!(byte, b'"' | b'\''));
+        if quote.is_some() {
+            cursor += 1;
+        }
         if value[cursor..]
             .get(..6)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer"))
@@ -236,7 +293,13 @@ fn adjacent_secret_range(value: &str, marker_end: usize, marker: &str) -> Option
             cursor += 6;
             cursor = skip_ascii_whitespace(bytes, cursor);
         }
-        return (cursor < value.len()).then(|| (cursor, scan_token_end(value, cursor)));
+        return (cursor < value.len()).then(|| {
+            let end = quote.map_or_else(
+                || scan_token_end(value, cursor),
+                |quote| scan_quoted_value_end(value, cursor, quote),
+            );
+            (cursor, end)
+        });
     }
 
     if bytes.get(cursor) != Some(&b'=') && bytes.get(cursor) != Some(&b':') {

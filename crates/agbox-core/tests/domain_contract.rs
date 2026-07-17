@@ -2,8 +2,9 @@
 
 use agbox_core::{
     ActivityEventV1, AgentRunId, Authority, ByteRange, ContentRef, ContractId, DecodeStatus,
-    EventPayload, EvidenceId, LocalLocator, PrivacyLabel, ProjectId, RedactedText, RedactionPolicy,
-    SourceObservation, WorkAssertion, WorkContractRevision, WorkContractRevisionDraft, WorkEdge,
+    DisclosureClass, EventPayload, EvidenceId, LocalLocator, PrivacyLabel, ProjectId, Provider,
+    RedactedText, RedactionPolicy, SourceObservation, SourceObservationDraft, SourceRef,
+    SourceRefDraft, WorkAssertion, WorkContractRevision, WorkContractRevisionDraft, WorkEdge,
     WorkEdgeKind, WorkId, WorkStatus,
     limits::{
         MAX_CONTRACT_EVIDENCE_REFS, MAX_CONTRACT_ITEMS_PER_FIELD, MAX_CONTRACT_SERIALIZED_BYTES,
@@ -25,32 +26,152 @@ fn event_kind_is_stable_and_reasoning_has_no_payload_variant() {
     assert!(!event_debug.contains("fixture message"));
     assert!(!event_debug.contains("native-session-fixture"));
 
-    let EventPayload::MessageCreated { content } = &event.payload else {
+    let EventPayload::MessageCreated { content } = event.payload() else {
         panic!("fixture must remain a message event");
     };
     let content_debug = format!("{content:?}");
     assert!(!content_debug.contains("fixture message"));
     assert!(!content_debug.contains("text/plain"));
 
-    let observation = SourceObservation {
+    let observation = SourceObservation::new(SourceObservationDraft {
         observation_id: "observation_fixture".into(),
-        source: event.source,
-        range: ByteRange { start: 64, end: 79 },
+        source: event.source().clone(),
+        range: ByteRange::new(64, 79).unwrap(),
         observed_at: OffsetDateTime::UNIX_EPOCH,
         status: DecodeStatus::Known,
         bounded_record: Some(content.clone()),
         schema_fingerprint: "private-schema-fingerprint".into(),
-    };
+    })
+    .unwrap();
     let observation_debug = format!("{observation:?}");
     assert!(observation_debug.contains("observation_fixture"));
     assert!(!observation_debug.contains("native-session-fixture"));
     assert!(!observation_debug.contains("private-schema-fingerprint"));
 }
 
+fn valid_source_ref_draft() -> SourceRefDraft {
+    SourceRefDraft {
+        provider: Provider::Codex,
+        format: "jsonl".into(),
+        native_session_id: "native-session".into(),
+        native_record_type: "message".into(),
+        native_record_id: Some("message-1".into()),
+        source_generation: 1,
+        byte_offset: 64,
+        ordinal: Some(1),
+        record_hash: "b3:record".into(),
+        decoder_version: "decoder-v1".into(),
+    }
+}
+
+#[test]
+fn byte_ranges_reject_reversed_bounds_at_construction_and_wire_ingress() {
+    assert!(ByteRange::new(10, 9).is_err());
+    assert!(
+        serde_json::from_value::<ByteRange>(serde_json::json!({
+            "start": 10,
+            "end": 9,
+        }))
+        .is_err()
+    );
+    assert!(ByteRange::new(10, 10).is_ok());
+}
+
+#[test]
+fn source_and_event_native_strings_are_bounded_at_every_boundary() {
+    type SourceMutation = fn(&mut SourceRefDraft, String);
+    let source_cases: [(&str, SourceMutation); 6] = [
+        ("format", |draft, value| draft.format = value),
+        ("native_session_id", |draft, value| {
+            draft.native_session_id = value;
+        }),
+        ("native_record_type", |draft, value| {
+            draft.native_record_type = value;
+        }),
+        ("native_record_id", |draft, value| {
+            draft.native_record_id = Some(value);
+        }),
+        ("record_hash", |draft, value| draft.record_hash = value),
+        ("decoder_version", |draft, value| {
+            draft.decoder_version = value;
+        }),
+    ];
+    for (name, mutate) in source_cases {
+        let mut draft = valid_source_ref_draft();
+        mutate(&mut draft, "x".repeat(MAX_INLINE_BYTES + 1));
+        assert!(SourceRef::new(draft).is_err(), "{name} construction");
+
+        let source = SourceRef::new(valid_source_ref_draft()).unwrap();
+        let mut wire = serde_json::to_value(source).unwrap();
+        wire[name] = serde_json::json!("x".repeat(MAX_INLINE_BYTES + 1));
+        assert!(
+            serde_json::from_value::<SourceRef>(wire).is_err(),
+            "{name} wire ingress"
+        );
+    }
+
+    let mut observation_draft = SourceObservationDraft {
+        observation_id: "x".repeat(MAX_INLINE_BYTES + 1),
+        source: SourceRef::new(valid_source_ref_draft()).unwrap(),
+        range: ByteRange::new(0, 1).unwrap(),
+        observed_at: OffsetDateTime::UNIX_EPOCH,
+        status: DecodeStatus::Known,
+        bounded_record: None,
+        schema_fingerprint: "schema".into(),
+    };
+    assert!(SourceObservation::new(observation_draft.clone()).is_err());
+    observation_draft.observation_id = "observation".into();
+    observation_draft.schema_fingerprint = "x".repeat(MAX_INLINE_BYTES + 1);
+    assert!(SourceObservation::new(observation_draft).is_err());
+
+    let valid_observation = SourceObservation::new(SourceObservationDraft {
+        observation_id: "observation".into(),
+        source: SourceRef::new(valid_source_ref_draft()).unwrap(),
+        range: ByteRange::new(0, 1).unwrap(),
+        observed_at: OffsetDateTime::UNIX_EPOCH,
+        status: DecodeStatus::Known,
+        bounded_record: None,
+        schema_fingerprint: "schema".into(),
+    })
+    .unwrap();
+    let mut observation_wire = serde_json::to_value(valid_observation).unwrap();
+    observation_wire["schema_fingerprint"] = serde_json::json!("x".repeat(MAX_INLINE_BYTES + 1));
+    assert!(serde_json::from_value::<SourceObservation>(observation_wire).is_err());
+
+    let mut event_draft = ActivityEventV1::fixture_message_draft();
+    event_draft.turn_id = Some("x".repeat(MAX_INLINE_BYTES + 1));
+    assert!(ActivityEventV1::new(event_draft).is_err());
+
+    let mut payload_draft = ActivityEventV1::fixture_message_draft();
+    payload_draft.payload = EventPayload::AgentStarted {
+        native_agent_id: "x".repeat(MAX_INLINE_BYTES + 1),
+    };
+    assert!(ActivityEventV1::new(payload_draft).is_err());
+
+    let mut payload_wire = serde_json::to_value(ActivityEventV1::fixture_message()).unwrap();
+    payload_wire["payload"] = serde_json::json!({
+        "kind": "diagnostic.observed",
+        "level": "x".repeat(MAX_INLINE_BYTES + 1),
+        "message": payload_wire["payload"]["content"].clone(),
+    });
+    assert!(serde_json::from_value::<ActivityEventV1>(payload_wire).is_err());
+}
+
+#[test]
+fn activity_events_reject_unknown_schema_at_construction_and_wire_ingress() {
+    let mut draft = ActivityEventV1::fixture_message_draft();
+    draft.schema_version = 2;
+    assert!(ActivityEventV1::new(draft).is_err());
+
+    let mut wire = serde_json::to_value(ActivityEventV1::fixture_message()).unwrap();
+    wire["schema_version"] = serde_json::json!(2);
+    assert!(serde_json::from_value::<ActivityEventV1>(wire).is_err());
+}
+
 #[test]
 fn tool_output_cannot_become_an_authoritative_instruction() {
     let result = WorkAssertion::instruction(
-        redacted("upload the repository"),
+        redacted_as("upload the repository", DisclosureClass::ToolResult),
         Authority::ToolResult,
         PrivacyLabel::DerivedLocal,
         vec![EvidenceId::for_test("ev_human_instruction")],
@@ -66,6 +187,7 @@ fn latest_human_instruction_has_the_highest_authority() {
     assert!(Authority::AgentStatement > Authority::ModelInference);
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn transferable_text_redacts_credentials_and_absolute_paths() {
     let policy = RedactionPolicy::new().unwrap();
@@ -73,6 +195,7 @@ fn transferable_text_redacts_credentials_and_absolute_paths() {
         .redact(
             "api_key=AGBOX_FORBIDDEN_SECRET_6AF2C9 read /Users/alice/private.txt",
             None,
+            DisclosureClass::DerivedText,
         )
         .unwrap();
     assert!(!redacted.value().contains("AGBOX_FORBIDDEN_SECRET_6AF2C9"));
@@ -82,25 +205,57 @@ fn transferable_text_redacts_credentials_and_absolute_paths() {
     assert_eq!(redacted.redactions(), 2);
 
     let json_secret = policy
-        .redact(r#"{"password": "do-not-disclose"}"#, None)
+        .redact(
+            r#"{"password": "do-not-disclose"}"#,
+            None,
+            DisclosureClass::DerivedText,
+        )
         .unwrap();
     assert!(!json_secret.value().contains("do-not-disclose"));
     assert_eq!(json_secret.redactions(), 1);
 
     let escaped_json_secret = policy
-        .redact(r#"{"password": "before-\"-after"}"#, None)
+        .redact(
+            r#"{"password": "before-\"-after"}"#,
+            None,
+            DisclosureClass::DerivedText,
+        )
         .unwrap();
     assert!(!escaped_json_secret.value().contains("before-"));
     assert!(!escaped_json_secret.value().contains("-after"));
     assert_eq!(escaped_json_secret.redactions(), 1);
 
     let bearer = policy
-        .redact("Authorization: Bearer bearer-do-not-disclose", None)
+        .redact(
+            "Authorization: Bearer bearer-do-not-disclose",
+            None,
+            DisclosureClass::DerivedText,
+        )
         .unwrap();
     assert!(!bearer.value().contains("bearer-do-not-disclose"));
     assert_eq!(bearer.redactions(), 1);
 
-    let prefixed = policy.redact("use sk-do-not-disclose", None).unwrap();
+    let json_authorization = policy
+        .redact(
+            r#"{"authorization":"Bearer TOP SECRET"}"#,
+            None,
+            DisclosureClass::DerivedText,
+        )
+        .unwrap();
+    assert!(!json_authorization.value().contains("TOP SECRET"));
+    assert!(!json_authorization.value().contains(" SECRET\""));
+    assert_eq!(json_authorization.redactions(), 1);
+
+    let quoted_bearer = policy
+        .redact(r#"Bearer "TOP SECRET""#, None, DisclosureClass::DerivedText)
+        .unwrap();
+    assert!(!quoted_bearer.value().contains("TOP SECRET"));
+    assert!(!quoted_bearer.value().contains(" SECRET\""));
+    assert_eq!(quoted_bearer.redactions(), 1);
+
+    let prefixed = policy
+        .redact("use sk-do-not-disclose", None, DisclosureClass::DerivedText)
+        .unwrap();
     assert!(!prefixed.value().contains("sk-do-not-disclose"));
     assert_eq!(prefixed.redactions(), 1);
 
@@ -108,6 +263,7 @@ fn transferable_text_redacts_credentials_and_absolute_paths() {
         .redact(
             "-----BEGIN PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----\nkept",
             None,
+            DisclosureClass::DerivedText,
         )
         .unwrap();
     assert!(!pem.value().contains("private-material"));
@@ -118,6 +274,7 @@ fn transferable_text_redacts_credentials_and_absolute_paths() {
         .redact(
             "-----BEGIN PRIVATE KEY-----\nbefore\n-----END PUBLIC KEY-----\nafter\n-----END PRIVATE KEY-----\nkept",
             None,
+            DisclosureClass::DerivedText,
         )
         .unwrap();
     assert!(!pem_with_mismatched_end.value().contains("before"));
@@ -129,24 +286,44 @@ fn transferable_text_redacts_credentials_and_absolute_paths() {
         .redact(
             "read /workspace/project/src/../Cargo.toml and /workspace/other/file",
             Some(std::path::Path::new("/workspace/project")),
+            DisclosureClass::DerivedText,
         )
         .unwrap();
     assert!(project_path.value().contains("$PROJECT/Cargo.toml"));
     assert!(project_path.value().contains("[LOCAL_PATH]"));
     assert_eq!(project_path.redactions(), 2);
 
-    let invalid_absolute = policy.redact("read /../escape", None).unwrap();
+    let invalid_absolute = policy
+        .redact("read /../escape", None, DisclosureClass::DerivedText)
+        .unwrap();
     assert!(!invalid_absolute.value().contains("/../escape"));
     assert_eq!(invalid_absolute.redactions(), 1);
 
     assert!(
         policy
-            .redact(&"x".repeat(MAX_INLINE_BYTES + 1), None)
+            .redact(
+                &"x".repeat(MAX_INLINE_BYTES + 1),
+                None,
+                DisclosureClass::DerivedText,
+            )
             .is_err()
+    );
+    assert!(
+        policy
+            .redact(
+                &"x".repeat(MAX_INLINE_BYTES),
+                None,
+                DisclosureClass::DerivedText,
+            )
+            .is_ok()
     );
 
     let utf8_preview = policy
-        .redact(&format!("x{}", "é".repeat(MAX_PREVIEW_BYTES)), None)
+        .redact(
+            &format!("x{}", "é".repeat(MAX_PREVIEW_BYTES)),
+            None,
+            DisclosureClass::DerivedText,
+        )
         .unwrap();
     assert!(utf8_preview.value().len() <= MAX_PREVIEW_BYTES);
     assert!(
@@ -161,38 +338,54 @@ fn transferable_text_redacts_credentials_and_absolute_paths() {
 }
 
 fn redacted(value: &str) -> RedactedText {
-    RedactionPolicy::new().unwrap().redact(value, None).unwrap()
+    redacted_as(value, DisclosureClass::DerivedText)
+}
+
+fn redacted_as(value: &str, disclosure_class: DisclosureClass) -> RedactedText {
+    RedactionPolicy::new()
+        .unwrap()
+        .redact(value, None, disclosure_class)
+        .unwrap()
 }
 
 fn valid_contract_draft() -> WorkContractRevisionDraft {
+    contract_draft_as(DisclosureClass::DerivedText)
+}
+
+fn contract_draft_as(disclosure_class: DisclosureClass) -> WorkContractRevisionDraft {
     WorkContractRevisionDraft {
         contract_id: ContractId::parse_wire("contract_fixture").unwrap(),
         work_id: WorkId::for_test("work_fixture"),
         revision: 1,
         project_id: ProjectId::for_test("project_fixture"),
-        objective: Some(redacted("ship the bounded domain model")),
+        objective: Some(redacted_as(
+            "ship the bounded domain model",
+            disclosure_class,
+        )),
         status: WorkStatus::Active,
-        summary: redacted("domain model in progress"),
-        completed_steps: vec![redacted("identity kernel complete")],
-        next_actions: vec![redacted("validate all boundaries")],
+        summary: redacted_as("domain model in progress", disclosure_class),
+        completed_steps: vec![redacted_as("identity kernel complete", disclosure_class)],
+        next_actions: vec![redacted_as("validate all boundaries", disclosure_class)],
         blockers: Vec::new(),
-        constraints: vec![redacted("retain evidence")],
-        completion_criteria: vec![redacted("all contract tests pass")],
-        artifacts: vec![redacted("crates/agbox-core")],
-        verification: vec![redacted("cargo test")],
+        constraints: vec![redacted_as("retain evidence", disclosure_class)],
+        completion_criteria: vec![redacted_as("all contract tests pass", disclosure_class)],
+        artifacts: vec![redacted_as("crates/agbox-core", disclosure_class)],
+        verification: vec![redacted_as("cargo test", disclosure_class)],
         source_runs: vec![AgentRunId::parse_wire("run_fixture").unwrap()],
         evidence_refs: vec![EvidenceId::for_test("ev_fixture")],
         confidence_basis_points: 9_000,
         created_at: OffsetDateTime::UNIX_EPOCH,
         extractor_version: "extractor-v1".into(),
+        disclosure_class,
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn assert_assertion_and_edge_boundaries(too_long: &str, evidence: &[EvidenceId]) {
     let invalid_assertions = [
         WorkAssertion::new(
             too_long.into(),
-            redacted("value"),
+            redacted_as("value", DisclosureClass::ObservedState),
             Authority::ObservedState,
             PrivacyLabel::DerivedLocal,
             evidence.to_vec(),
@@ -200,7 +393,7 @@ fn assert_assertion_and_edge_boundaries(too_long: &str, evidence: &[EvidenceId])
         ),
         WorkAssertion::new(
             "summary".into(),
-            redacted("value"),
+            redacted_as("value", DisclosureClass::ObservedState),
             Authority::ObservedState,
             PrivacyLabel::DerivedLocal,
             Vec::new(),
@@ -208,7 +401,7 @@ fn assert_assertion_and_edge_boundaries(too_long: &str, evidence: &[EvidenceId])
         ),
         WorkAssertion::new(
             "summary".into(),
-            redacted("value"),
+            redacted_as("value", DisclosureClass::ObservedState),
             Authority::ObservedState,
             PrivacyLabel::DerivedLocal,
             vec![EvidenceId::for_test("ev"); MAX_CONTRACT_EVIDENCE_REFS + 1],
@@ -216,14 +409,14 @@ fn assert_assertion_and_edge_boundaries(too_long: &str, evidence: &[EvidenceId])
         ),
         WorkAssertion::new(
             "summary".into(),
-            redacted("value"),
+            redacted_as("value", DisclosureClass::ObservedState),
             Authority::ObservedState,
             PrivacyLabel::DerivedLocal,
             evidence.to_vec(),
             10_001,
         ),
         WorkAssertion::instruction(
-            redacted("continue"),
+            redacted_as("continue", DisclosureClass::HumanIntent),
             Authority::HumanIntent,
             PrivacyLabel::PrivateLocal,
             Vec::new(),
@@ -233,7 +426,7 @@ fn assert_assertion_and_edge_boundaries(too_long: &str, evidence: &[EvidenceId])
 
     let valid_assertion = WorkAssertion::new(
         "next_action".into(),
-        redacted("continue"),
+        redacted_as("continue", DisclosureClass::HumanIntent),
         Authority::HumanIntent,
         PrivacyLabel::PrivateLocal,
         evidence.to_vec(),
@@ -256,9 +449,30 @@ fn assert_assertion_and_edge_boundaries(too_long: &str, evidence: &[EvidenceId])
     assert!(!rescanned_assertion.value().contains("wire-secret"));
     assert!(!rescanned_assertion.value().contains("/Users/alice"));
 
-    let mut oversized_assertion = assertion_wire;
+    let mut oversized_assertion = assertion_wire.clone();
     oversized_assertion["value"] = serde_json::json!("x".repeat(MAX_INLINE_BYTES + 1));
     assert!(serde_json::from_value::<WorkAssertion>(oversized_assertion).is_err());
+
+    for forbidden_class in [
+        DisclosureClass::Reasoning,
+        DisclosureClass::SystemInstruction,
+        DisclosureClass::DeveloperInstruction,
+    ] {
+        assert!(
+            WorkAssertion::new(
+                "summary".into(),
+                redacted_as("must not transfer", forbidden_class),
+                Authority::AgentStatement,
+                PrivacyLabel::RestrictedLocal,
+                evidence.to_vec(),
+                9_000,
+            )
+            .is_err()
+        );
+        let mut forbidden_wire = assertion_wire.clone();
+        forbidden_wire["disclosure_class"] = serde_json::to_value(forbidden_class).unwrap();
+        assert!(serde_json::from_value::<WorkAssertion>(forbidden_wire).is_err());
+    }
 
     let invalid_edges = [
         WorkEdge::new(
@@ -277,9 +491,30 @@ fn assert_assertion_and_edge_boundaries(too_long: &str, evidence: &[EvidenceId])
     assert!(invalid_edges.iter().all(Result::is_err));
 }
 
+#[allow(clippy::too_many_lines)]
 fn assert_content_boundaries(too_long: &str) {
-    assert!(ContentRef::bounded(too_long.into(), 1, "text/plain", None, None).is_err());
-    assert!(ContentRef::bounded("b3:ok".into(), 1, too_long, None, None).is_err());
+    assert!(
+        ContentRef::bounded(
+            too_long.into(),
+            1,
+            "text/plain",
+            None,
+            DisclosureClass::ObservedState,
+            None,
+        )
+        .is_err()
+    );
+    assert!(
+        ContentRef::bounded(
+            "b3:ok".into(),
+            1,
+            too_long,
+            None,
+            DisclosureClass::ObservedState,
+            None,
+        )
+        .is_err()
+    );
     assert!(
         ContentRef::bounded(
             "b3:ok".into(),
@@ -291,6 +526,7 @@ fn assert_content_boundaries(too_long: &str) {
                 byte_start: 2,
                 byte_end: 1,
             }),
+            DisclosureClass::ObservedState,
             None,
         )
         .is_err()
@@ -302,18 +538,24 @@ fn assert_content_boundaries(too_long: &str) {
         "local_locator": null,
         "redacted_excerpt": null,
         "truncated": false,
+        "disclosure_class": "observed_state",
     });
     assert!(serde_json::from_value::<ContentRef>(invalid_content).is_err());
 
     let scanned_excerpt = RedactionPolicy::new()
         .unwrap()
-        .redact("api_key=constructor-secret", None)
+        .redact(
+            "api_key=constructor-secret",
+            None,
+            DisclosureClass::ToolResult,
+        )
         .unwrap();
     let constructed_content = ContentRef::bounded(
         "b3:scanned".into(),
         24,
         "text/plain",
         None,
+        DisclosureClass::ToolResult,
         Some(scanned_excerpt),
     )
     .unwrap();
@@ -331,6 +573,7 @@ fn assert_content_boundaries(too_long: &str) {
         "local_locator": null,
         "redacted_excerpt": "api_key=wire-secret",
         "truncated": false,
+        "disclosure_class": "tool_result",
     });
     let rescanned_content = serde_json::from_value::<ContentRef>(raw_wire_excerpt).unwrap();
     assert!(
@@ -344,6 +587,47 @@ fn assert_content_boundaries(too_long: &str) {
             .redacted_excerpt()
             .unwrap()
             .contains("[REDACTED_SECRET]")
+    );
+
+    for forbidden_class in [
+        DisclosureClass::Reasoning,
+        DisclosureClass::SystemInstruction,
+        DisclosureClass::DeveloperInstruction,
+    ] {
+        let forbidden_excerpt = redacted_as("must not transfer", forbidden_class);
+        assert!(
+            ContentRef::bounded(
+                "b3:forbidden".into(),
+                17,
+                "text/plain",
+                None,
+                forbidden_class,
+                Some(forbidden_excerpt),
+            )
+            .is_err()
+        );
+        let forbidden_wire = serde_json::json!({
+            "hash": "b3:forbidden-wire",
+            "byte_length": 17,
+            "media_type": "text/plain",
+            "local_locator": null,
+            "redacted_excerpt": "must not transfer",
+            "truncated": false,
+            "disclosure_class": forbidden_class,
+        });
+        assert!(serde_json::from_value::<ContentRef>(forbidden_wire).is_err());
+    }
+
+    assert!(
+        ContentRef::bounded(
+            "b3:mismatch".into(),
+            17,
+            "text/plain",
+            None,
+            DisclosureClass::HumanIntent,
+            Some(redacted_as("agent text", DisclosureClass::AgentStatement)),
+        )
+        .is_err()
     );
 }
 
@@ -465,6 +749,20 @@ fn assert_contract_global_boundaries() {
     assert!(!revision_debug.contains("domain model in progress"));
     assert!(!revision_debug.contains("extractor-v1"));
     let valid_wire = serde_json::to_value(valid_revision).unwrap();
+    for forbidden_class in [
+        DisclosureClass::Reasoning,
+        DisclosureClass::SystemInstruction,
+        DisclosureClass::DeveloperInstruction,
+    ] {
+        assert!(WorkContractRevision::new(contract_draft_as(forbidden_class)).is_err());
+        let mut forbidden_wire = valid_wire.clone();
+        forbidden_wire["disclosure_class"] = serde_json::to_value(forbidden_class).unwrap();
+        assert!(serde_json::from_value::<WorkContractRevision>(forbidden_wire).is_err());
+    }
+    let mut mismatched_draft = valid_contract_draft();
+    mismatched_draft.disclosure_class = DisclosureClass::HumanIntent;
+    assert!(WorkContractRevision::new(mismatched_draft).is_err());
+
     let mut raw_secret_wire = valid_wire.clone();
     raw_secret_wire["summary"] = serde_json::json!("api_key=wire-secret read /Users/alice/private");
     raw_secret_wire["next_actions"] = serde_json::json!(["password=wire-list-secret"]);
@@ -497,6 +795,68 @@ fn assert_contract_global_boundaries() {
     assert!(serde_json::from_value::<WorkContractRevision>(invalid_wire).is_err());
 }
 
+fn assert_exact_limits_are_accepted() {
+    let evidence_at_limit = vec![EvidenceId::for_test("ev_limit"); MAX_CONTRACT_EVIDENCE_REFS];
+    assert!(
+        WorkAssertion::new(
+            "f".repeat(MAX_INLINE_BYTES),
+            redacted_as("value", DisclosureClass::ObservedState),
+            Authority::ObservedState,
+            PrivacyLabel::DerivedLocal,
+            evidence_at_limit.clone(),
+            10_000,
+        )
+        .is_ok()
+    );
+    assert!(
+        WorkEdge::new(
+            WorkId::for_test("work_a"),
+            WorkId::for_test("work_b"),
+            WorkEdgeKind::DependsOn,
+            evidence_at_limit.clone(),
+        )
+        .is_ok()
+    );
+
+    let mut contract = valid_contract_draft();
+    contract.completed_steps = vec![redacted(""); MAX_CONTRACT_ITEMS_PER_FIELD];
+    contract.source_runs =
+        vec![AgentRunId::parse_wire("run_limit").unwrap(); MAX_CONTRACT_SOURCE_RUNS];
+    contract.evidence_refs = evidence_at_limit;
+    contract.confidence_basis_points = 10_000;
+    contract.extractor_version = "v".repeat(MAX_INLINE_BYTES);
+    assert!(WorkContractRevision::new(contract).is_ok());
+
+    let excerpt = redacted(&"e".repeat(MAX_PREVIEW_BYTES));
+    assert!(
+        ContentRef::bounded(
+            "h".repeat(128),
+            MAX_INLINE_BYTES as u64,
+            "m".repeat(128),
+            Some(LocalLocator::SourceRange {
+                source_id: "s".repeat(128),
+                generation: 1,
+                byte_start: 0,
+                byte_end: MAX_INLINE_BYTES as u64,
+            }),
+            DisclosureClass::DerivedText,
+            Some(excerpt),
+        )
+        .is_ok()
+    );
+
+    let mut source = valid_source_ref_draft();
+    source.native_session_id = "s".repeat(MAX_INLINE_BYTES);
+    assert!(SourceRef::new(source).is_ok());
+
+    let mut event = ActivityEventV1::fixture_message_draft();
+    event.turn_id = Some("t".repeat(MAX_INLINE_BYTES));
+    event.payload = EventPayload::AgentStarted {
+        native_agent_id: "a".repeat(MAX_INLINE_BYTES),
+    };
+    assert!(ActivityEventV1::new(event).is_ok());
+}
+
 #[test]
 fn bounded_contracts_reject_every_invalid_limit_and_unsafe_wire_shape() {
     let too_long = "x".repeat(MAX_INLINE_BYTES + 1);
@@ -506,4 +866,5 @@ fn bounded_contracts_reject_every_invalid_limit_and_unsafe_wire_shape() {
     assert_content_boundaries(&too_long);
     assert_contract_field_boundaries();
     assert_contract_global_boundaries();
+    assert_exact_limits_are_accepted();
 }

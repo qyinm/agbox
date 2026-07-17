@@ -4,8 +4,8 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use time::OffsetDateTime;
 
 use crate::{
-    AgentRunId, Authority, ContractId, EvidenceId, PrivacyLabel, ProjectId, RedactedText,
-    RedactionError, RedactionPolicy, WorkId,
+    AgentRunId, Authority, ContractId, DisclosureClass, EvidenceId, PrivacyLabel, ProjectId,
+    RedactedText, RedactionError, RedactionPolicy, WorkId,
     limits::{
         MAX_CONTRACT_EVIDENCE_REFS, MAX_CONTRACT_ITEMS_PER_FIELD, MAX_CONTRACT_SERIALIZED_BYTES,
         MAX_CONTRACT_SOURCE_RUNS, MAX_INLINE_BYTES,
@@ -41,6 +41,7 @@ pub struct WorkAssertion {
     privacy: PrivacyLabel,
     evidence_refs: Vec<EvidenceId>,
     confidence_basis_points: u16,
+    disclosure_class: DisclosureClass,
 }
 
 impl fmt::Debug for WorkAssertion {
@@ -49,6 +50,7 @@ impl fmt::Debug for WorkAssertion {
             .debug_struct("WorkAssertion")
             .field("authority", &self.authority)
             .field("privacy", &self.privacy)
+            .field("disclosure_class", &self.disclosure_class)
             .field("evidence_count", &self.evidence_refs.len())
             .field("value_bytes", &self.value.len())
             .finish_non_exhaustive()
@@ -69,6 +71,8 @@ pub enum AssertionError {
     InvalidConfidence,
     #[error("assertion text could not be redacted")]
     Redaction(#[from] RedactionError),
+    #[error("assertion disclosure class is forbidden")]
+    ForbiddenDisclosure,
 }
 
 impl WorkAssertion {
@@ -86,6 +90,7 @@ impl WorkAssertion {
         evidence_refs: Vec<EvidenceId>,
         confidence_basis_points: u16,
     ) -> Result<Self, AssertionError> {
+        let disclosure_class = value.disclosure_class();
         let assertion = Self {
             field,
             value: value.into_value(),
@@ -93,6 +98,7 @@ impl WorkAssertion {
             privacy,
             evidence_refs,
             confidence_basis_points,
+            disclosure_class,
         };
         assertion.validate()?;
         Ok(assertion)
@@ -141,6 +147,9 @@ impl WorkAssertion {
         if self.confidence_basis_points > 10_000 {
             return Err(AssertionError::InvalidConfidence);
         }
+        if !self.disclosure_class.is_transferable() {
+            return Err(AssertionError::ForbiddenDisclosure);
+        }
         Ok(())
     }
 
@@ -173,6 +182,11 @@ impl WorkAssertion {
     pub fn confidence_basis_points(&self) -> u16 {
         self.confidence_basis_points
     }
+
+    #[must_use]
+    pub fn disclosure_class(&self) -> DisclosureClass {
+        self.disclosure_class
+    }
 }
 
 #[derive(Deserialize)]
@@ -183,6 +197,7 @@ struct WorkAssertionWire {
     privacy: PrivacyLabel,
     evidence_refs: Vec<EvidenceId>,
     confidence_basis_points: u16,
+    disclosure_class: DisclosureClass,
 }
 
 impl<'de> Deserialize<'de> for WorkAssertion {
@@ -192,7 +207,7 @@ impl<'de> Deserialize<'de> for WorkAssertion {
     {
         let wire = WorkAssertionWire::deserialize(deserializer)?;
         let redacted_value = RedactionPolicy::new()
-            .and_then(|policy| policy.redact(&wire.value, None))
+            .and_then(|policy| policy.redact(&wire.value, None, wire.disclosure_class))
             .map_err(de::Error::custom)?;
         Self::new(
             wire.field,
@@ -319,6 +334,7 @@ pub struct WorkContractRevisionDraft {
     pub confidence_basis_points: u16,
     pub created_at: OffsetDateTime,
     pub extractor_version: String,
+    pub disclosure_class: DisclosureClass,
 }
 
 impl fmt::Debug for WorkContractRevisionDraft {
@@ -348,6 +364,7 @@ pub struct WorkContractRevision {
     confidence_basis_points: u16,
     created_at: OffsetDateTime,
     extractor_version: String,
+    disclosure_class: DisclosureClass,
 }
 
 impl fmt::Debug for WorkContractRevision {
@@ -372,6 +389,7 @@ struct SanitizedContractDebug<'a> {
     source_run_count: usize,
     evidence_count: usize,
     extractor_version_bytes: usize,
+    disclosure_class: DisclosureClass,
 }
 
 impl<'a> SanitizedContractDebug<'a> {
@@ -395,6 +413,7 @@ impl<'a> SanitizedContractDebug<'a> {
             source_run_count: draft.source_runs.len(),
             evidence_count: draft.evidence_refs.len(),
             extractor_version_bytes: draft.extractor_version.len(),
+            disclosure_class: draft.disclosure_class,
         }
     }
 
@@ -415,6 +434,7 @@ impl<'a> SanitizedContractDebug<'a> {
             source_run_count: revision.source_runs.len(),
             evidence_count: revision.evidence_refs.len(),
             extractor_version_bytes: revision.extractor_version.len(),
+            disclosure_class: revision.disclosure_class,
         }
     }
 }
@@ -436,6 +456,7 @@ impl fmt::Debug for SanitizedContractDebug<'_> {
             .field("verification_count", &self.verification_count)
             .field("source_run_count", &self.source_run_count)
             .field("evidence_count", &self.evidence_count)
+            .field("disclosure_class", &self.disclosure_class)
             .field("extractor_version_bytes", &self.extractor_version_bytes)
             .finish_non_exhaustive()
     }
@@ -461,6 +482,10 @@ pub enum ContractError {
     Serialization(#[from] serde_json::Error),
     #[error("contract text could not be redacted")]
     Redaction(#[from] RedactionError),
+    #[error("contract disclosure class is forbidden")]
+    ForbiddenDisclosure,
+    #[error("contract semantic text has mismatched disclosure provenance")]
+    DisclosureMismatch,
 }
 
 impl WorkContractRevision {
@@ -471,6 +496,7 @@ impl WorkContractRevision {
     /// Returns [`ContractError`] when any text, list, evidence, confidence, or
     /// final serialized-size invariant is violated.
     pub fn new(draft: WorkContractRevisionDraft) -> Result<Self, ContractError> {
+        validate_draft_disclosure(&draft)?;
         let revision = Self {
             contract_id: draft.contract_id,
             work_id: draft.work_id,
@@ -491,6 +517,7 @@ impl WorkContractRevision {
             confidence_basis_points: draft.confidence_basis_points,
             created_at: draft.created_at,
             extractor_version: draft.extractor_version,
+            disclosure_class: draft.disclosure_class,
         };
         revision.validate()?;
         Ok(revision)
@@ -523,6 +550,9 @@ impl WorkContractRevision {
         }
         if self.confidence_basis_points > 10_000 {
             return Err(ContractError::InvalidConfidence);
+        }
+        if !self.disclosure_class.is_transferable() {
+            return Err(ContractError::ForbiddenDisclosure);
         }
         if serde_json::to_vec(self)?.len() > MAX_CONTRACT_SERIALIZED_BYTES {
             return Err(ContractError::SerializedTooLarge);
@@ -624,6 +654,38 @@ impl WorkContractRevision {
     pub fn extractor_version(&self) -> &str {
         &self.extractor_version
     }
+
+    #[must_use]
+    pub fn disclosure_class(&self) -> DisclosureClass {
+        self.disclosure_class
+    }
+}
+
+fn validate_draft_disclosure(draft: &WorkContractRevisionDraft) -> Result<(), ContractError> {
+    let class = draft.disclosure_class;
+    if !class.is_transferable() {
+        return Err(ContractError::ForbiddenDisclosure);
+    }
+    let objective_matches = draft
+        .objective
+        .as_ref()
+        .is_none_or(|value| value.disclosure_class() == class);
+    let all_lists_match = [
+        draft.completed_steps.as_slice(),
+        draft.next_actions.as_slice(),
+        draft.blockers.as_slice(),
+        draft.constraints.as_slice(),
+        draft.completion_criteria.as_slice(),
+        draft.artifacts.as_slice(),
+        draft.verification.as_slice(),
+    ]
+    .into_iter()
+    .flatten()
+    .all(|value| value.disclosure_class() == class);
+    if !objective_matches || draft.summary.disclosure_class() != class || !all_lists_match {
+        return Err(ContractError::DisclosureMismatch);
+    }
+    Ok(())
 }
 
 fn into_strings(values: Vec<RedactedText>) -> Vec<String> {
@@ -678,6 +740,7 @@ struct WorkContractRevisionWire {
     confidence_basis_points: u16,
     created_at: OffsetDateTime,
     extractor_version: String,
+    disclosure_class: DisclosureClass,
 }
 
 impl WorkContractRevisionWire {
@@ -697,26 +760,53 @@ impl WorkContractRevisionWire {
             project_id: self.project_id,
             objective: self
                 .objective
-                .map(|value| policy.redact(&value, None))
+                .map(|value| policy.redact(&value, None, self.disclosure_class))
                 .transpose()?,
             status: self.status,
-            summary: policy.redact(&self.summary, None)?,
-            completed_steps: redact_wire_list("completed_steps", self.completed_steps, &policy)?,
-            next_actions: redact_wire_list("next_actions", self.next_actions, &policy)?,
-            blockers: redact_wire_list("blockers", self.blockers, &policy)?,
-            constraints: redact_wire_list("constraints", self.constraints, &policy)?,
+            summary: policy.redact(&self.summary, None, self.disclosure_class)?,
+            completed_steps: redact_wire_list(
+                "completed_steps",
+                self.completed_steps,
+                self.disclosure_class,
+                &policy,
+            )?,
+            next_actions: redact_wire_list(
+                "next_actions",
+                self.next_actions,
+                self.disclosure_class,
+                &policy,
+            )?,
+            blockers: redact_wire_list("blockers", self.blockers, self.disclosure_class, &policy)?,
+            constraints: redact_wire_list(
+                "constraints",
+                self.constraints,
+                self.disclosure_class,
+                &policy,
+            )?,
             completion_criteria: redact_wire_list(
                 "completion_criteria",
                 self.completion_criteria,
+                self.disclosure_class,
                 &policy,
             )?,
-            artifacts: redact_wire_list("artifacts", self.artifacts, &policy)?,
-            verification: redact_wire_list("verification", self.verification, &policy)?,
+            artifacts: redact_wire_list(
+                "artifacts",
+                self.artifacts,
+                self.disclosure_class,
+                &policy,
+            )?,
+            verification: redact_wire_list(
+                "verification",
+                self.verification,
+                self.disclosure_class,
+                &policy,
+            )?,
             source_runs: self.source_runs,
             evidence_refs: self.evidence_refs,
             confidence_basis_points: self.confidence_basis_points,
             created_at: self.created_at,
             extractor_version: self.extractor_version,
+            disclosure_class: self.disclosure_class,
         })
     }
 }
@@ -724,6 +814,7 @@ impl WorkContractRevisionWire {
 fn redact_wire_list(
     field: &'static str,
     values: Vec<String>,
+    disclosure_class: DisclosureClass,
     policy: &RedactionPolicy,
 ) -> Result<Vec<RedactedText>, ContractError> {
     if values.len() > MAX_CONTRACT_ITEMS_PER_FIELD {
@@ -731,7 +822,11 @@ fn redact_wire_list(
     }
     values
         .into_iter()
-        .map(|value| policy.redact(&value, None).map_err(ContractError::from))
+        .map(|value| {
+            policy
+                .redact(&value, None, disclosure_class)
+                .map_err(ContractError::from)
+        })
         .collect()
 }
 

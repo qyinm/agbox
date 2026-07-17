@@ -3,7 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 use crate::{
-    EvidenceId, RedactedText, RedactionPolicy,
+    DisclosureClass, EvidenceId, RedactedText, RedactionPolicy,
     limits::{MAX_INLINE_BYTES, MAX_PREVIEW_BYTES},
 };
 
@@ -29,6 +29,7 @@ pub struct ContentRef {
     local_locator: Option<LocalLocator>,
     redacted_excerpt: Option<String>,
     truncated: bool,
+    disclosure_class: DisclosureClass,
 }
 
 impl fmt::Debug for ContentRef {
@@ -37,6 +38,7 @@ impl fmt::Debug for ContentRef {
             .debug_struct("ContentRef")
             .field("hash", &self.hash)
             .field("byte_length", &self.byte_length)
+            .field("disclosure_class", &self.disclosure_class)
             .field(
                 "redacted_excerpt_bytes",
                 &self.redacted_excerpt.as_ref().map_or(0, String::len),
@@ -57,6 +59,10 @@ pub enum ContentError {
     ExcerptInputTooLarge,
     #[error("content truncation metadata is inconsistent")]
     InvalidTruncation,
+    #[error("content excerpt disclosure class is forbidden")]
+    ForbiddenDisclosure,
+    #[error("content excerpt disclosure class does not match its reference")]
+    DisclosureMismatch,
 }
 
 impl ContentRef {
@@ -71,6 +77,7 @@ impl ContentRef {
         byte_length: u64,
         media_type: impl Into<String>,
         local_locator: Option<LocalLocator>,
+        disclosure_class: DisclosureClass,
         redacted_excerpt: Option<RedactedText>,
     ) -> Result<Self, ContentError> {
         let media_type = media_type.into();
@@ -90,6 +97,14 @@ impl ContentRef {
                 ContentError::MetadataTooLarge
             });
         }
+        if let Some(excerpt) = &redacted_excerpt {
+            if excerpt.disclosure_class() != disclosure_class {
+                return Err(ContentError::DisclosureMismatch);
+            }
+            if !disclosure_class.is_transferable() {
+                return Err(ContentError::ForbiddenDisclosure);
+            }
+        }
         let redacted_excerpt = redacted_excerpt.map(RedactedText::into_value);
         let content = Self {
             hash,
@@ -98,6 +113,7 @@ impl ContentRef {
             local_locator,
             redacted_excerpt,
             truncated: byte_length > MAX_INLINE_BYTES as u64,
+            disclosure_class,
         };
         content.validate()?;
         Ok(content)
@@ -132,6 +148,9 @@ impl ContentRef {
         if self.truncated != (self.byte_length > MAX_INLINE_BYTES as u64) {
             return Err(ContentError::InvalidTruncation);
         }
+        if self.redacted_excerpt.is_some() && !self.disclosure_class.is_transferable() {
+            return Err(ContentError::ForbiddenDisclosure);
+        }
         Ok(())
     }
 
@@ -164,6 +183,11 @@ impl ContentRef {
     pub fn is_truncated(&self) -> bool {
         self.truncated
     }
+
+    #[must_use]
+    pub fn disclosure_class(&self) -> DisclosureClass {
+        self.disclosure_class
+    }
 }
 
 #[derive(Deserialize)]
@@ -174,6 +198,7 @@ struct ContentRefWire {
     local_locator: Option<LocalLocator>,
     redacted_excerpt: Option<String>,
     truncated: bool,
+    disclosure_class: DisclosureClass,
 }
 
 impl<'de> Deserialize<'de> for ContentRef {
@@ -198,7 +223,10 @@ impl<'de> Deserialize<'de> for ContentRef {
         }
         let redacted_excerpt = wire
             .redacted_excerpt
-            .map(|excerpt| RedactionPolicy::new().and_then(|policy| policy.redact(&excerpt, None)))
+            .map(|excerpt| {
+                RedactionPolicy::new()
+                    .and_then(|policy| policy.redact(&excerpt, None, wire.disclosure_class))
+            })
             .transpose()
             .map_err(de::Error::custom)?;
         let content = Self::bounded(
@@ -206,6 +234,7 @@ impl<'de> Deserialize<'de> for ContentRef {
             wire.byte_length,
             wire.media_type,
             wire.local_locator,
+            wire.disclosure_class,
             redacted_excerpt,
         )
         .map_err(de::Error::custom)?;

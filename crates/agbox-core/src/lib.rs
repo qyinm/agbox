@@ -8,13 +8,20 @@ pub mod work;
 
 use serde::{Deserialize, Serialize};
 
-pub use activity::{ActionOutcome, ActivityEventV1, Actor, EventPayload};
+pub use activity::{
+    ActionOutcome, ActivityError, ActivityEventDraft, ActivityEventV1, Actor, EventPayload,
+};
 pub use content::{ContentError, ContentRef, LocalLocator};
 pub use id::{
     AgentRunId, ContractId, EventId, EvidenceId, ProjectId, SemanticKey, SessionId, WorkId,
 };
-pub use privacy::{Authority, PrivacyLabel, RedactedText, RedactionError, RedactionPolicy};
-pub use source::{ByteRange, DecodeStatus, SourceObservation, SourceRef};
+pub use privacy::{
+    Authority, DisclosureClass, PrivacyLabel, RedactedText, RedactionError, RedactionPolicy,
+};
+pub use source::{
+    ByteRange, DecodeStatus, SourceError, SourceObservation, SourceObservationDraft, SourceRef,
+    SourceRefDraft,
+};
 pub use work::{
     AssertionError, ContractError, WorkAssertion, WorkContractRevision, WorkContractRevisionDraft,
     WorkEdge, WorkEdgeError, WorkEdgeKind, WorkStatus,
