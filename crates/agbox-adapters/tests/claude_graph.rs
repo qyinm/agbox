@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use agbox_adapters::{
-    ClaudeAdapter, DecodeContext, DecodeDisposition, DecoderState, MemoryRecordSource,
+    ClaudeAdapter, DecodeContext, DecodeDisposition, DecodeError, DecoderState, MemoryRecordSource,
     SourceAdapter, test_support::decode_fixture_file,
 };
 use agbox_core::{ActionOutcome, EventPayload, PrivacyLabel, ProjectId};
@@ -25,52 +25,97 @@ fn context() -> DecodeContext {
     }
 }
 
+fn try_decode(
+    json: &str,
+    state: &DecoderState,
+) -> Result<agbox_adapters::DecodedRecord, DecodeError> {
+    ClaudeAdapter.decode(
+        &MemoryRecordSource::new(json.as_bytes().to_vec()),
+        &context(),
+        state,
+    )
+}
+
 fn decode_one(json: &str, state: &DecoderState) -> agbox_adapters::DecodedRecord {
-    ClaudeAdapter
-        .decode(
-            &MemoryRecordSource::new(json.as_bytes().to_vec()),
-            &context(),
-            state,
-        )
-        .unwrap()
+    try_decode(json, state).unwrap()
+}
+
+fn graph_events(records: &[agbox_adapters::DecodedRecord]) -> Vec<&agbox_core::ActivityEventV1> {
+    records
+        .iter()
+        .flat_map(agbox_adapters::DecodedRecord::events)
+        .collect()
+}
+
+fn relationship_count(record: &agbox_adapters::DecodedRecord) -> usize {
+    record
+        .events()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.payload(),
+                EventPayload::DiagnosticObserved { level, .. }
+                    if level == "relationship.sidechain"
+            )
+        })
+        .count()
 }
 
 #[test]
-fn claude_parent_and_subagent_links_are_not_flattened() {
+fn claude_graph_uses_opaque_joinable_ids_and_authoritative_terminal_lifecycle() {
     let records = decode_fixture_file("claude", fixture("sidechain.jsonl")).unwrap();
-    let events = records
+    let events = graph_events(&records);
+    let parent_request = records[0]
+        .events()
         .iter()
-        .flat_map(agbox_adapters::DecodedRecord::events)
+        .find(|event| matches!(event.payload(), EventPayload::ActionRequested { .. }))
+        .unwrap();
+    let started = records[1]
+        .events()
+        .iter()
+        .filter(|event| matches!(event.payload(), EventPayload::AgentStarted { .. }))
         .collect::<Vec<_>>();
 
-    let started = events
-        .iter()
-        .find(|event| {
-            matches!(
-                event.payload(),
-                EventPayload::AgentStarted { native_agent_id } if native_agent_id == "agent-a"
-            )
-        })
-        .unwrap();
-    assert_eq!(started.correlation_id(), Some("spawn-assistant-a"));
-    assert_eq!(started.causation_id(), Some("parent-a1"));
-    assert_eq!(started.turn_id(), Some("child-a1"));
+    assert_eq!(started.len(), 2);
+    assert!(started.iter().all(|event| {
+        matches!(
+            event.payload(),
+            EventPayload::AgentStarted { native_agent_id }
+                if native_agent_id.starts_with("claude_graph_")
+                    && !native_agent_id.contains("PRIVATE")
+        )
+    }));
+    assert_ne!(
+        started[0].payload(),
+        started[1].payload(),
+        "distinct agentId and attributionAgent stay distinct after normalization"
+    );
+    assert!(
+        started
+            .iter()
+            .all(|event| event.correlation_id() == Some(parent_request.event_id().as_str()))
+    );
+    assert!(
+        records[1]
+            .events()
+            .iter()
+            .all(|event| event.causation_id() == parent_request.turn_id())
+    );
+    assert_eq!(relationship_count(&records[1]), 1);
 
-    for record in &records[1..4] {
-        let expected_parent = match record.observation().source().native_record_id().unwrap() {
-            "child-a1" => "parent-a1",
-            "child-compact" => "child-a1",
-            "child-finish" => "child-compact",
-            other => panic!("unexpected child record {other}"),
-        };
-        assert!(!record.events().is_empty());
-        assert!(
-            record
-                .events()
-                .iter()
-                .all(|event| event.causation_id() == Some(expected_parent))
-        );
-    }
+    let child_message = records[1]
+        .events()
+        .iter()
+        .find(|event| matches!(event.payload(), EventPayload::MessageCreated { .. }))
+        .unwrap();
+    assert!(
+        records[2]
+            .events()
+            .iter()
+            .all(|event| event.causation_id() == child_message.turn_id())
+    );
+    assert_ne!(child_message.event_id(), parent_request.event_id());
+    assert_ne!(child_message.turn_id(), parent_request.turn_id());
 
     assert!(events.iter().any(|event| matches!(
         event.payload(),
@@ -80,58 +125,35 @@ fn claude_parent_and_subagent_links_are_not_flattened() {
     )));
     assert!(events.iter().any(|event| matches!(
         event.payload(),
-        EventPayload::AgentFinished {
-            native_agent_id,
-            outcome: ActionOutcome::Succeeded
-        } if native_agent_id == "agent-a"
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event.payload(),
         EventPayload::TurnFinished {
             outcome: ActionOutcome::Succeeded
         }
     )));
-    assert!(events.iter().any(|event| matches!(
-        event.payload(),
-        EventPayload::AgentFinished {
-            native_agent_id,
-            outcome: ActionOutcome::Failed
-        } if native_agent_id == "agent-a"
-    )));
-
-    let child_message = records[1]
-        .events()
+    assert!(
+        !records[3..5]
+            .iter()
+            .flat_map(agbox_adapters::DecodedRecord::events)
+            .any(|event| matches!(event.payload(), EventPayload::AgentFinished { .. }))
+    );
+    let finished = events
         .iter()
-        .find(|event| matches!(event.payload(), EventPayload::MessageCreated { .. }))
-        .unwrap();
-    let parent_request = records[0]
-        .events()
-        .iter()
-        .find(|event| matches!(event.payload(), EventPayload::ActionRequested { .. }))
-        .unwrap();
-    assert_ne!(child_message.event_id(), parent_request.event_id());
-    assert_ne!(child_message.turn_id(), parent_request.turn_id());
+        .filter_map(|event| match event.payload() {
+            EventPayload::AgentFinished {
+                native_agent_id,
+                outcome,
+            } => Some((native_agent_id, outcome)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(*finished[0].1, ActionOutcome::Succeeded);
+    assert!(finished[0].0.starts_with("claude_graph_"));
 }
 
 #[test]
-fn system_summaries_and_assistant_errors_are_private_bounded_diagnostics() {
+fn every_new_graph_field_is_absent_raw_from_events_evidence_state_and_debug() {
     let records = decode_fixture_file("claude", fixture("sidechain.jsonl")).unwrap();
-    for record in &records[4..] {
-        let diagnostic = record
-            .events()
-            .iter()
-            .find(|event| matches!(event.payload(), EventPayload::DiagnosticObserved { .. }))
-            .unwrap();
-        assert_eq!(diagnostic.privacy(), PrivacyLabel::PrivateLocal);
-    }
-
-    let serialized = serde_json::to_string(
-        &records
-            .iter()
-            .flat_map(agbox_adapters::DecodedRecord::events)
-            .collect::<Vec<_>>(),
-    )
-    .unwrap();
+    let serialized = serde_json::to_string(&graph_events(&records)).unwrap();
     let debug = format!("{records:?}");
     let evidence = records
         .iter()
@@ -140,7 +162,11 @@ fn system_summaries_and_assistant_errors_are_private_bounded_diagnostics() {
         .collect::<Vec<_>>();
     let state = records.last().unwrap().next_state().as_bytes();
     for forbidden in [
-        "/Users/alice/private",
+        "spawn-token=PRIVATE_CREDENTIAL_",
+        "/Users/alice",
+        "image-base64-thinking",
+        "agent-token=PRIVATE_AGENT_",
+        "attribution-thinking-PRIVATE_AGENT",
         "PRIVATE_TOKEN",
         "PRIVATE_BASE64",
         "PRIVATE_ASSISTANT_THINKING",
@@ -163,20 +189,70 @@ fn system_summaries_and_assistant_errors_are_private_bounded_diagnostics() {
 }
 
 #[test]
-fn malformed_and_unknown_records_are_visible_and_isolated() {
+fn system_summaries_and_real_assistant_errors_are_private_bounded_diagnostics() {
+    let records = decode_fixture_file("claude", fixture("sidechain.jsonl")).unwrap();
+    for record in [&records[4], &records[7], &records[8]] {
+        let diagnostic = record
+            .events()
+            .iter()
+            .find(|event| {
+                matches!(
+                    event.payload(),
+                    EventPayload::DiagnosticObserved { level, .. }
+                        if level != "relationship.sidechain"
+                )
+            })
+            .unwrap();
+        assert_eq!(diagnostic.privacy(), PrivacyLabel::PrivateLocal);
+    }
+    for record in &records[9..12] {
+        assert!(!record.events().iter().any(|event| matches!(
+            event.payload(),
+            EventPayload::DiagnosticObserved { level, .. } if level == "error"
+        )));
+    }
+
+    let duplicate = try_decode(
+        r#"{"type":"assistant","uuid":"dup-error","sessionId":"session-graph","timestamp":"2026-07-17T03:00:12Z","error":"one","error":"two","message":{"content":[]}}"#,
+        records.last().unwrap().next_state(),
+    )
+    .unwrap_err();
+    assert!(matches!(duplicate, DecodeError::Malformed(_)));
+}
+
+#[test]
+fn malformed_identity_and_unknown_irrelevant_identity_fields_are_isolated() {
     let malformed = decode_fixture_file("claude", fixture("malformed.jsonl")).unwrap();
-    assert_eq!(malformed.len(), 2);
-    assert!(matches!(
-        malformed[0].disposition(),
-        DecodeDisposition::Malformed { .. }
-    ));
-    assert_eq!(
-        malformed[0].disposition().class(),
-        Some("missing_required_identity")
-    );
-    assert!(malformed[0].events().is_empty());
-    assert!(malformed[0].evidence().is_empty());
-    assert!(!malformed[1].events().is_empty());
+    assert_eq!(malformed.len(), 3);
+    for record in &malformed[..2] {
+        assert!(matches!(
+            record.disposition(),
+            DecodeDisposition::Malformed { .. }
+        ));
+        assert_eq!(
+            record.disposition().class(),
+            Some("missing_required_identity")
+        );
+        assert!(record.events().is_empty());
+        assert!(record.evidence().is_empty());
+        assert_eq!(record.next_state(), &DecoderState::default());
+    }
+    assert!(!malformed[2].events().is_empty());
+
+    for session in [None, Some("null"), Some(r#"{"nested":"invalid"}"#)] {
+        let field = session.map_or(String::new(), |value| format!(r#","sessionId":{value}"#));
+        let error = try_decode(
+            &format!(
+                r#"{{"type":"assistant","uuid":"session-hard-error","timestamp":"2026-07-17T04:00:02Z"{field},"message":{{"content":[]}}}}"#
+            ),
+            &DecoderState::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            DecodeError::MissingIdentity("sessionId") | DecodeError::Malformed(_)
+        ));
+    }
 
     let unknown = decode_fixture_file("claude", fixture("unknown.jsonl")).unwrap();
     assert!(matches!(
@@ -210,18 +286,121 @@ fn additive_fields_only_change_the_known_record_schema_fingerprint() {
 }
 
 #[test]
-fn known_agents_are_historical_bounded_and_evict_at_128() {
+fn sidechain_true_has_one_explicit_relationship_without_order_flattening() {
+    let parent = decode_one(
+        r#"{"type":"assistant","uuid":"paired-parent","sessionId":"session-pair","timestamp":"2026-07-17T07:00:00Z","message":{"content":[{"type":"tool_use","id":"pair-tool","name":"Task","input":{}}]}}"#,
+        &DecoderState::default(),
+    );
+    let true_record = decode_one(
+        r#"{"type":"assistant","uuid":"paired-child","parentUuid":"paired-parent","sessionId":"session-pair","timestamp":"2026-07-17T07:00:01Z","isSidechain":true,"agentId":"paired-agent","sourceToolAssistantUUID":"paired-parent","message":{"content":"same"}}"#,
+        parent.next_state(),
+    );
+    let false_record = decode_one(
+        r#"{"type":"assistant","uuid":"paired-child","parentUuid":"paired-parent","sessionId":"session-pair","timestamp":"2026-07-17T07:00:01Z","isSidechain":false,"agentId":"paired-agent","sourceToolAssistantUUID":"paired-parent","message":{"content":"same"}}"#,
+        parent.next_state(),
+    );
+
+    assert_eq!(relationship_count(&true_record), 1);
+    assert_eq!(relationship_count(&false_record), 0);
+    assert_eq!(true_record.events().len(), false_record.events().len() + 1);
+    assert!(
+        true_record
+            .events()
+            .iter()
+            .all(|event| event.turn_id() != parent.events()[0].turn_id())
+    );
+}
+
+#[test]
+fn ambiguous_spawn_requests_fail_closed_without_misjoining_agent_start() {
+    let parent = decode_one(
+        r#"{"type":"assistant","uuid":"ambiguous-parent","sessionId":"session-ambiguous","timestamp":"2026-07-17T08:00:00Z","message":{"content":[{"type":"tool_use","id":"task-one","name":"Task","input":{}},{"type":"tool_use","id":"task-two","name":"Task","input":{}}]}}"#,
+        &DecoderState::default(),
+    );
+    let child = decode_one(
+        r#"{"type":"assistant","uuid":"ambiguous-child","parentUuid":"ambiguous-parent","sessionId":"session-ambiguous","timestamp":"2026-07-17T08:00:01Z","agentId":"ambiguous-agent","sourceToolAssistantUUID":"ambiguous-parent","message":{"content":"done"}}"#,
+        parent.next_state(),
+    );
+    let started = child
+        .events()
+        .iter()
+        .find(|event| matches!(event.payload(), EventPayload::AgentStarted { .. }))
+        .unwrap();
+    assert_eq!(started.correlation_id(), None);
+}
+
+#[test]
+fn agent_history_pressure_never_evicts_pending_tool_correlations() {
+    let mut state = DecoderState::default();
+    for index in 0..128 {
+        let request = decode_one(
+            &format!(
+                r#"{{"type":"assistant","uuid":"tool-parent-{index}","sessionId":"session-pressure","timestamp":"2026-07-17T09:00:00Z","message":{{"content":[{{"type":"tool_use","id":"pending-{index}","name":"Read","input":{{"path":"src/{index}.rs"}}}}]}}}}"#
+            ),
+            &state,
+        );
+        state = request.next_state().clone();
+    }
+    for index in 0..129 {
+        let padding = "a".repeat(112);
+        let agent = decode_one(
+            &format!(
+                r#"{{"type":"assistant","uuid":"pressure-child-{index}","sessionId":"session-pressure","timestamp":"2026-07-17T09:00:01Z","agentId":"{padding}-{index}","message":{{"content":[]}}}}"#
+            ),
+            &state,
+        );
+        state = agent.next_state().clone();
+        assert!(state.as_bytes().len() <= 32 * 1024);
+    }
+
+    let mut correlated = 0;
+    for index in 0..128 {
+        let result = decode_one(
+            &format!(
+                r#"{{"type":"user","uuid":"pressure-result-{index}","sessionId":"session-pressure","timestamp":"2026-07-17T09:00:02Z","message":{{"content":[{{"type":"tool_result","tool_use_id":"pending-{index}","content":"ok","is_error":false}}]}}}}"#
+            ),
+            &state,
+        );
+        correlated += result
+            .events()
+            .iter()
+            .filter(|event| matches!(event.payload(), EventPayload::ActionFinished { .. }))
+            .count();
+        state = result.next_state().clone();
+    }
+    assert_eq!(correlated, 128);
+
+    let padding = "a".repeat(112);
+    let resighted = decode_one(
+        &format!(
+            r#"{{"type":"assistant","uuid":"pressure-resighted","sessionId":"session-pressure","timestamp":"2026-07-17T09:00:03Z","agentId":"{padding}-0","message":{{"content":[]}}}}"#
+        ),
+        &state,
+    );
+    assert!(
+        resighted
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::AgentStarted { .. })),
+        "an identity evicted from bounded history is intentionally first-sight again"
+    );
+}
+
+#[test]
+fn known_agents_and_finished_agents_are_opaque_historical_bounded_sets() {
     let mut state = DecoderState::default();
     for index in 0..129 {
         let decoded = decode_one(
             &format!(
-                r#"{{"type":"assistant","uuid":"child-{index}","parentUuid":"parent-{index}","sessionId":"session-agents","timestamp":"2026-07-17T06:00:00Z","isSidechain":true,"agentId":"agent-{index}","sourceToolAssistantUUID":"spawn-{index}","message":{{"content":"done"}}}}"#
+                r#"{{"type":"assistant","uuid":"child-{index}","parentUuid":"parent-{index}","sessionId":"session-agents","timestamp":"2026-07-17T06:00:00Z","isSidechain":true,"agentId":"agent-token=PRIVATE-{index}","message":{{"content":"done"}}}}"#
             ),
             &state,
         );
         assert!(decoded.events().iter().any(|event| matches!(
             event.payload(),
-            EventPayload::AgentStarted { native_agent_id } if native_agent_id == &format!("agent-{index}")
+            EventPayload::AgentStarted { native_agent_id }
+                if native_agent_id.starts_with("claude_graph_")
+                    && !native_agent_id.contains("PRIVATE")
         )));
         state = decoded.next_state().clone();
         assert!(state.as_bytes().len() <= 32 * 1024);
@@ -229,29 +408,42 @@ fn known_agents_are_historical_bounded_and_evict_at_128() {
 
     let value: serde_json::Value = serde_json::from_slice(state.as_bytes()).unwrap();
     let agents = value["known_agents"].as_array().unwrap();
-    assert_eq!(agents.len(), 128);
-    assert_eq!(agents.first().unwrap(), "agent-1");
-    assert_eq!(agents.last().unwrap(), "agent-128");
+    assert!(agents.len() <= 128);
+    assert!(
+        agents
+            .iter()
+            .all(|agent| agent.as_str().unwrap().starts_with("claude_graph_"))
+    );
+    assert!(!String::from_utf8_lossy(state.as_bytes()).contains("PRIVATE"));
 
     let terminal = decode_one(
-        r#"{"type":"system","subtype":"turn_duration","uuid":"finished-128","sessionId":"session-agents","timestamp":"2026-07-17T06:00:01Z","agentId":"agent-128","durationMs":1}"#,
+        r#"{"type":"result","subtype":"success","uuid":"finished-128","sessionId":"session-agents","timestamp":"2026-07-17T06:00:01Z","agentId":"agent-token=PRIVATE-128"}"#,
         &state,
     );
     assert!(terminal.events().iter().any(|event| matches!(
         event.payload(),
-        EventPayload::AgentFinished { native_agent_id, .. } if native_agent_id == "agent-128"
+        EventPayload::AgentFinished {
+            outcome: ActionOutcome::Succeeded,
+            ..
+        }
     )));
-    let terminal_state: serde_json::Value =
-        serde_json::from_slice(terminal.next_state().as_bytes()).unwrap();
-    assert_eq!(
-        terminal_state["known_agents"].as_array().unwrap().len(),
-        128
+    let replay = decode_one(
+        r#"{"type":"result","subtype":"failed","uuid":"finished-replay","sessionId":"session-agents","timestamp":"2026-07-17T06:00:02Z","agentId":"agent-token=PRIVATE-128"}"#,
+        terminal.next_state(),
     );
+    assert!(
+        !replay
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::AgentFinished { .. }))
+    );
+    let terminal_state: serde_json::Value =
+        serde_json::from_slice(replay.next_state().as_bytes()).unwrap();
     assert!(
         terminal_state["known_agents"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|agent| agent == "agent-128")
+            .any(|agent| *agent == terminal_state["finished_agents"][0]["agent_id"])
     );
 }

@@ -103,60 +103,189 @@ impl SourceAdapter for ClaudeAdapter {
             native_type_capture.ok_or(DecodeError::MissingIdentity("type"))?;
         let native_type = safe_native_type(native_type_capture);
 
-        let semantic = matches!(
-            native_type.as_str(),
-            "user" | "assistant" | "system" | "result"
-        );
-        let session_id = optional_identifier(record, &["sessionId"], MAX_ID_BYTES)?;
-        let native_record_id = optional_identifier(record, &["uuid"], MAX_ID_BYTES)?;
-        let timestamp = optional_identifier(record, &["timestamp"], MAX_ID_BYTES)?;
-        if semantic && session_id.is_none() {
-            return Err(DecodeError::MissingIdentity("sessionId"));
-        }
-
-        let source_session = session_id.as_deref().unwrap_or("metadata-session");
-        let source = make_source(
-            record,
-            context,
-            source_session,
-            &native_type,
-            native_record_id.clone(),
-        )?;
-        let observation = make_observation(
-            record,
-            context,
-            source.clone(),
-            &schema_fingerprint,
-            if semantic && (native_record_id.is_none() || timestamp.is_none()) {
-                DecodeStatus::Malformed
-            } else if is_known_type(&native_type) {
-                DecodeStatus::Known
-            } else {
-                DecodeStatus::UnknownType
-            },
-        )?;
-        if semantic && (native_record_id.is_none() || timestamp.is_none()) {
+        if !is_known_type(&native_type) {
+            let source = make_source(record, context, "metadata-session", &native_type, None)?;
+            let observation = make_observation(
+                record,
+                context,
+                source,
+                &schema_fingerprint,
+                DecodeStatus::UnknownType,
+            )?;
             return Ok(empty_record(
                 observation,
-                DecodeDisposition::malformed("missing_required_identity"),
+                DecodeDisposition::unknown_type(&native_type),
                 prior_state,
             ));
         }
 
-        decode_envelope(
+        let semantic = matches!(
+            native_type.as_str(),
+            "user" | "assistant" | "system" | "result"
+        );
+        if semantic {
+            decode_semantic_record(
+                record,
+                context,
+                prior_state,
+                &native_type,
+                &schema_fingerprint,
+            )
+        } else {
+            decode_metadata_record(
+                record,
+                context,
+                prior_state,
+                native_type,
+                &schema_fingerprint,
+            )
+        }
+    }
+}
+
+fn decode_metadata_record(
+    record: &dyn RecordSource,
+    context: &DecodeContext,
+    prior_state: &DecoderState,
+    native_type: String,
+    schema_fingerprint: &str,
+) -> Result<DecodedRecord, DecodeError> {
+    let session_id = optional_identifier(record, &["sessionId"], MAX_ID_BYTES)?;
+    let native_record_id = optional_identifier(record, &["uuid"], MAX_ID_BYTES)?;
+    let timestamp = optional_identifier(record, &["timestamp"], MAX_ID_BYTES)?;
+    let source = make_source(
+        record,
+        context,
+        session_id.as_deref().unwrap_or("metadata-session"),
+        &native_type,
+        native_record_id.clone(),
+    )?;
+    let observation = make_observation(
+        record,
+        context,
+        source.clone(),
+        schema_fingerprint,
+        DecodeStatus::Known,
+    )?;
+    decode_envelope(
+        record,
+        context,
+        prior_state,
+        RecordEnvelope {
+            native_type,
+            session_id,
+            native_record_id,
+            timestamp,
+            source,
+            observation,
+        },
+    )
+}
+
+fn decode_semantic_record(
+    record: &dyn RecordSource,
+    context: &DecodeContext,
+    prior_state: &DecoderState,
+    native_type: &str,
+    schema_fingerprint: &str,
+) -> Result<DecodedRecord, DecodeError> {
+    let session_id = optional_identifier(record, &["sessionId"], MAX_ID_BYTES)?
+        .ok_or(DecodeError::MissingIdentity("sessionId"))?;
+    let record_identity = capture_identity_digest(record, &["uuid"], MAX_ID_BYTES)?;
+    let timestamp = capture_nullable_text(record, &["timestamp"], MAX_ID_BYTES)?;
+    let (IdentityCapture::Valid(record_identity), TextCapture::Valid(timestamp)) =
+        (&record_identity, &timestamp)
+    else {
+        let native_record_id = match record_identity {
+            IdentityCapture::Valid(identity) => Some(opaque_graph_id(
+                "record",
+                &session_id,
+                identity.total_bytes,
+                &identity.hash,
+            )),
+            IdentityCapture::Missing | IdentityCapture::Invalid => None,
+        };
+        let source = make_source(record, context, &session_id, native_type, native_record_id)?;
+        let observation = make_observation(
             record,
             context,
+            source,
+            schema_fingerprint,
+            DecodeStatus::Malformed,
+        )?;
+        return Ok(empty_record(
+            observation,
+            DecodeDisposition::malformed("missing_required_identity"),
             prior_state,
-            RecordEnvelope {
-                native_type,
-                session_id,
-                native_record_id,
-                timestamp,
-                source,
-                observation,
-            },
-        )
-    }
+        ));
+    };
+    let occurred_at = OffsetDateTime::parse(timestamp.as_str(), &Rfc3339)
+        .map_err(|_| DecodeError::Malformed("invalid-timestamp".to_owned()))?;
+    let native_record_id = opaque_graph_id(
+        "record",
+        &session_id,
+        record_identity.total_bytes,
+        &record_identity.hash,
+    );
+    let assistant_record_id = opaque_graph_id(
+        "assistant-record",
+        &session_id,
+        record_identity.total_bytes,
+        &record_identity.hash,
+    );
+    let GraphCapture::Valid(graph) = capture_graph_fields(record, &session_id)? else {
+        let source = make_source(
+            record,
+            context,
+            &session_id,
+            native_type,
+            Some(native_record_id),
+        )?;
+        let observation = make_observation(
+            record,
+            context,
+            source,
+            schema_fingerprint,
+            DecodeStatus::Malformed,
+        )?;
+        return Ok(empty_record(
+            observation,
+            DecodeDisposition::malformed("invalid_graph_identity"),
+            prior_state,
+        ));
+    };
+    let source = make_source(
+        record,
+        context,
+        &session_id,
+        native_type,
+        Some(native_record_id.clone()),
+    )?;
+    let observation = make_observation(
+        record,
+        context,
+        source.clone(),
+        schema_fingerprint,
+        DecodeStatus::Known,
+    )?;
+    let identity = SemanticIdentity {
+        session_id,
+        uuid: native_record_id,
+        assistant_record_id,
+        occurred_at,
+    };
+    decode_activity_record(
+        record,
+        context,
+        prior_state,
+        ActivityRecord {
+            native_type,
+            source: &source,
+            observation,
+            identity: &identity,
+            graph: &graph,
+        },
+    )
 }
 
 struct RecordEnvelope {
@@ -202,6 +331,11 @@ fn decode_envelope(
         ));
     };
     let identity = SemanticIdentity {
+        assistant_record_id: opaque_graph_id_from_bytes(
+            "assistant-record",
+            &session_id,
+            uuid.as_bytes(),
+        ),
         session_id,
         uuid,
         occurred_at: OffsetDateTime::parse(&timestamp, &Rfc3339)
@@ -211,50 +345,82 @@ fn decode_envelope(
         record,
         context,
         prior_state,
-        &envelope.native_type,
-        &envelope.source,
-        envelope.observation,
-        &identity,
+        ActivityRecord {
+            native_type: &envelope.native_type,
+            source: &envelope.source,
+            observation: envelope.observation,
+            identity: &identity,
+            graph: &GraphFields::default(),
+        },
     )
+}
+
+struct ActivityRecord<'a> {
+    native_type: &'a str,
+    source: &'a SourceRef,
+    observation: SourceObservation,
+    identity: &'a SemanticIdentity,
+    graph: &'a GraphFields,
 }
 
 fn decode_activity_record(
     record: &dyn RecordSource,
     context: &DecodeContext,
     prior_state: &DecoderState,
-    native_type: &str,
-    source: &SourceRef,
-    observation: SourceObservation,
-    identity: &SemanticIdentity,
+    activity: ActivityRecord<'_>,
 ) -> Result<DecodedRecord, DecodeError> {
+    let ActivityRecord {
+        native_type,
+        source,
+        observation,
+        identity,
+        graph,
+    } = activity;
     let mut state = ClaudeStateV1::decode(prior_state)?;
     let mut output = Output::default();
-    let parent_uuid = optional_nullable_identifier(record, &["parentUuid"], MAX_ID_BYTES)?;
-    let source_tool_assistant_uuid =
-        optional_nullable_identifier(record, &["sourceToolAssistantUUID"], MAX_ID_BYTES)?;
-    let _is_sidechain = optional_bool(record, &["isSidechain"])?;
+    let spawn_request_event_id = graph
+        .source_assistant_record_id
+        .as_deref()
+        .and_then(|assistant| state.assistant_spawn_request(assistant));
     let scope = EventScope {
         context,
         source,
         identity,
-        parent_uuid: parent_uuid.as_deref(),
-        source_tool_assistant_uuid: source_tool_assistant_uuid.as_deref(),
+        parent_record_id: graph.parent_record_id.as_deref(),
+        spawn_request_event_id: spawn_request_event_id.as_deref(),
     };
-    let agent_ids = collect_agent_ids(record)?;
     let decoded = (|| {
-        emit_agent_starts(scope, &agent_ids, &mut state, &mut output)?;
+        emit_agent_starts(scope, &graph.agent_ids, &mut state, &mut output)?;
+        if graph.is_sidechain {
+            emit_diagnostic(
+                scope,
+                &mut output,
+                322,
+                "sidechain-relationship",
+                "relationship.sidechain",
+                b"normalized sidechain relationship observed",
+                PrivacyLabel::SyncEligible,
+            )?;
+        }
         emit_context_change(record, scope, &mut state, &mut output)?;
         let terminal_outcome = match native_type {
             "user" => {
                 decode_user(record, scope, &mut state, &mut output)?;
                 None
             }
-            "assistant" => decode_assistant(record, scope, &mut state, &mut output)?,
-            "system" | "result" => decode_system(record, scope, &mut output)?,
+            "assistant" => {
+                decode_assistant(record, scope, &mut state, &mut output)?;
+                None
+            }
+            "system" => {
+                decode_system(record, scope, &mut output)?;
+                None
+            }
+            "result" => decode_result(record)?,
             _ => None,
         };
         if let Some(outcome) = terminal_outcome {
-            emit_agent_finishes(scope, &agent_ids, outcome, &mut output)?;
+            emit_agent_finishes(scope, &graph.agent_ids, outcome, &mut state, &mut output)?;
         }
         Ok(())
     })();
@@ -302,7 +468,21 @@ fn empty_record(
 struct SemanticIdentity {
     session_id: String,
     uuid: String,
+    assistant_record_id: String,
     occurred_at: OffsetDateTime,
+}
+
+#[derive(Default)]
+struct GraphFields {
+    parent_record_id: Option<String>,
+    source_assistant_record_id: Option<String>,
+    agent_ids: Vec<String>,
+    is_sidechain: bool,
+}
+
+enum GraphCapture {
+    Valid(GraphFields),
+    Invalid,
 }
 
 #[derive(Clone, Copy)]
@@ -310,8 +490,8 @@ struct EventScope<'a> {
     context: &'a DecodeContext,
     source: &'a SourceRef,
     identity: &'a SemanticIdentity,
-    parent_uuid: Option<&'a str>,
-    source_tool_assistant_uuid: Option<&'a str>,
+    parent_record_id: Option<&'a str>,
+    spawn_request_event_id: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]
@@ -423,7 +603,7 @@ fn decode_assistant(
     scope: EventScope<'_>,
     state: &mut ClaudeStateV1,
     output: &mut Output,
-) -> Result<Option<ActionOutcome>, DecodeError> {
+) -> Result<(), DecodeError> {
     let mut message_parts = Vec::new();
     let CollectedBlocks {
         blocks,
@@ -454,8 +634,9 @@ fn decode_assistant(
     if let Some(content) = combine_text(message_parts)? {
         emit_message(scope, Actor::Agent, content, 0, output)?;
     }
+    let mut eligible_spawns = Vec::new();
     for (index, block) in deferred_tools {
-        emit_tool_request(
+        let emitted = emit_tool_request(
             scope,
             state,
             output,
@@ -463,7 +644,15 @@ fn decode_assistant(
             block,
             scope.context.project_root.as_deref(),
         )?;
+        if emitted.eligible_spawn {
+            eligible_spawns.push(emitted.event_id);
+        }
     }
+    let spawn_request = match eligible_spawns.as_slice() {
+        [event_id] => Some(event_id.as_str().to_owned()),
+        _ => None,
+    };
+    state.set_assistant_spawn(scope.identity.assistant_record_id.clone(), spawn_request)?;
     if assistant_error_present(record)? {
         emit_private_diagnostic(
             scope,
@@ -473,10 +662,8 @@ fn decode_assistant(
             "error",
             b"assistant error observed",
         )?;
-        Ok(Some(ActionOutcome::Failed))
-    } else {
-        Ok(None)
     }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -497,16 +684,186 @@ struct CollectedBlocks {
     remaining_projection_bytes: usize,
 }
 
-fn collect_agent_ids(record: &dyn RecordSource) -> Result<Vec<String>, DecodeError> {
-    let mut agents = Vec::with_capacity(2);
+struct IdentityDigest {
+    total_bytes: u64,
+    hash: String,
+}
+
+enum IdentityCapture {
+    Missing,
+    Valid(IdentityDigest),
+    Invalid,
+}
+
+enum TextCapture {
+    Missing,
+    Valid(Zeroizing<String>),
+    Invalid,
+}
+
+fn capture_graph_fields(
+    record: &dyn RecordSource,
+    session_id: &str,
+) -> Result<GraphCapture, DecodeError> {
+    let Ok(parent_record_id) = normalized_optional_graph_id(
+        capture_identity_digest(record, &["parentUuid"], MAX_ID_BYTES)?,
+        "record",
+        session_id,
+    ) else {
+        return Ok(GraphCapture::Invalid);
+    };
+    let Ok(source_assistant_record_id) = normalized_optional_graph_id(
+        capture_identity_digest(record, &["sourceToolAssistantUUID"], MAX_ID_BYTES)?,
+        "assistant-record",
+        session_id,
+    ) else {
+        return Ok(GraphCapture::Invalid);
+    };
+    let mut agent_ids = Vec::with_capacity(2);
     for path in [&["agentId"][..], &["attributionAgent"][..]] {
-        if let Some(agent) = optional_nullable_identifier(record, path, MAX_ID_BYTES)?
-            && !agents.iter().any(|known| known == &agent)
+        let Ok(agent) = normalized_optional_graph_id(
+            capture_identity_digest(record, path, MAX_ID_BYTES)?,
+            "agent",
+            session_id,
+        ) else {
+            return Ok(GraphCapture::Invalid);
+        };
+        if let Some(agent) = agent
+            && !agent_ids.iter().any(|known| known == &agent)
         {
-            agents.push(agent);
+            agent_ids.push(agent);
         }
     }
-    Ok(agents)
+    let is_sidechain = match capture_optional_bool(record, &["isSidechain"])? {
+        Ok(value) => value.unwrap_or(false),
+        Err(()) => return Ok(GraphCapture::Invalid),
+    };
+    Ok(GraphCapture::Valid(GraphFields {
+        parent_record_id,
+        source_assistant_record_id,
+        agent_ids,
+        is_sidechain,
+    }))
+}
+
+fn normalized_optional_graph_id(
+    capture: IdentityCapture,
+    domain: &str,
+    session_id: &str,
+) -> Result<Option<String>, ()> {
+    match capture {
+        IdentityCapture::Missing => Ok(None),
+        IdentityCapture::Valid(identity) => Ok(Some(opaque_graph_id(
+            domain,
+            session_id,
+            identity.total_bytes,
+            &identity.hash,
+        ))),
+        IdentityCapture::Invalid => Err(()),
+    }
+}
+
+fn capture_identity_digest(
+    record: &dyn RecordSource,
+    path: &[&str],
+    limit: usize,
+) -> Result<IdentityCapture, DecodeError> {
+    let mut reader = BoundedJsonReader::new(record.open()?);
+    let matches = reader.capture_matches(path, 0, 2, 8)?;
+    if matches.len() > 1 {
+        return Ok(IdentityCapture::Invalid);
+    }
+    Ok(matches
+        .into_iter()
+        .next()
+        .map_or(IdentityCapture::Missing, |captured| match captured.value {
+            CapturedValue::String(value)
+                if value.total_bytes > 0 && value.total_bytes <= limit as u64 =>
+            {
+                IdentityCapture::Valid(IdentityDigest {
+                    total_bytes: value.total_bytes,
+                    hash: value.hash,
+                })
+            }
+            CapturedValue::Scalar(value) if value == "null" => IdentityCapture::Missing,
+            CapturedValue::String(_) | CapturedValue::Scalar(_) | CapturedValue::Container => {
+                IdentityCapture::Invalid
+            }
+        }))
+}
+
+fn capture_nullable_text(
+    record: &dyn RecordSource,
+    path: &[&str],
+    limit: usize,
+) -> Result<TextCapture, DecodeError> {
+    let mut reader = BoundedJsonReader::new(record.open()?);
+    let matches = reader.capture_matches(path, limit, 2, limit.saturating_mul(2))?;
+    if matches.len() > 1 {
+        return Ok(TextCapture::Invalid);
+    }
+    Ok(matches
+        .into_iter()
+        .next()
+        .map_or(TextCapture::Missing, |captured| match captured.value {
+            CapturedValue::String(mut value)
+                if !value.truncated
+                    && value.total_bytes > 0
+                    && value.total_bytes <= limit as u64 =>
+            {
+                String::from_utf8(value.take_bytes()).map_or(TextCapture::Invalid, |value| {
+                    TextCapture::Valid(Zeroizing::new(value))
+                })
+            }
+            CapturedValue::Scalar(value) if value == "null" => TextCapture::Missing,
+            CapturedValue::String(_) | CapturedValue::Scalar(_) | CapturedValue::Container => {
+                TextCapture::Invalid
+            }
+        }))
+}
+
+fn capture_optional_bool(
+    record: &dyn RecordSource,
+    path: &[&str],
+) -> Result<Result<Option<bool>, ()>, DecodeError> {
+    let mut reader = BoundedJsonReader::new(record.open()?);
+    let matches = reader.capture_matches(path, 5, 2, 10)?;
+    if matches.len() > 1 {
+        return Ok(Err(()));
+    }
+    Ok(matches
+        .into_iter()
+        .next()
+        .map_or(Ok(None), |captured| match captured.value {
+            CapturedValue::Scalar(value) if value == "true" => Ok(Some(true)),
+            CapturedValue::Scalar(value) if value == "false" => Ok(Some(false)),
+            CapturedValue::Scalar(value) if value == "null" => Ok(None),
+            CapturedValue::String(_) | CapturedValue::Scalar(_) | CapturedValue::Container => {
+                Err(())
+            }
+        }))
+}
+
+fn opaque_graph_id(domain: &str, session_id: &str, total_bytes: u64, hash: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"agbox-claude-graph-identity-v1");
+    hasher.update(&(domain.len() as u64).to_le_bytes());
+    hasher.update(domain.as_bytes());
+    hasher.update(b"claude");
+    hasher.update(&(session_id.len() as u64).to_le_bytes());
+    hasher.update(session_id.as_bytes());
+    hasher.update(&total_bytes.to_le_bytes());
+    hasher.update(hash.as_bytes());
+    format!("claude_graph_{}", &hasher.finalize().to_hex()[..48])
+}
+
+fn opaque_graph_id_from_bytes(domain: &str, session_id: &str, value: &[u8]) -> String {
+    opaque_graph_id(
+        domain,
+        session_id,
+        u64::try_from(value.len()).unwrap_or(u64::MAX),
+        blake3::hash(value).to_hex().as_str(),
+    )
 }
 
 fn emit_agent_starts(
@@ -533,7 +890,7 @@ fn emit_agent_starts(
                 agent_id,
             ),
             Actor::System,
-            scope.source_tool_assistant_uuid.map(str::to_owned),
+            scope.spawn_request_event_id.map(str::to_owned),
             None,
             EventPayload::AgentStarted {
                 native_agent_id: agent_id.clone(),
@@ -548,9 +905,13 @@ fn emit_agent_finishes(
     scope: EventScope<'_>,
     agent_ids: &[String],
     outcome: ActionOutcome,
+    state: &mut ClaudeStateV1,
     output: &mut Output,
 ) -> Result<(), DecodeError> {
     for (index, agent_id) in agent_ids.iter().enumerate() {
+        if !state.finish_agent(agent_id, outcome)? {
+            continue;
+        }
         let ordinal = 340_u32
             .checked_add(u32::try_from(index).map_err(|_| DecodeError::OutputTooLarge)?)
             .ok_or(DecodeError::OutputTooLarge)?;
@@ -565,7 +926,7 @@ fn emit_agent_finishes(
                 agent_id,
             ),
             Actor::System,
-            scope.source_tool_assistant_uuid.map(str::to_owned),
+            scope.spawn_request_event_id.map(str::to_owned),
             None,
             EventPayload::AgentFinished {
                 native_agent_id: agent_id.clone(),
@@ -581,10 +942,10 @@ fn decode_system(
     record: &dyn RecordSource,
     scope: EventScope<'_>,
     output: &mut Output,
-) -> Result<Option<ActionOutcome>, DecodeError> {
+) -> Result<(), DecodeError> {
     let subtype = optional_identifier(record, &["subtype"], MAX_ID_BYTES)?;
     let Some(subtype) = subtype.as_deref() else {
-        return Ok(None);
+        return Ok(());
     };
     match subtype {
         "compact_boundary" | "compacted" | "context_compacted" => {
@@ -606,7 +967,7 @@ fn decode_system(
                 },
             )?;
             output.push_event(event)?;
-            Ok(None)
+            Ok(())
         }
         "turn_duration" => {
             let source_identity = source_identity(scope.source, scope.context);
@@ -627,7 +988,7 @@ fn decode_system(
                 },
             )?;
             output.push_event(event)?;
-            Ok(Some(ActionOutcome::Succeeded))
+            Ok(())
         }
         "stop_hook_summary" => {
             emit_private_diagnostic(
@@ -638,7 +999,7 @@ fn decode_system(
                 "info",
                 b"stop hook summary observed",
             )?;
-            Ok(None)
+            Ok(())
         }
         "away_summary" => {
             emit_private_diagnostic(
@@ -649,19 +1010,40 @@ fn decode_system(
                 "info",
                 b"away summary observed",
             )?;
-            Ok(None)
+            Ok(())
         }
-        "success" | "agent_finished" => Ok(Some(ActionOutcome::Succeeded)),
-        "error" | "failed" => Ok(Some(ActionOutcome::Failed)),
-        "cancelled" => Ok(Some(ActionOutcome::Cancelled)),
-        _ => Ok(None),
+        _ => Ok(()),
     }
+}
+
+fn decode_result(record: &dyn RecordSource) -> Result<Option<ActionOutcome>, DecodeError> {
+    let subtype = optional_identifier(record, &["subtype"], MAX_ID_BYTES)?;
+    Ok(match subtype.as_deref() {
+        Some("success" | "agent_finished") => Some(ActionOutcome::Succeeded),
+        Some("error" | "failed") => Some(ActionOutcome::Failed),
+        Some("cancelled") => Some(ActionOutcome::Cancelled),
+        _ => None,
+    })
 }
 
 fn assistant_error_present(record: &dyn RecordSource) -> Result<bool, DecodeError> {
     for path in [&["error"][..], &["message", "error"][..]] {
-        if !capture_matches_bounded(record, path, 0, 0)?.is_empty() {
-            return Ok(true);
+        let matches = capture_matches_bounded(record, path, MAX_ID_BYTES, MAX_ID_BYTES * 2)?;
+        if matches.len() > 1 {
+            return Err(DecodeError::Malformed(
+                "duplicate-assistant-error".to_owned(),
+            ));
+        }
+        if let Some(captured) = matches.into_iter().next() {
+            match captured.value {
+                CapturedValue::String(value) if value.total_bytes > 0 => return Ok(true),
+                CapturedValue::String(_) => {}
+                CapturedValue::Scalar(value) if value == "true" => return Ok(true),
+                CapturedValue::Scalar(value) if matches!(value.as_str(), "false" | "null") => {}
+                CapturedValue::Scalar(_) | CapturedValue::Container => {
+                    return Err(DecodeError::Malformed("invalid-assistant-error".to_owned()));
+                }
+            }
         }
     }
     Ok(false)
@@ -674,6 +1056,27 @@ fn emit_private_diagnostic(
     semantic_kind: &str,
     level: &str,
     safe_message: &[u8],
+) -> Result<(), DecodeError> {
+    emit_diagnostic(
+        scope,
+        output,
+        ordinal,
+        semantic_kind,
+        level,
+        safe_message,
+        PrivacyLabel::PrivateLocal,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_diagnostic(
+    scope: EventScope<'_>,
+    output: &mut Output,
+    ordinal: u32,
+    semantic_kind: &str,
+    level: &str,
+    safe_message: &[u8],
+    privacy: PrivacyLabel,
 ) -> Result<(), DecodeError> {
     let source_identity = source_identity(scope.source, scope.context);
     let event_id = EventId::from_source(&source_identity, ordinal);
@@ -705,7 +1108,7 @@ fn emit_private_diagnostic(
             level: level.to_owned(),
             message,
         },
-        PrivacyLabel::PrivateLocal,
+        privacy,
     )?;
     output.push_event(event)
 }
@@ -1263,6 +1666,11 @@ fn emit_message(
     output.push_event(event)
 }
 
+struct EmittedToolRequest {
+    event_id: EventId,
+    eligible_spawn: bool,
+}
+
 fn emit_tool_request(
     scope: EventScope<'_>,
     state: &mut ClaudeStateV1,
@@ -1270,7 +1678,7 @@ fn emit_tool_request(
     index: usize,
     block: Block,
     project_root: Option<&Path>,
-) -> Result<(), DecodeError> {
+) -> Result<EmittedToolRequest, DecodeError> {
     let tool_id = block
         .tool_id
         .ok_or(DecodeError::MissingIdentity("tool_use.id"))?;
@@ -1319,12 +1727,17 @@ fn emit_tool_request(
         },
     )?;
     output.push_event(event)?;
+    let eligible_spawn = is_agent_spawn_tool(&tool_name);
     state.insert_tool(ToolLink {
         tool_use_id: tool_id,
         request_event_id: event_id.as_str().to_owned(),
         tool_name,
         input_hash,
         project_relative_path: project_path,
+    })?;
+    Ok(EmittedToolRequest {
+        event_id,
+        eligible_spawn,
     })
 }
 
@@ -1587,13 +2000,9 @@ fn make_event_with_privacy(
         session_id,
         turn_id: Some(scope.identity.uuid.clone()),
         actor,
-        correlation_id: correlation_id.or_else(|| {
-            scope
-                .source_tool_assistant_uuid
-                .map(std::borrow::ToOwned::to_owned)
-        }),
+        correlation_id,
         causation_id: scope
-            .parent_uuid
+            .parent_record_id
             .map(std::borrow::ToOwned::to_owned)
             .or(causation_id),
         source: scope.source.clone(),
@@ -1803,31 +2212,6 @@ fn optional_identifier(
         .transpose()
 }
 
-fn optional_nullable_identifier(
-    record: &dyn RecordSource,
-    path: &[&str],
-    limit: usize,
-) -> Result<Option<String>, DecodeError> {
-    let matches = capture_matches(record, path, limit)?;
-    if matches.len() > 1 {
-        return Err(DecodeError::Malformed(
-            "duplicate-selected-field".to_owned(),
-        ));
-    }
-    matches
-        .into_iter()
-        .next()
-        .map_or(Ok(None), |captured| match captured.value {
-            CapturedValue::String(value) => {
-                required_identifier(value, limit, "identifier").map(Some)
-            }
-            CapturedValue::Scalar(value) if value == "null" => Ok(None),
-            CapturedValue::Scalar(_) | CapturedValue::Container => {
-                Err(DecodeError::Malformed("selected-non-string".to_owned()))
-            }
-        })
-}
-
 fn optional_bounded_text(
     record: &dyn RecordSource,
     path: &[&str],
@@ -2026,6 +2410,13 @@ fn is_write_tool(value: &str) -> bool {
     matches!(
         value.to_ascii_lowercase().as_str(),
         "write" | "edit" | "multiedit" | "notebookedit"
+    )
+}
+
+fn is_agent_spawn_tool(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "task" | "agent" | "taskcreate"
     )
 }
 

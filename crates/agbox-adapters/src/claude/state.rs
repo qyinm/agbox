@@ -7,10 +7,14 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use agbox_core::ActionOutcome;
+
 use crate::{DecodeError, DecoderState, MAX_DECODER_STATE_BYTES};
 
 const MAX_UNRESOLVED_TOOLS: usize = 128;
 const MAX_KNOWN_AGENTS: usize = 128;
+const MAX_FINISHED_AGENTS: usize = 128;
+const MAX_ASSISTANT_SPAWNS: usize = 128;
 const MAX_TOOL_USE_ID_BYTES: usize = 128;
 const MAX_EVENT_ID_BYTES: usize = 128;
 const MAX_TOOL_NAME_BYTES: usize = 64;
@@ -32,6 +36,8 @@ const SAFE_PERMISSION_MODES: &[&str] = &[
 pub(super) struct ClaudeStateV1 {
     unresolved_tools: VecDeque<ToolLink>,
     known_agents: VecDeque<String>,
+    finished_agents: VecDeque<FinishedAgent>,
+    assistant_spawns: VecDeque<AssistantSpawn>,
     last_human_turn: Option<String>,
     context: ContextSnapshot,
 }
@@ -42,6 +48,8 @@ impl fmt::Debug for ClaudeStateV1 {
             .debug_struct("ClaudeStateV1")
             .field("unresolved_tool_count", &self.unresolved_tools.len())
             .field("known_agent_count", &self.known_agents.len())
+            .field("finished_agent_count", &self.finished_agents.len())
+            .field("assistant_spawn_count", &self.assistant_spawns.len())
             .field("has_last_human_turn", &self.last_human_turn.is_some())
             .field("has_context_cwd", &self.context.cwd.is_some())
             .field("has_context_mode", &self.context.mode.is_some())
@@ -79,6 +87,18 @@ pub(super) struct ToolLink {
     pub tool_name: String,
     pub input_hash: String,
     pub project_relative_path: Option<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(super) struct FinishedAgent {
+    agent_id: String,
+    outcome: ActionOutcome,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(super) struct AssistantSpawn {
+    assistant_record_id: String,
+    request_event_id: String,
 }
 
 impl fmt::Debug for ToolLink {
@@ -137,7 +157,7 @@ impl ClaudeStateV1 {
     }
 
     pub fn observe_agent(&mut self, agent_id: String) -> Result<bool, DecodeError> {
-        if !bounded_identifier(&agent_id, MAX_TOOL_USE_ID_BYTES) {
+        if !opaque_graph_identifier(&agent_id) {
             return Err(DecodeError::Malformed("invalid-claude-agent-id".to_owned()));
         }
         if self.known_agents.iter().any(|known| known == &agent_id) {
@@ -149,6 +169,68 @@ impl ClaudeStateV1 {
         }
         self.fit_serialized_bound()?;
         Ok(true)
+    }
+
+    pub fn finish_agent(
+        &mut self,
+        agent_id: &str,
+        outcome: ActionOutcome,
+    ) -> Result<bool, DecodeError> {
+        if !opaque_graph_identifier(agent_id) {
+            return Err(DecodeError::Malformed("invalid-claude-agent-id".to_owned()));
+        }
+        if self
+            .finished_agents
+            .iter()
+            .any(|finished| finished.agent_id == agent_id)
+        {
+            return Ok(false);
+        }
+        self.finished_agents.push_back(FinishedAgent {
+            agent_id: agent_id.to_owned(),
+            outcome,
+        });
+        while self.finished_agents.len() > MAX_FINISHED_AGENTS {
+            let _ = self.finished_agents.pop_front();
+        }
+        self.fit_serialized_bound()?;
+        Ok(true)
+    }
+
+    pub fn set_assistant_spawn(
+        &mut self,
+        assistant_record_id: String,
+        request_event_id: Option<String>,
+    ) -> Result<(), DecodeError> {
+        if !opaque_graph_identifier(&assistant_record_id) {
+            return Err(DecodeError::Malformed(
+                "invalid-claude-assistant-spawn".to_owned(),
+            ));
+        }
+        self.assistant_spawns
+            .retain(|spawn| spawn.assistant_record_id != assistant_record_id);
+        if let Some(request_event_id) = request_event_id {
+            if !bounded_identifier(&request_event_id, MAX_EVENT_ID_BYTES) {
+                return Err(DecodeError::Malformed(
+                    "invalid-claude-assistant-spawn".to_owned(),
+                ));
+            }
+            self.assistant_spawns.push_back(AssistantSpawn {
+                assistant_record_id,
+                request_event_id,
+            });
+            while self.assistant_spawns.len() > MAX_ASSISTANT_SPAWNS {
+                let _ = self.assistant_spawns.pop_front();
+            }
+        }
+        self.fit_serialized_bound()
+    }
+
+    pub fn assistant_spawn_request(&self, assistant_record_id: &str) -> Option<String> {
+        self.assistant_spawns
+            .iter()
+            .find(|spawn| spawn.assistant_record_id == assistant_record_id)
+            .map(|spawn| spawn.request_event_id.clone())
     }
 
     pub fn merge_context(
@@ -199,10 +281,30 @@ impl ClaudeStateV1 {
             || self
                 .known_agents
                 .iter()
-                .any(|agent| !bounded_identifier(agent, MAX_TOOL_USE_ID_BYTES))
+                .any(|agent| !opaque_graph_identifier(agent))
         {
             return Err(DecodeError::Malformed(
                 "invalid-claude-state-agents".to_owned(),
+            ));
+        }
+        if self.finished_agents.len() > MAX_FINISHED_AGENTS
+            || self
+                .finished_agents
+                .iter()
+                .any(|agent| !opaque_graph_identifier(&agent.agent_id))
+        {
+            return Err(DecodeError::Malformed(
+                "invalid-claude-state-finished-agents".to_owned(),
+            ));
+        }
+        if self.assistant_spawns.len() > MAX_ASSISTANT_SPAWNS
+            || self.assistant_spawns.iter().any(|spawn| {
+                !opaque_graph_identifier(&spawn.assistant_record_id)
+                    || !bounded_identifier(&spawn.request_event_id, MAX_EVENT_ID_BYTES)
+            })
+        {
+            return Err(DecodeError::Malformed(
+                "invalid-claude-state-assistant-spawns".to_owned(),
             ));
         }
         if self
@@ -223,13 +325,21 @@ impl ClaudeStateV1 {
 
     fn fit_serialized_bound(&mut self) -> Result<(), DecodeError> {
         while serialized_len(self)? > MAX_DECODER_STATE_BYTES {
-            if self.unresolved_tools.pop_front().is_none()
-                && self.known_agents.pop_front().is_none()
+            if self.known_agents.pop_front().is_some()
+                || self.finished_agents.pop_front().is_some()
+                || self.assistant_spawns.pop_front().is_some()
             {
-                self.last_human_turn = None;
-                if serialized_len(self)? > MAX_DECODER_STATE_BYTES {
-                    return Err(DecodeError::StateTooLarge);
-                }
+                continue;
+            }
+            if self.last_human_turn.take().is_some() {
+                continue;
+            }
+            if self.context != ContextSnapshot::default() {
+                self.context = ContextSnapshot::default();
+                continue;
+            }
+            if self.unresolved_tools.pop_front().is_none() {
+                return Err(DecodeError::StateTooLarge);
             }
         }
         Ok(())
@@ -308,6 +418,14 @@ pub(super) fn bounded_identifier(value: &str, max_bytes: usize) -> bool {
     !value.is_empty()
         && value.len() <= max_bytes
         && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+fn opaque_graph_identifier(value: &str) -> bool {
+    value.len() == "claude_graph_".len() + 48
+        && value.starts_with("claude_graph_")
+        && value["claude_graph_".len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn valid_project_path(value: &str) -> bool {
