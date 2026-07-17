@@ -33,7 +33,10 @@ fn ensure_directory_metadata(metadata: &fs::Metadata) -> io::Result<()> {
 }
 
 fn create_directory(path: &Path) -> io::Result<()> {
-    match fs::create_dir(path) {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, OWNER_DIRECTORY_MODE);
+    match builder.create(path) {
         Ok(()) => {
             set_directory_mode(path)?;
             Ok(())
