@@ -12,8 +12,10 @@ test-support = []
 agbox-core.workspace = true
 chacha20poly1305.workspace = true
 keyring.workspace = true
+rusqlite.workspace = true
 rustix.workspace = true
 thiserror.workspace = true
+time.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 
