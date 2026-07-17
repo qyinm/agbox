@@ -103,21 +103,15 @@ impl SourceAdapter for ClaudeAdapter {
             native_type_capture.ok_or(DecodeError::MissingIdentity("type"))?;
         let native_type = safe_native_type(native_type_capture);
 
-        let semantic = matches!(native_type.as_str(), "user" | "assistant" | "system");
+        let semantic = matches!(
+            native_type.as_str(),
+            "user" | "assistant" | "system" | "result"
+        );
         let session_id = optional_identifier(record, &["sessionId"], MAX_ID_BYTES)?;
         let native_record_id = optional_identifier(record, &["uuid"], MAX_ID_BYTES)?;
         let timestamp = optional_identifier(record, &["timestamp"], MAX_ID_BYTES)?;
-
-        if semantic {
-            if session_id.is_none() {
-                return Err(DecodeError::MissingIdentity("sessionId"));
-            }
-            if native_record_id.is_none() {
-                return Err(DecodeError::MissingIdentity("uuid"));
-            }
-            if timestamp.is_none() {
-                return Err(DecodeError::MissingIdentity("timestamp"));
-            }
+        if semantic && session_id.is_none() {
+            return Err(DecodeError::MissingIdentity("sessionId"));
         }
 
         let source_session = session_id.as_deref().unwrap_or("metadata-session");
@@ -133,12 +127,21 @@ impl SourceAdapter for ClaudeAdapter {
             context,
             source.clone(),
             &schema_fingerprint,
-            if is_known_type(&native_type) {
+            if semantic && (native_record_id.is_none() || timestamp.is_none()) {
+                DecodeStatus::Malformed
+            } else if is_known_type(&native_type) {
                 DecodeStatus::Known
             } else {
                 DecodeStatus::UnknownType
             },
         )?;
+        if semantic && (native_record_id.is_none() || timestamp.is_none()) {
+            return Ok(empty_record(
+                observation,
+                DecodeDisposition::malformed("missing_required_identity"),
+                prior_state,
+            ));
+        }
 
         decode_envelope(
             record,
@@ -226,17 +229,35 @@ fn decode_activity_record(
 ) -> Result<DecodedRecord, DecodeError> {
     let mut state = ClaudeStateV1::decode(prior_state)?;
     let mut output = Output::default();
+    let parent_uuid = optional_nullable_identifier(record, &["parentUuid"], MAX_ID_BYTES)?;
+    let source_tool_assistant_uuid =
+        optional_nullable_identifier(record, &["sourceToolAssistantUUID"], MAX_ID_BYTES)?;
+    let _is_sidechain = optional_bool(record, &["isSidechain"])?;
     let scope = EventScope {
         context,
         source,
         identity,
+        parent_uuid: parent_uuid.as_deref(),
+        source_tool_assistant_uuid: source_tool_assistant_uuid.as_deref(),
     };
-    emit_context_change(record, scope, &mut state, &mut output)?;
-    let decoded = match native_type {
-        "user" => decode_user(record, context, source, identity, &mut state, &mut output),
-        "assistant" => decode_assistant(record, context, source, identity, &mut state, &mut output),
-        _ => Ok(()),
-    };
+    let agent_ids = collect_agent_ids(record)?;
+    let decoded = (|| {
+        emit_agent_starts(scope, &agent_ids, &mut state, &mut output)?;
+        emit_context_change(record, scope, &mut state, &mut output)?;
+        let terminal_outcome = match native_type {
+            "user" => {
+                decode_user(record, scope, &mut state, &mut output)?;
+                None
+            }
+            "assistant" => decode_assistant(record, scope, &mut state, &mut output)?,
+            "system" | "result" => decode_system(record, scope, &mut output)?,
+            _ => None,
+        };
+        if let Some(outcome) = terminal_outcome {
+            emit_agent_finishes(scope, &agent_ids, outcome, &mut output)?;
+        }
+        Ok(())
+    })();
     if matches!(decoded, Err(DecodeError::OutputTooLarge)) {
         return Ok(empty_record(
             observation,
@@ -289,6 +310,8 @@ struct EventScope<'a> {
     context: &'a DecodeContext,
     source: &'a SourceRef,
     identity: &'a SemanticIdentity,
+    parent_uuid: Option<&'a str>,
+    source_tool_assistant_uuid: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]
@@ -353,9 +376,7 @@ impl Output {
 
 fn decode_user(
     record: &dyn RecordSource,
-    context: &DecodeContext,
-    source: &SourceRef,
-    identity: &SemanticIdentity,
+    scope: EventScope<'_>,
     state: &mut ClaudeStateV1,
     output: &mut Output,
 ) -> Result<(), DecodeError> {
@@ -388,20 +409,10 @@ fn decode_user(
         }
     }
     if let Some(content) = combine_text(message_parts)? {
-        let scope = EventScope {
-            context,
-            source,
-            identity,
-        };
         emit_message(scope, Actor::Human, content, 0, output)?;
-        state.set_last_human_turn(identity.uuid.clone())?;
+        state.set_last_human_turn(scope.identity.uuid.clone())?;
     }
     for (index, block) in deferred_results {
-        let scope = EventScope {
-            context,
-            source,
-            identity,
-        };
         emit_tool_result(scope, state, output, index, block)?;
     }
     Ok(())
@@ -409,12 +420,10 @@ fn decode_user(
 
 fn decode_assistant(
     record: &dyn RecordSource,
-    context: &DecodeContext,
-    source: &SourceRef,
-    identity: &SemanticIdentity,
+    scope: EventScope<'_>,
     state: &mut ClaudeStateV1,
     output: &mut Output,
-) -> Result<(), DecodeError> {
+) -> Result<Option<ActionOutcome>, DecodeError> {
     let mut message_parts = Vec::new();
     let CollectedBlocks {
         blocks,
@@ -443,29 +452,31 @@ fn decode_assistant(
         }
     }
     if let Some(content) = combine_text(message_parts)? {
-        let scope = EventScope {
-            context,
-            source,
-            identity,
-        };
         emit_message(scope, Actor::Agent, content, 0, output)?;
     }
     for (index, block) in deferred_tools {
-        let scope = EventScope {
-            context,
-            source,
-            identity,
-        };
         emit_tool_request(
             scope,
             state,
             output,
             index,
             block,
-            context.project_root.as_deref(),
+            scope.context.project_root.as_deref(),
         )?;
     }
-    Ok(())
+    if assistant_error_present(record)? {
+        emit_private_diagnostic(
+            scope,
+            output,
+            362,
+            "assistant-error",
+            "error",
+            b"assistant error observed",
+        )?;
+        Ok(Some(ActionOutcome::Failed))
+    } else {
+        Ok(None)
+    }
 }
 
 #[derive(Default)]
@@ -484,6 +495,219 @@ struct Block {
 struct CollectedBlocks {
     blocks: BTreeMap<usize, Block>,
     remaining_projection_bytes: usize,
+}
+
+fn collect_agent_ids(record: &dyn RecordSource) -> Result<Vec<String>, DecodeError> {
+    let mut agents = Vec::with_capacity(2);
+    for path in [&["agentId"][..], &["attributionAgent"][..]] {
+        if let Some(agent) = optional_nullable_identifier(record, path, MAX_ID_BYTES)?
+            && !agents.iter().any(|known| known == &agent)
+        {
+            agents.push(agent);
+        }
+    }
+    Ok(agents)
+}
+
+fn emit_agent_starts(
+    scope: EventScope<'_>,
+    agent_ids: &[String],
+    state: &mut ClaudeStateV1,
+    output: &mut Output,
+) -> Result<(), DecodeError> {
+    for (index, agent_id) in agent_ids.iter().enumerate() {
+        if !state.observe_agent(agent_id.clone())? {
+            continue;
+        }
+        let ordinal = 300_u32
+            .checked_add(u32::try_from(index).map_err(|_| DecodeError::OutputTooLarge)?)
+            .ok_or(DecodeError::OutputTooLarge)?;
+        let source_identity = source_identity(scope.source, scope.context);
+        let event = make_event(
+            scope,
+            EventId::from_source(&source_identity, ordinal),
+            SemanticKey::from_native(
+                Provider::Claude,
+                &scope.identity.session_id,
+                "agent-start",
+                agent_id,
+            ),
+            Actor::System,
+            scope.source_tool_assistant_uuid.map(str::to_owned),
+            None,
+            EventPayload::AgentStarted {
+                native_agent_id: agent_id.clone(),
+            },
+        )?;
+        output.push_event(event)?;
+    }
+    Ok(())
+}
+
+fn emit_agent_finishes(
+    scope: EventScope<'_>,
+    agent_ids: &[String],
+    outcome: ActionOutcome,
+    output: &mut Output,
+) -> Result<(), DecodeError> {
+    for (index, agent_id) in agent_ids.iter().enumerate() {
+        let ordinal = 340_u32
+            .checked_add(u32::try_from(index).map_err(|_| DecodeError::OutputTooLarge)?)
+            .ok_or(DecodeError::OutputTooLarge)?;
+        let source_identity = source_identity(scope.source, scope.context);
+        let event = make_event(
+            scope,
+            EventId::from_source(&source_identity, ordinal),
+            SemanticKey::from_native(
+                Provider::Claude,
+                &scope.identity.session_id,
+                "agent-finish",
+                agent_id,
+            ),
+            Actor::System,
+            scope.source_tool_assistant_uuid.map(str::to_owned),
+            None,
+            EventPayload::AgentFinished {
+                native_agent_id: agent_id.clone(),
+                outcome,
+            },
+        )?;
+        output.push_event(event)?;
+    }
+    Ok(())
+}
+
+fn decode_system(
+    record: &dyn RecordSource,
+    scope: EventScope<'_>,
+    output: &mut Output,
+) -> Result<Option<ActionOutcome>, DecodeError> {
+    let subtype = optional_identifier(record, &["subtype"], MAX_ID_BYTES)?;
+    let Some(subtype) = subtype.as_deref() else {
+        return Ok(None);
+    };
+    match subtype {
+        "compact_boundary" | "compacted" | "context_compacted" => {
+            let source_identity = source_identity(scope.source, scope.context);
+            let event = make_event(
+                scope,
+                EventId::from_source(&source_identity, 320),
+                SemanticKey::from_native(
+                    Provider::Claude,
+                    &scope.identity.session_id,
+                    "context-compact",
+                    &scope.identity.uuid,
+                ),
+                Actor::System,
+                None,
+                None,
+                EventPayload::ContextCompacted {
+                    summary_hash: Some(scope.source.record_hash().to_owned()),
+                },
+            )?;
+            output.push_event(event)?;
+            Ok(None)
+        }
+        "turn_duration" => {
+            let source_identity = source_identity(scope.source, scope.context);
+            let event = make_event(
+                scope,
+                EventId::from_source(&source_identity, 321),
+                SemanticKey::from_native(
+                    Provider::Claude,
+                    &scope.identity.session_id,
+                    "turn-finish",
+                    &scope.identity.uuid,
+                ),
+                Actor::System,
+                None,
+                None,
+                EventPayload::TurnFinished {
+                    outcome: ActionOutcome::Succeeded,
+                },
+            )?;
+            output.push_event(event)?;
+            Ok(Some(ActionOutcome::Succeeded))
+        }
+        "stop_hook_summary" => {
+            emit_private_diagnostic(
+                scope,
+                output,
+                360,
+                "stop-hook-summary",
+                "info",
+                b"stop hook summary observed",
+            )?;
+            Ok(None)
+        }
+        "away_summary" => {
+            emit_private_diagnostic(
+                scope,
+                output,
+                361,
+                "away-summary",
+                "info",
+                b"away summary observed",
+            )?;
+            Ok(None)
+        }
+        "success" | "agent_finished" => Ok(Some(ActionOutcome::Succeeded)),
+        "error" | "failed" => Ok(Some(ActionOutcome::Failed)),
+        "cancelled" => Ok(Some(ActionOutcome::Cancelled)),
+        _ => Ok(None),
+    }
+}
+
+fn assistant_error_present(record: &dyn RecordSource) -> Result<bool, DecodeError> {
+    for path in [&["error"][..], &["message", "error"][..]] {
+        if !capture_matches_bounded(record, path, 0, 0)?.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn emit_private_diagnostic(
+    scope: EventScope<'_>,
+    output: &mut Output,
+    ordinal: u32,
+    semantic_kind: &str,
+    level: &str,
+    safe_message: &[u8],
+) -> Result<(), DecodeError> {
+    let source_identity = source_identity(scope.source, scope.context);
+    let event_id = EventId::from_source(&source_identity, ordinal);
+    let message = make_content(
+        capture_from_derived(safe_message)?,
+        DisclosureClass::ObservedState,
+        "text/plain",
+        ContentOwner {
+            project_root: None,
+            event_id: &event_id,
+            source_identity: &source_identity,
+            ordinal,
+        },
+        output,
+    )?;
+    let event = make_event_with_privacy(
+        scope,
+        event_id,
+        SemanticKey::from_native(
+            Provider::Claude,
+            &scope.identity.session_id,
+            semantic_kind,
+            &scope.identity.uuid,
+        ),
+        Actor::System,
+        None,
+        None,
+        EventPayload::DiagnosticObserved {
+            level: level.to_owned(),
+            message,
+        },
+        PrivacyLabel::PrivateLocal,
+    )?;
+    output.push_event(event)
 }
 
 fn emit_context_change(
@@ -1328,6 +1552,29 @@ fn make_event(
     causation_id: Option<String>,
     payload: EventPayload,
 ) -> Result<ActivityEventV1, DecodeError> {
+    make_event_with_privacy(
+        scope,
+        event_id,
+        semantic_key,
+        actor,
+        correlation_id,
+        causation_id,
+        payload,
+        PrivacyLabel::SyncEligible,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_event_with_privacy(
+    scope: EventScope<'_>,
+    event_id: EventId,
+    semantic_key: SemanticKey,
+    actor: Actor,
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
+    payload: EventPayload,
+    privacy: PrivacyLabel,
+) -> Result<ActivityEventV1, DecodeError> {
     let session_id = SessionId::parse_wire(&scope.identity.session_id)
         .ok_or_else(|| DecodeError::Malformed("invalid-session-id".to_owned()))?;
     ActivityEventV1::new(ActivityEventDraft {
@@ -1340,11 +1587,18 @@ fn make_event(
         session_id,
         turn_id: Some(scope.identity.uuid.clone()),
         actor,
-        correlation_id,
-        causation_id,
+        correlation_id: correlation_id.or_else(|| {
+            scope
+                .source_tool_assistant_uuid
+                .map(std::borrow::ToOwned::to_owned)
+        }),
+        causation_id: scope
+            .parent_uuid
+            .map(std::borrow::ToOwned::to_owned)
+            .or(causation_id),
         source: scope.source.clone(),
         payload,
-        privacy: PrivacyLabel::SyncEligible,
+        privacy,
     })
     .map_err(|_| DecodeError::Malformed("invalid-event".to_owned()))
 }
@@ -1547,6 +1801,31 @@ fn optional_identifier(
         .0
         .map(|value| required_identifier(value, limit, "identifier"))
         .transpose()
+}
+
+fn optional_nullable_identifier(
+    record: &dyn RecordSource,
+    path: &[&str],
+    limit: usize,
+) -> Result<Option<String>, DecodeError> {
+    let matches = capture_matches(record, path, limit)?;
+    if matches.len() > 1 {
+        return Err(DecodeError::Malformed(
+            "duplicate-selected-field".to_owned(),
+        ));
+    }
+    matches
+        .into_iter()
+        .next()
+        .map_or(Ok(None), |captured| match captured.value {
+            CapturedValue::String(value) => {
+                required_identifier(value, limit, "identifier").map(Some)
+            }
+            CapturedValue::Scalar(value) if value == "null" => Ok(None),
+            CapturedValue::Scalar(_) | CapturedValue::Container => {
+                Err(DecodeError::Malformed("selected-non-string".to_owned()))
+            }
+        })
 }
 
 fn optional_bounded_text(
@@ -1782,5 +2061,5 @@ fn is_metadata_type(value: &str) -> bool {
 }
 
 fn is_known_type(value: &str) -> bool {
-    matches!(value, "user" | "assistant" | "system") || is_metadata_type(value)
+    matches!(value, "user" | "assistant" | "system" | "result") || is_metadata_type(value)
 }

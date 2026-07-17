@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{DecodeError, DecoderState, MAX_DECODER_STATE_BYTES};
 
 const MAX_UNRESOLVED_TOOLS: usize = 128;
+const MAX_KNOWN_AGENTS: usize = 128;
 const MAX_TOOL_USE_ID_BYTES: usize = 128;
 const MAX_EVENT_ID_BYTES: usize = 128;
 const MAX_TOOL_NAME_BYTES: usize = 64;
@@ -30,6 +31,7 @@ const SAFE_PERMISSION_MODES: &[&str] = &[
 #[serde(default)]
 pub(super) struct ClaudeStateV1 {
     unresolved_tools: VecDeque<ToolLink>,
+    known_agents: VecDeque<String>,
     last_human_turn: Option<String>,
     context: ContextSnapshot,
 }
@@ -39,6 +41,7 @@ impl fmt::Debug for ClaudeStateV1 {
         formatter
             .debug_struct("ClaudeStateV1")
             .field("unresolved_tool_count", &self.unresolved_tools.len())
+            .field("known_agent_count", &self.known_agents.len())
             .field("has_last_human_turn", &self.last_human_turn.is_some())
             .field("has_context_cwd", &self.context.cwd.is_some())
             .field("has_context_mode", &self.context.mode.is_some())
@@ -133,6 +136,21 @@ impl ClaudeStateV1 {
         self.unresolved_tools.remove(index)
     }
 
+    pub fn observe_agent(&mut self, agent_id: String) -> Result<bool, DecodeError> {
+        if !bounded_identifier(&agent_id, MAX_TOOL_USE_ID_BYTES) {
+            return Err(DecodeError::Malformed("invalid-claude-agent-id".to_owned()));
+        }
+        if self.known_agents.iter().any(|known| known == &agent_id) {
+            return Ok(false);
+        }
+        self.known_agents.push_back(agent_id);
+        while self.known_agents.len() > MAX_KNOWN_AGENTS {
+            let _ = self.known_agents.pop_front();
+        }
+        self.fit_serialized_bound()?;
+        Ok(true)
+    }
+
     pub fn merge_context(
         &mut self,
         cwd: Option<String>,
@@ -177,6 +195,16 @@ impl ClaudeStateV1 {
                 "invalid-claude-state-count".to_owned(),
             ));
         }
+        if self.known_agents.len() > MAX_KNOWN_AGENTS
+            || self
+                .known_agents
+                .iter()
+                .any(|agent| !bounded_identifier(agent, MAX_TOOL_USE_ID_BYTES))
+        {
+            return Err(DecodeError::Malformed(
+                "invalid-claude-state-agents".to_owned(),
+            ));
+        }
         if self
             .last_human_turn
             .as_ref()
@@ -195,7 +223,9 @@ impl ClaudeStateV1 {
 
     fn fit_serialized_bound(&mut self) -> Result<(), DecodeError> {
         while serialized_len(self)? > MAX_DECODER_STATE_BYTES {
-            if self.unresolved_tools.pop_front().is_none() {
+            if self.unresolved_tools.pop_front().is_none()
+                && self.known_agents.pop_front().is_none()
+            {
                 self.last_human_turn = None;
                 if serialized_len(self)? > MAX_DECODER_STATE_BYTES {
                     return Err(DecodeError::StateTooLarge);

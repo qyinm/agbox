@@ -1,0 +1,2 @@
+{"type":"assistant","sessionId":"session-malformed","timestamp":"2026-07-17T04:00:00Z","message":{"content":"must be quarantined"}}
+{"type":"user","uuid":"valid-after-malformed","sessionId":"session-malformed","timestamp":"2026-07-17T04:00:01Z","message":{"content":"valid recovery"}}

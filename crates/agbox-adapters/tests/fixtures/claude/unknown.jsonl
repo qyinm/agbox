@@ -1,0 +1,3 @@
+{"type":"future_additive_record","uuid":"unknown-1","privatePayload":{"token":"PRIVATE_UNKNOWN_TOKEN"}}
+{"type":"system","subtype":"turn_duration","uuid":"known-drift","sessionId":"session-drift","timestamp":"2026-07-17T05:00:00Z","durationMs":1}
+{"type":"system","subtype":"turn_duration","uuid":"known-drift","sessionId":"session-drift","timestamp":"2026-07-17T05:00:00Z","durationMs":1,"futureAdditive":{"token":"PRIVATE_ADDITIVE_TOKEN","thinking":"PRIVATE_ADDITIVE_THINKING"}}
