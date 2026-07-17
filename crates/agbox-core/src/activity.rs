@@ -27,7 +27,7 @@ pub enum ActionOutcome {
     Unknown,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind")]
 pub enum EventPayload {
     #[serde(rename = "session.started")]
@@ -76,6 +76,128 @@ pub enum EventPayload {
     DiagnosticObserved { level: String, message: ContentRef },
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "kind")]
+enum EventPayloadWire {
+    #[serde(rename = "session.started")]
+    SessionStarted { context: Option<ContentRef> },
+    #[serde(rename = "session.context_changed")]
+    SessionContextChanged {
+        context: ContentRef,
+        branch_hash: Option<String>,
+    },
+    #[serde(rename = "turn.started")]
+    TurnStarted { prompt_id: Option<String> },
+    #[serde(rename = "turn.finished")]
+    TurnFinished { outcome: ActionOutcome },
+    #[serde(rename = "message.created")]
+    MessageCreated { content: ContentRef },
+    #[serde(rename = "action.requested")]
+    ActionRequested {
+        native_action_id: String,
+        tool_name: String,
+        input: ContentRef,
+    },
+    #[serde(rename = "action.finished")]
+    ActionFinished {
+        native_action_id: String,
+        outcome: ActionOutcome,
+        output: Option<ContentRef>,
+    },
+    #[serde(rename = "artifact.changed")]
+    ArtifactChanged {
+        path: ContentRef,
+        operation: String,
+        content_hash: Option<String>,
+    },
+    #[serde(rename = "plan.observed")]
+    PlanObserved { plan: ContentRef },
+    #[serde(rename = "agent.started")]
+    AgentStarted { native_agent_id: String },
+    #[serde(rename = "agent.finished")]
+    AgentFinished {
+        native_agent_id: String,
+        outcome: ActionOutcome,
+    },
+    #[serde(rename = "context.compacted")]
+    ContextCompacted { summary_hash: Option<String> },
+    #[serde(rename = "diagnostic.observed")]
+    DiagnosticObserved { level: String, message: ContentRef },
+}
+
+impl From<EventPayloadWire> for EventPayload {
+    fn from(wire: EventPayloadWire) -> Self {
+        match wire {
+            EventPayloadWire::SessionStarted { context } => Self::SessionStarted { context },
+            EventPayloadWire::SessionContextChanged {
+                context,
+                branch_hash,
+            } => Self::SessionContextChanged {
+                context,
+                branch_hash,
+            },
+            EventPayloadWire::TurnStarted { prompt_id } => Self::TurnStarted { prompt_id },
+            EventPayloadWire::TurnFinished { outcome } => Self::TurnFinished { outcome },
+            EventPayloadWire::MessageCreated { content } => Self::MessageCreated { content },
+            EventPayloadWire::ActionRequested {
+                native_action_id,
+                tool_name,
+                input,
+            } => Self::ActionRequested {
+                native_action_id,
+                tool_name,
+                input,
+            },
+            EventPayloadWire::ActionFinished {
+                native_action_id,
+                outcome,
+                output,
+            } => Self::ActionFinished {
+                native_action_id,
+                outcome,
+                output,
+            },
+            EventPayloadWire::ArtifactChanged {
+                path,
+                operation,
+                content_hash,
+            } => Self::ArtifactChanged {
+                path,
+                operation,
+                content_hash,
+            },
+            EventPayloadWire::PlanObserved { plan } => Self::PlanObserved { plan },
+            EventPayloadWire::AgentStarted { native_agent_id } => {
+                Self::AgentStarted { native_agent_id }
+            }
+            EventPayloadWire::AgentFinished {
+                native_agent_id,
+                outcome,
+            } => Self::AgentFinished {
+                native_agent_id,
+                outcome,
+            },
+            EventPayloadWire::ContextCompacted { summary_hash } => {
+                Self::ContextCompacted { summary_hash }
+            }
+            EventPayloadWire::DiagnosticObserved { level, message } => {
+                Self::DiagnosticObserved { level, message }
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EventPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let payload = Self::from(EventPayloadWire::deserialize(deserializer)?);
+        payload.validate().map_err(de::Error::custom)?;
+        Ok(payload)
+    }
+}
+
 impl EventPayload {
     fn kind(&self) -> &'static str {
         match self {
@@ -95,7 +217,13 @@ impl EventPayload {
         }
     }
 
-    fn validate(&self) -> Result<(), ActivityError> {
+    /// Revalidates standalone payload text and nested content references.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ActivityError`] when payload text or nested content violates
+    /// an activity invariant.
+    pub fn validate(&self) -> Result<(), ActivityError> {
         match self {
             Self::SessionStarted { context } => validate_optional_content(context.as_ref()),
             Self::SessionContextChanged {

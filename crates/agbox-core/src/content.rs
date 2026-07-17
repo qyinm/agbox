@@ -97,13 +97,13 @@ impl ContentRef {
                 ContentError::MetadataTooLarge
             });
         }
-        if let Some(excerpt) = &redacted_excerpt {
-            if excerpt.disclosure_class() != disclosure_class {
-                return Err(ContentError::DisclosureMismatch);
-            }
-            if !disclosure_class.is_transferable() {
-                return Err(ContentError::ForbiddenDisclosure);
-            }
+        if !disclosure_class.is_transferable() {
+            return Err(ContentError::ForbiddenDisclosure);
+        }
+        if let Some(excerpt) = &redacted_excerpt
+            && excerpt.disclosure_class() != disclosure_class
+        {
+            return Err(ContentError::DisclosureMismatch);
         }
         let redacted_excerpt = redacted_excerpt.map(RedactedText::into_value);
         let content = Self {
@@ -148,7 +148,7 @@ impl ContentRef {
         if self.truncated != (self.byte_length > MAX_INLINE_BYTES as u64) {
             return Err(ContentError::InvalidTruncation);
         }
-        if self.redacted_excerpt.is_some() && !self.disclosure_class.is_transferable() {
+        if !self.disclosure_class.is_transferable() {
             return Err(ContentError::ForbiddenDisclosure);
         }
         Ok(())

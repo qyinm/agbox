@@ -59,7 +59,7 @@ impl fmt::Debug for WorkAssertion {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssertionError {
-    #[error("only explicit human intent may define an instruction")]
+    #[error("only explicit human-intent authority and disclosure may define an instruction")]
     InstructionAuthority,
     #[error("an assertion must cite evidence")]
     MissingEvidence,
@@ -132,7 +132,10 @@ impl WorkAssertion {
     ///
     /// Returns [`AssertionError`] when an assertion invariant is violated.
     pub fn validate(&self) -> Result<(), AssertionError> {
-        if self.field == "next_action" && !self.authority.may_define_instruction() {
+        if self.field == "next_action"
+            && (!self.authority.may_define_instruction()
+                || self.disclosure_class != DisclosureClass::HumanIntent)
+        {
             return Err(AssertionError::InstructionAuthority);
         }
         if self.evidence_refs.is_empty() {

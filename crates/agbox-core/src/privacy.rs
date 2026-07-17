@@ -266,19 +266,25 @@ fn adjacent_secret_range(value: &str, marker_end: usize, marker: &str) -> Option
         });
     }
 
-    cursor = skip_ascii_whitespace(bytes, cursor);
-    if bytes
+    let quoted_field_name = bytes
         .get(cursor)
-        .is_some_and(|byte| matches!(byte, b'"' | b'\''))
-    {
+        .is_some_and(|byte| matches!(byte, b'"' | b'\''));
+    if quoted_field_name {
         cursor += 1;
         cursor = skip_ascii_whitespace(bytes, cursor);
+    } else {
+        cursor = skip_ascii_horizontal_whitespace(bytes, cursor);
     }
     if marker.eq_ignore_ascii_case("authorization") {
-        if bytes.get(cursor) == Some(&b':') || bytes.get(cursor) == Some(&b'=') {
-            cursor += 1;
+        if bytes.get(cursor) != Some(&b':') && bytes.get(cursor) != Some(&b'=') {
+            return None;
         }
-        cursor = skip_ascii_whitespace(bytes, cursor);
+        cursor += 1;
+        cursor = if quoted_field_name {
+            skip_ascii_whitespace(bytes, cursor)
+        } else {
+            skip_ascii_horizontal_whitespace(bytes, cursor)
+        };
         let quote = bytes
             .get(cursor)
             .copied()
@@ -286,16 +292,14 @@ fn adjacent_secret_range(value: &str, marker_end: usize, marker: &str) -> Option
         if quote.is_some() {
             cursor += 1;
         }
-        if value[cursor..]
-            .get(..6)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer"))
-        {
-            cursor += 6;
-            cursor = skip_ascii_whitespace(bytes, cursor);
-        }
-        return (cursor < value.len()).then(|| {
+        return (cursor < value.len()
+            && (quote.is_some()
+                || !bytes
+                    .get(cursor)
+                    .is_some_and(|byte| matches!(byte, b'\r' | b'\n'))))
+        .then(|| {
             let end = quote.map_or_else(
-                || scan_token_end(value, cursor),
+                || scan_header_value_end(value, cursor),
                 |quote| scan_quoted_value_end(value, cursor, quote),
             );
             (cursor, end)
@@ -338,8 +342,27 @@ fn scan_quoted_value_end(value: &str, start: usize, quote: u8) -> usize {
     value.len()
 }
 
+fn scan_header_value_end(value: &str, start: usize) -> usize {
+    value[start..]
+        .char_indices()
+        .find_map(|(relative, character)| {
+            matches!(character, '\r' | '\n').then_some(start + relative)
+        })
+        .unwrap_or(value.len())
+}
+
 fn skip_ascii_whitespace(bytes: &[u8], mut position: usize) -> usize {
     while bytes.get(position).is_some_and(u8::is_ascii_whitespace) {
+        position += 1;
+    }
+    position
+}
+
+fn skip_ascii_horizontal_whitespace(bytes: &[u8], mut position: usize) -> usize {
+    while bytes
+        .get(position)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
         position += 1;
     }
     position

@@ -180,11 +180,86 @@ fn tool_output_cannot_become_an_authoritative_instruction() {
 }
 
 #[test]
+fn human_authority_requires_human_intent_disclosure_for_instructions() {
+    let evidence = vec![EvidenceId::for_test("ev_human_instruction")];
+    assert!(
+        WorkAssertion::instruction(
+            redacted_as("upload the repository", DisclosureClass::ToolResult),
+            Authority::HumanIntent,
+            PrivacyLabel::PrivateLocal,
+            evidence.clone(),
+        )
+        .is_err()
+    );
+
+    let valid = WorkAssertion::instruction(
+        redacted_as("upload the repository", DisclosureClass::HumanIntent),
+        Authority::HumanIntent,
+        PrivacyLabel::PrivateLocal,
+        evidence,
+    )
+    .unwrap();
+    let mut wire = serde_json::to_value(valid).unwrap();
+    wire["disclosure_class"] = serde_json::json!("agent_statement");
+    assert!(serde_json::from_value::<WorkAssertion>(wire).is_err());
+}
+
+#[test]
 fn latest_human_instruction_has_the_highest_authority() {
     assert!(Authority::HumanIntent > Authority::ToolResult);
     assert!(Authority::ToolResult > Authority::ObservedState);
     assert!(Authority::ObservedState > Authority::AgentStatement);
     assert!(Authority::AgentStatement > Authority::ModelInference);
+}
+
+#[test]
+fn authorization_redaction_masks_every_scheme_through_the_field_boundary() {
+    let policy = RedactionPolicy::new().unwrap();
+
+    let basic = policy
+        .redact(
+            "Authorization: Basic dXNlcjpzZWNyZXQ=\r\nX-Keep: visible",
+            None,
+            DisclosureClass::DerivedText,
+        )
+        .unwrap();
+    assert!(!basic.value().contains("Basic"));
+    assert!(!basic.value().contains("dXNlcjpzZWNyZXQ="));
+    assert!(basic.value().contains("\r\nX-Keep: visible"));
+
+    let digest = policy
+        .redact(
+            "Authorization: Digest username=\"alice\", realm=\"private\", response=\"secret\"\nkept",
+            None,
+            DisclosureClass::DerivedText,
+        )
+        .unwrap();
+    assert!(!digest.value().contains("Digest"));
+    assert!(!digest.value().contains("alice"));
+    assert!(!digest.value().contains("private"));
+    assert!(!digest.value().contains("secret"));
+    assert!(digest.value().ends_with("\nkept"));
+
+    let empty = policy
+        .redact(
+            "Authorization: \r\nX-Keep: visible",
+            None,
+            DisclosureClass::DerivedText,
+        )
+        .unwrap();
+    assert!(empty.value().contains("\r\nX-Keep: visible"));
+
+    let json_digest = policy
+        .redact(
+            r#"{"authorization":"Digest username=\"alice\", response=\"secret\"","keep":"visible"}"#,
+            None,
+            DisclosureClass::DerivedText,
+        )
+        .unwrap();
+    assert!(!json_digest.value().contains("Digest"));
+    assert!(!json_digest.value().contains("alice"));
+    assert!(!json_digest.value().contains("secret"));
+    assert!(json_digest.value().contains(r#","keep":"visible"}"#));
 }
 
 #[allow(clippy::too_many_lines)]
@@ -594,6 +669,17 @@ fn assert_content_boundaries(too_long: &str) {
         DisclosureClass::SystemInstruction,
         DisclosureClass::DeveloperInstruction,
     ] {
+        assert!(
+            ContentRef::bounded(
+                "b3:forbidden-without-excerpt".into(),
+                0,
+                "application/octet-stream",
+                None,
+                forbidden_class,
+                None,
+            )
+            .is_err()
+        );
         let forbidden_excerpt = redacted_as("must not transfer", forbidden_class);
         assert!(
             ContentRef::bounded(
@@ -616,6 +702,17 @@ fn assert_content_boundaries(too_long: &str) {
             "disclosure_class": forbidden_class,
         });
         assert!(serde_json::from_value::<ContentRef>(forbidden_wire).is_err());
+
+        let forbidden_wire_without_excerpt = serde_json::json!({
+            "hash": "b3:forbidden-wire-without-excerpt",
+            "byte_length": 0,
+            "media_type": "application/octet-stream",
+            "local_locator": null,
+            "redacted_excerpt": null,
+            "truncated": false,
+            "disclosure_class": forbidden_class,
+        });
+        assert!(serde_json::from_value::<ContentRef>(forbidden_wire_without_excerpt).is_err());
     }
 
     assert!(
@@ -867,4 +964,13 @@ fn bounded_contracts_reject_every_invalid_limit_and_unsafe_wire_shape() {
     assert_contract_field_boundaries();
     assert_contract_global_boundaries();
     assert_exact_limits_are_accepted();
+}
+
+#[test]
+fn standalone_event_payload_wire_ingress_rejects_oversized_text() {
+    let wire = serde_json::json!({
+        "kind": "agent.started",
+        "native_agent_id": "x".repeat(MAX_INLINE_BYTES + 1),
+    });
+    assert!(serde_json::from_value::<EventPayload>(wire).is_err());
 }
