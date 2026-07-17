@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 
 use agbox_ingest::{READ_BUFFER_BYTES, RecordScanner, ScanOutcome};
 use proptest::prelude::*;
@@ -22,6 +23,14 @@ fn read_window(record: &agbox_ingest::RecordWindow) -> Vec<u8> {
     let mut bytes = Vec::new();
     record.open().unwrap().read_to_end(&mut bytes).unwrap();
     bytes
+}
+
+fn scanned_record_with_mutator(bytes: &[u8]) -> (agbox_ingest::RecordWindow, std::fs::File) {
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(bytes).unwrap();
+    let mutator = file.try_clone().unwrap();
+    let mut scanner = RecordScanner::new(file, 0, u64::try_from(bytes.len()).unwrap()).unwrap();
+    (complete(scanner.next().unwrap()), mutator)
 }
 
 #[test]
@@ -190,6 +199,74 @@ fn multi_window_hash_matches_direct_blake3_without_the_newline() {
 }
 
 #[test]
+fn truncating_a_completed_record_makes_the_window_fail_with_unexpected_eof() {
+    let (record, file) = scanned_record_with_mutator(b"original\n");
+    file.set_len(3).unwrap();
+
+    let error = record
+        .open()
+        .unwrap()
+        .read_to_end(&mut Vec::new())
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+}
+
+#[test]
+fn same_length_rewrite_makes_the_window_fail_hash_verification() {
+    let (record, file) = scanned_record_with_mutator(b"original\n");
+    assert_eq!(file.write_at(b"mutated!", 0).unwrap(), 8);
+
+    let mut reader = record.open().unwrap();
+    let mut final_chunk = [0_u8; 8];
+    let error = reader.read(&mut final_chunk).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn hybrid_read_makes_the_window_fail_hash_verification() {
+    let (record, file) = scanned_record_with_mutator(b"abcdefgh\n");
+    let mut reader = record.open().unwrap();
+    let mut prefix = [0_u8; 4];
+    reader.read_exact(&mut prefix).unwrap();
+    assert_eq!(&prefix, b"abcd");
+
+    assert_eq!(file.write_at(b"WXYZ", 4).unwrap(), 4);
+    let error = reader.read_to_end(&mut Vec::new()).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn appending_after_a_completed_record_preserves_the_original_window() {
+    let (record, file) = scanned_record_with_mutator(b"original\n");
+    assert_eq!(file.write_at(b"later\n", 9).unwrap(), 6);
+
+    assert_eq!(read_window(&record), b"original");
+}
+
+#[test]
+fn debug_output_is_bounded_and_never_includes_scanned_content() {
+    const SECRET: &str = "AGBOX_SECRET_SENTINEL";
+    let bytes = format!("{SECRET}\n");
+    let mut scanner = scanner_for(bytes.as_bytes(), 0, u64::try_from(bytes.len()).unwrap());
+    let record = complete(scanner.next().unwrap());
+    let mut reader = record.open().unwrap();
+    let mut prefix = [0_u8; 5];
+    reader.read_exact(&mut prefix).unwrap();
+
+    let scanner_debug = format!("{scanner:?}");
+    let record_debug = format!("{record:?}");
+    let reader_debug = format!("{reader:?}");
+    let outcome_debug = format!("{:?}", ScanOutcome::Complete(record));
+
+    for debug in [&scanner_debug, &record_debug, &reader_debug, &outcome_debug] {
+        assert!(!debug.contains(SECRET));
+        assert!(debug.len() < 256, "unbounded debug output: {debug}");
+    }
+    assert!(scanner_debug.contains("buffer_capacity: 65536"));
+    assert!(!scanner_debug.contains("buffer:"));
+}
+
+#[test]
 fn target_size_smaller_than_the_physical_file_is_a_hard_boundary() {
     let bytes = b"one\ntwo\n";
     let mut scanner = scanner_for(bytes, 0, 4);
@@ -284,15 +361,23 @@ proptest! {
         }
 
         let mut scanner = scanner_for(&bytes, 0, u64::try_from(bytes.len()).unwrap());
+        let mut expected_start = 0_u64;
         for expected in &records {
             let record = complete(scanner.next().unwrap());
-            prop_assert_eq!(record.content_length(), u64::try_from(expected.len()).unwrap());
+            let expected_length = u64::try_from(expected.len()).unwrap();
+            let expected_end = expected_start.checked_add(expected_length).unwrap();
+            let expected_next = expected_end.checked_add(1).unwrap();
+            prop_assert_eq!(record.start(), expected_start);
+            prop_assert_eq!(record.content_end(), expected_end);
+            prop_assert_eq!(record.content_length(), expected_length);
+            prop_assert_eq!(record.next_offset(), expected_next);
             prop_assert_eq!(read_window(&record), expected.as_slice());
             prop_assert_eq!(
                 record.record_hash(),
                 format!("b3:{}", blake3::hash(expected).to_hex())
             );
             prop_assert_eq!(scanner.buffer_capacity(), READ_BUFFER_BYTES);
+            expected_start = expected_next;
         }
 
         if include_incomplete {
