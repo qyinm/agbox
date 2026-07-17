@@ -79,19 +79,6 @@ fn invalid_path_error(message: &'static str) -> io::Error {
 }
 
 fn ensure_directory_metadata(metadata: &fs::Metadata) -> io::Result<()> {
-    ensure_owned_directory_metadata(metadata)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-
-        if metadata.mode() & 0o7777 != OWNER_DIRECTORY_MODE {
-            return Err(security_error("evidence root is not owner-controlled"));
-        }
-    }
-    Ok(())
-}
-
-fn ensure_owned_directory_metadata(metadata: &fs::Metadata) -> io::Result<()> {
     if !metadata.is_dir() {
         return Err(security_error("evidence root is not a directory"));
     }
@@ -99,7 +86,9 @@ fn ensure_owned_directory_metadata(metadata: &fs::Metadata) -> io::Result<()> {
     {
         use std::os::unix::fs::MetadataExt;
 
-        if metadata.uid() != rustix::process::geteuid().as_raw() {
+        if metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.mode() & 0o7777 != OWNER_DIRECTORY_MODE
+        {
             return Err(security_error("evidence root is not owner-controlled"));
         }
     }
@@ -144,10 +133,6 @@ fn absolute_path(path: &Path) -> io::Result<PathBuf> {
 }
 
 pub(crate) fn ensure_owner_directory(path: &Path) -> io::Result<()> {
-    ensure_owner_directory_entry(path, true)
-}
-
-fn ensure_owner_directory_entry(path: &Path, require_private_mode: bool) -> io::Result<()> {
     let absolute = absolute_path(path)?;
     let mut current = PathBuf::new();
 
@@ -212,11 +197,7 @@ fn ensure_owner_directory_entry(path: &Path, require_private_mode: bool) -> io::
     if metadata.file_type().is_symlink() {
         return Err(security_error("evidence root must not be a symlink"));
     }
-    if require_private_mode {
-        ensure_directory_metadata(&metadata)
-    } else {
-        ensure_owned_directory_metadata(&metadata)
-    }
+    ensure_directory_metadata(&metadata)
 }
 
 pub(crate) fn set_owner_file_mode(file: &File) -> io::Result<()> {
@@ -255,18 +236,7 @@ fn ensure_owner_stat(stat: &rustix_fs::Stat, expected: FileType) -> io::Result<(
     Ok(())
 }
 
-#[cfg(unix)]
-fn ensure_owner_directory_stat(stat: &rustix_fs::Stat) -> io::Result<()> {
-    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
-        return Err(security_error("evidence root is not a directory"));
-    }
-    if stat.st_uid != rustix::process::geteuid().as_raw() {
-        return Err(security_error("evidence root is not owner-controlled"));
-    }
-    Ok(())
-}
-
-fn open_owner_directory_with_mode(path: &Path, require_private_mode: bool) -> io::Result<File> {
+pub(crate) fn open_owner_directory(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     let directory = File::from(
         rustix_fs::open(
@@ -279,23 +249,13 @@ fn open_owner_directory_with_mode(path: &Path, require_private_mode: bool) -> io
     #[cfg(not(unix))]
     let directory = File::open(path)?;
     #[cfg(unix)]
-    let stat = rustix_fs::fstat(&directory).map_err(io::Error::from)?;
-    if require_private_mode {
-        ensure_owner_stat(&stat, FileType::Directory)?;
-    } else {
-        ensure_owner_directory_stat(&stat)?;
-    }
+    ensure_owner_stat(
+        &rustix_fs::fstat(&directory).map_err(io::Error::from)?,
+        FileType::Directory,
+    )?;
     #[cfg(not(unix))]
-    if require_private_mode {
-        ensure_directory_metadata(&directory.metadata()?)?;
-    } else {
-        ensure_owned_directory_metadata(&directory.metadata()?)?;
-    }
+    ensure_directory_metadata(&directory.metadata()?)?;
     Ok(directory)
-}
-
-pub(crate) fn open_owner_directory(path: &Path) -> io::Result<File> {
-    open_owner_directory_with_mode(path, true)
 }
 
 #[cfg(unix)]
@@ -341,34 +301,6 @@ pub(crate) fn open_bound_owner_directory(path: &Path) -> io::Result<(PathBuf, Fi
 
     // Canonicalize only after the no-follow descriptor is held, then compare
     // both the original spelling and resolved path against that descriptor.
-    let canonical = path.canonicalize()?;
-    #[cfg(unix)]
-    {
-        verify_directory_path_identity(path, expected)?;
-        verify_directory_path_identity(&canonical, expected)?;
-    }
-    #[cfg(not(unix))]
-    {
-        verify_directory_path_identity(path)?;
-        verify_directory_path_identity(&canonical)?;
-    }
-    Ok((canonical, directory))
-}
-
-pub(crate) fn open_bound_private_directory(path: &Path) -> io::Result<(PathBuf, File)> {
-    ensure_owner_directory_entry(path, false)?;
-    let directory = open_owner_directory_with_mode(path, false)?;
-    #[cfg(unix)]
-    {
-        rustix_fs::fchmod(&directory, Mode::from_raw_mode(0o700)).map_err(io::Error::from)?;
-        ensure_owner_stat(
-            &rustix_fs::fstat(&directory).map_err(io::Error::from)?,
-            FileType::Directory,
-        )?;
-    }
-
-    #[cfg(unix)]
-    let expected = metadata_identity(&directory.metadata()?);
     let canonical = path.canonicalize()?;
     #[cfg(unix)]
     {

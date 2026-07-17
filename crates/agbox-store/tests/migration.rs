@@ -12,6 +12,7 @@ use rusqlite::{Connection, params};
 #[test]
 fn creates_v2_schema_without_touching_legacy_db() {
     let home = tempfile::tempdir().unwrap();
+    set_mode(home.path(), 0o700);
     let legacy = home.path().join("agbox.db");
     std::fs::write(&legacy, b"legacy sentinel").unwrap();
 
@@ -66,6 +67,7 @@ fn rejects_the_reserved_legacy_database_without_changing_it() {
 #[test]
 fn rejects_an_unsupported_schema_version_without_migrating_it() {
     let home = tempfile::tempdir().unwrap();
+    set_mode(home.path(), 0o700);
     let database = home.path().join("state.db");
     let connection = Connection::open(&database).unwrap();
     connection.pragma_update(None, "user_version", 2).unwrap();
@@ -83,6 +85,7 @@ fn rejects_an_unsupported_schema_version_without_migrating_it() {
 #[test]
 fn disclosure_classes_are_required_and_checked_beside_stored_text() {
     let home = tempfile::tempdir().unwrap();
+    set_mode(home.path(), 0o700);
     let database = home.path().join("state.db");
     let _store = Store::open_new(&database).unwrap();
     let connection = Connection::open(&database).unwrap();
@@ -179,9 +182,23 @@ fn creates_owner_only_database_directory_and_sqlite_files() {
 }
 
 #[test]
+fn rejects_a_preexisting_non_private_parent_without_changing_its_mode() {
+    let home = tempfile::tempdir().unwrap();
+    set_mode(home.path(), 0o755);
+    let database = home.path().join("state.db");
+
+    let error = Store::open_new(&database).unwrap_err();
+
+    assert!(matches!(error, StoreError::Io(_)));
+    assert_mode(home.path(), 0o755);
+    assert!(!database.exists());
+}
+
+#[test]
 fn refuses_symlinks_for_database_and_sqlite_sidecars_without_following_them() {
     for name in ["state.db", "state.db-wal", "state.db-shm"] {
         let home = tempfile::tempdir().unwrap();
+        set_mode(home.path(), 0o700);
         let target = home.path().join(format!("{name}.target"));
         let database = home.path().join("state.db");
         fs::write(&target, b"do not follow").unwrap();

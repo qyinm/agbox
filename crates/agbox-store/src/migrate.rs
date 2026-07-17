@@ -10,7 +10,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 use crate::{
     StoreError,
-    fs_security::{create_owner_temp_file, open_bound_private_directory, validate_owner_file},
+    fs_security::{create_owner_temp_file, open_bound_owner_directory, validate_owner_file},
 };
 
 const INITIAL: &str = include_str!("schema/0001_initial.sql");
@@ -28,7 +28,7 @@ pub(crate) fn open_writer(path: &Path) -> Result<OpenedWriter, StoreError> {
         )
     })?;
     let parent = database_parent(path)?;
-    let (canonical_parent, directory) = open_bound_private_directory(parent)?;
+    let (canonical_parent, directory) = open_bound_owner_directory(parent)?;
     let wal_name = sidecar_name(name, "-wal");
     let shm_name = sidecar_name(name, "-shm");
 
