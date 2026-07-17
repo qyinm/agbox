@@ -830,6 +830,73 @@ fn aggregate_text_over_inline_limit_preserves_message_hash_and_tool_action() {
 }
 
 #[test]
+fn large_typed_tool_result_streams_exact_output_without_plaintext_evidence() {
+    let request = decode_one(
+        r#"{"type":"assistant","uuid":"typed-request","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"tool_use","id":"typed-large","name":"Read","input":{}}]}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let secret = "TOOL_SECRET_AT_END";
+    let large = format!("{}{secret}", "x".repeat(70 * 1024 - secret.len()));
+    let tail = "small-safe";
+    let result = decode_one(
+        &format!(
+            r#"{{"type":"user","uuid":"typed-result","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{{"content":[{{"type":"text","text":"unrelated-human"}},{{"type":"tool_result","tool_use_id":"typed-large","content":[{{"type":"text","text":"{large}"}},{{"type":"image","source":{{"data":"PRIVATE_IMAGE_BYTES"}}}},{{"type":"text","text":"{tail}"}}]}}]}}}}"#
+        ),
+        request.next_state(),
+    )
+    .unwrap();
+    let output = result
+        .events()
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::ActionFinished {
+                output: Some(output),
+                ..
+            } => Some(output),
+            _ => None,
+        })
+        .unwrap();
+    let joined = format!("{large}\n{tail}");
+    assert_eq!(output.byte_length(), joined.len() as u64);
+    assert_eq!(
+        output.hash(),
+        blake3::hash(joined.as_bytes()).to_hex().as_str()
+    );
+    assert!(output.is_truncated());
+    assert!(
+        !result
+            .evidence()
+            .iter()
+            .any(|evidence| &evidence.content == output)
+    );
+    assert!(
+        result
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::MessageCreated { .. }))
+    );
+    let serialized = event_json(&result);
+    let debug = format!("{result:?}");
+    let state = result.next_state().as_bytes();
+    for forbidden in [secret, "PRIVATE_IMAGE_BYTES", tail] {
+        assert!(!serialized.contains(forbidden));
+        assert!(!debug.contains(forbidden));
+        assert!(
+            !state
+                .windows(forbidden.len())
+                .any(|window| window == forbidden.as_bytes())
+        );
+        assert!(!result.evidence().iter().any(|evidence| {
+            evidence
+                .plaintext
+                .windows(forbidden.len())
+                .any(|window| window == forbidden.as_bytes())
+        }));
+    }
+}
+
+#[test]
 fn sixty_four_full_text_blocks_stream_to_one_truncated_message() {
     let text = "x".repeat(64 * 1024);
     let blocks = (0..64)

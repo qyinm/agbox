@@ -590,9 +590,9 @@ fn combine_text(
     }
     let mut total_bytes = 0_u64;
     let mut hasher = blake3::Hasher::new();
-    let mut bytes = Vec::with_capacity(
+    let mut bytes = Zeroizing::new(Vec::with_capacity(
         MAX_CAPTURE_BYTES.min(parts.iter().map(|part| part.bytes.len()).sum::<usize>()),
-    );
+    ));
     let mut capture_open = true;
     for (index, part) in parts.iter().enumerate() {
         if index > 0 {
@@ -629,7 +629,7 @@ fn combine_text(
         }
     }
     Ok(Some(SecureCapturedString {
-        bytes: Zeroizing::new(bytes),
+        bytes,
         total_bytes,
         hash: hasher.finalize().to_hex().to_string(),
         truncated: !capture_open || total_bytes > MAX_CAPTURE_BYTES as u64,
@@ -862,6 +862,7 @@ fn collect_direct_result_text(
 struct TypedText {
     kind: Option<String>,
     text: Option<SecureCapturedString>,
+    indices: Option<Vec<usize>>,
 }
 
 fn collect_nested_result_text(
@@ -880,22 +881,30 @@ fn collect_nested_result_text(
     )?;
     insert_nested_text(
         &mut nested,
-        capture_matches_bounded(
-            record,
-            &["message", "content", "content", "text"],
-            MAX_CAPTURE_BYTES.min(remaining),
-            remaining,
-        )?,
+        capture_matches_bounded(record, &["message", "content", "content", "text"], 0, 0)?,
     )?;
-    for ((outer, inner), value) in nested {
+    let mut selected_by_block = BTreeMap::<usize, Vec<Vec<usize>>>::new();
+    for ((outer, _), value) in nested {
         if value.kind.as_deref() == Some("text")
-            && let Some(text) = value.text
+            && value.text.is_some()
+            && let Some(indices) = value.indices
         {
-            blocks
-                .entry(outer)
-                .or_default()
-                .result_text
-                .push((inner.saturating_add(1), text));
+            selected_by_block.entry(outer).or_default().push(indices);
+        }
+    }
+    let mut remaining = remaining;
+    for (outer, selected_indices) in selected_by_block {
+        let mut reader = BoundedJsonReader::new(record.open()?);
+        if let Some(text) = reader.capture_joined_matches(
+            &["message", "content", "content", "text"],
+            &selected_indices,
+            MAX_CAPTURE_BYTES.min(remaining),
+            MAX_MATCHES,
+        )? {
+            remaining = remaining
+                .checked_sub(text.bytes.len())
+                .ok_or(DecodeError::OutputTooLarge)?;
+            blocks.entry(outer).or_default().result_text.push((1, text));
         }
     }
     Ok(())
@@ -914,8 +923,9 @@ fn insert_nested_kind(
             ));
         }
         if let CapturedValue::String(value) = captured.value {
-            nested.entry(key).or_default().kind =
-                Some(required_identifier(value, MAX_ID_BYTES, "result.type")?);
+            let entry = nested.entry(key).or_default();
+            entry.indices = Some(captured.array_indices);
+            entry.kind = Some(required_identifier(value, MAX_ID_BYTES, "result.type")?);
         }
     }
     Ok(())
@@ -934,7 +944,9 @@ fn insert_nested_text(
             ));
         }
         if let CapturedValue::String(value) = captured.value {
-            nested.entry(key).or_default().text = Some(value);
+            let entry = nested.entry(key).or_default();
+            entry.indices = Some(captured.array_indices);
+            entry.text = Some(value);
         }
     }
     Ok(())
@@ -1265,17 +1277,13 @@ fn collect_top_typed_text(
             ));
         }
         if let CapturedValue::String(value) = captured.value {
-            values.entry(key).or_default().kind =
-                Some(required_identifier(value, MAX_ID_BYTES, "result.type")?);
+            let entry = values.entry(key.clone()).or_default();
+            entry.indices = Some(key);
+            entry.kind = Some(required_identifier(value, MAX_ID_BYTES, "result.type")?);
         }
     }
     seen.clear();
-    for captured in capture_matches_bounded(
-        record,
-        text_path,
-        MAX_CAPTURE_BYTES.min(retained_budget),
-        retained_budget,
-    )? {
+    for captured in capture_matches_bounded(record, text_path, 0, 0)? {
         let key = captured.array_indices;
         if !seen.insert(key.clone()) {
             return Err(DecodeError::Malformed(
@@ -1283,16 +1291,31 @@ fn collect_top_typed_text(
             ));
         }
         if let CapturedValue::String(value) = captured.value {
-            values.entry(key).or_default().text = Some(value);
+            let entry = values.entry(key.clone()).or_default();
+            entry.indices = Some(key);
+            entry.text = Some(value);
         }
     }
-    Ok(values
+    let selected_indices = values
         .into_values()
         .filter_map(|value| {
-            (value.kind.as_deref() == Some("text"))
-                .then_some(value.text)
+            (value.kind.as_deref() == Some("text") && value.text.is_some())
+                .then_some(value.indices)
                 .flatten()
         })
+        .collect::<Vec<_>>();
+    if selected_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut reader = BoundedJsonReader::new(record.open()?);
+    Ok(reader
+        .capture_joined_matches(
+            text_path,
+            &selected_indices,
+            MAX_CAPTURE_BYTES.min(retained_budget),
+            MAX_MATCHES,
+        )?
+        .into_iter()
         .collect())
 }
 

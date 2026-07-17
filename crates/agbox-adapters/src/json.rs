@@ -4,7 +4,7 @@ use std::{
 };
 
 use struson::reader::{JsonReader, JsonStreamReader};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::adapter::DecodeError;
 
@@ -503,7 +503,7 @@ impl<'a, R: Read> Parser<'a, R> {
             self.joined.take().map(|accumulator| {
                 let mut value = accumulator.finish();
                 SecureCapturedString {
-                    bytes: Zeroizing::new(value.take_prefix()),
+                    bytes: value.take_secure_prefix(),
                     total_bytes: value.total,
                     hash: value.take_hash(),
                     truncated: value.truncated,
@@ -565,7 +565,7 @@ impl<'a, R: Read> Parser<'a, R> {
                 .start_capture(self.selection_limit.min(remaining))?;
             self.parse_unselected_value(depth, None)?;
             let mut value = self.input.finish_capture()?;
-            let mut prefix = value.take_prefix();
+            let mut prefix = value.take_secure_prefix();
             if let Err(error) = std::str::from_utf8(&prefix) {
                 prefix.truncate(error.valid_up_to());
             }
@@ -587,7 +587,7 @@ impl<'a, R: Read> Parser<'a, R> {
             self.push_match(
                 max_matches,
                 CapturedValue::String(SecureCapturedString {
-                    bytes: Zeroizing::new(prefix),
+                    bytes: prefix,
                     total_bytes: value.total,
                     hash: value.take_hash(),
                     truncated: value.truncated,
@@ -777,7 +777,7 @@ impl<'a, R: Read> Parser<'a, R> {
                 self.push_match(
                     max_matches,
                     CapturedValue::String(SecureCapturedString {
-                        bytes: Zeroizing::new(value.take_prefix()),
+                        bytes: value.take_secure_prefix(),
                         total_bytes: value.total,
                         hash: value.take_hash(),
                         truncated: value.truncated,
@@ -1010,7 +1010,7 @@ impl<'a, R: Read> Parser<'a, R> {
 }
 
 struct StringAccumulator {
-    prefix: Vec<u8>,
+    prefix: Zeroizing<Vec<u8>>,
     capture_limit: usize,
     capture_open: bool,
     total: u64,
@@ -1020,7 +1020,7 @@ struct StringAccumulator {
 impl StringAccumulator {
     fn new(capture_limit: usize) -> Self {
         Self {
-            prefix: Vec::with_capacity(capture_limit.min(MAX_FIELD_NAME_BYTES)),
+            prefix: Zeroizing::new(Vec::with_capacity(capture_limit.min(MAX_FIELD_NAME_BYTES))),
             capture_limit,
             capture_open: true,
             total: 0,
@@ -1057,14 +1057,8 @@ impl StringAccumulator {
     }
 }
 
-impl Drop for StringAccumulator {
-    fn drop(&mut self) {
-        self.prefix.zeroize();
-    }
-}
-
 struct StringInfo {
-    prefix: Vec<u8>,
+    prefix: Zeroizing<Vec<u8>>,
     total: u64,
     hash: String,
     truncated: bool,
@@ -1072,6 +1066,10 @@ struct StringInfo {
 
 impl StringInfo {
     fn take_prefix(&mut self) -> Vec<u8> {
+        std::mem::take(&mut *self.prefix)
+    }
+
+    fn take_secure_prefix(&mut self) -> Zeroizing<Vec<u8>> {
         std::mem::take(&mut self.prefix)
     }
 
@@ -1084,15 +1082,10 @@ impl StringInfo {
             return false;
         }
         if expected.len() <= MAX_FIELD_NAME_BYTES {
-            return self.prefix == expected;
+            return self.prefix.as_slice() == expected;
         }
-        expected.starts_with(&self.prefix) && self.hash == blake3::hash(expected).to_hex().as_str()
-    }
-}
-
-impl Drop for StringInfo {
-    fn drop(&mut self) {
-        self.prefix.zeroize();
+        expected.starts_with(self.prefix.as_slice())
+            && self.hash == blake3::hash(expected).to_hex().as_str()
     }
 }
 
@@ -1177,5 +1170,20 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StringAccumulator, Zeroizing};
+
+    fn assert_zeroizing_vec(_: &Zeroizing<Vec<u8>>) {}
+
+    #[test]
+    fn joined_plaintext_storage_is_zeroizing_from_allocation() {
+        let accumulator = StringAccumulator::new(64);
+        assert_zeroizing_vec(&accumulator.prefix);
+        let info = accumulator.finish();
+        assert_zeroizing_vec(&info.prefix);
     }
 }
