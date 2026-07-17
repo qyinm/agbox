@@ -1,0 +1,13 @@
+pub const MAX_INLINE_BYTES: usize = 64 * 1024;
+pub const MAX_PREVIEW_BYTES: usize = 2 * 1024;
+pub const MAX_EVENTS_PER_RECORD: usize = 64;
+pub const MAX_EVIDENCE_PER_RECORD: usize = 64;
+pub const MAX_DECODER_STATE_BYTES: usize = 32 * 1024;
+pub const MAX_RECORD_SEMANTIC_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_BATCH_SEMANTIC_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_BATCH_RECORDS: usize = 1_000;
+pub const MAX_IPC_FRAME_BYTES: usize = 1024 * 1024;
+pub const MAX_CONTRACT_ITEMS_PER_FIELD: usize = 64;
+pub const MAX_CONTRACT_SOURCE_RUNS: usize = 64;
+pub const MAX_CONTRACT_EVIDENCE_REFS: usize = 128;
+pub const MAX_CONTRACT_SERIALIZED_BYTES: usize = 512 * 1024;
