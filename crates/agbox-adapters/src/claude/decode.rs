@@ -20,7 +20,9 @@ use crate::{
     json::{CapturedMatch, CapturedValue, SecureCapturedString},
 };
 
-use super::state::{ClaudeStateV1, ToolLink, bounded_identifier};
+use super::state::{
+    ClaudeStateV1, ToolLink, bounded_identifier, canonical_context_mode, canonical_permission_mode,
+};
 
 const DECODER_VERSION: &str = "claude-transcript-2.1";
 const MAX_MATCHES: usize = MAX_EVENTS_PER_RECORD;
@@ -358,24 +360,31 @@ fn decode_user(
     output: &mut Output,
 ) -> Result<(), DecodeError> {
     let mut message_parts = Vec::new();
+    let CollectedBlocks {
+        mut blocks,
+        mut remaining_projection_bytes,
+    } = collect_blocks(record)?;
+    if let Some(content) = capture_single_string(
+        record,
+        &["message", "content"],
+        MAX_CAPTURE_BYTES.min(remaining_projection_bytes),
+        false,
+    )?
+    .0
+    {
+        charge_projection(&mut remaining_projection_bytes, content.bytes.len())?;
+        message_parts.push(content);
+    }
     if let Some(content) =
-        capture_single_string(record, &["message", "content"], MAX_CAPTURE_BYTES, false)?.0
+        capture_message_block_text(record, &blocks, &mut remaining_projection_bytes)?
     {
         message_parts.push(content);
     }
-    let blocks = collect_blocks(record)?;
+    prepare_top_result_fallback(record, &mut blocks, &mut remaining_projection_bytes)?;
     let mut deferred_results = Vec::new();
-    for (index, mut block) in blocks {
-        match block.kind.as_deref() {
-            Some("text") => {
-                if let Some(text) = block.text.take() {
-                    message_parts.push(text);
-                }
-            }
-            Some("tool_result") => {
-                deferred_results.push((index, block));
-            }
-            _ => {}
+    for (index, block) in blocks {
+        if block.kind.as_deref() == Some("tool_result") {
+            deferred_results.push((index, block));
         }
     }
     if let Some(content) = combine_text(message_parts)? {
@@ -393,7 +402,7 @@ fn decode_user(
             source,
             identity,
         };
-        emit_tool_result(record, scope, state, output, index, block)?;
+        emit_tool_result(scope, state, output, index, block)?;
     }
     Ok(())
 }
@@ -407,24 +416,30 @@ fn decode_assistant(
     output: &mut Output,
 ) -> Result<(), DecodeError> {
     let mut message_parts = Vec::new();
+    let CollectedBlocks {
+        blocks,
+        mut remaining_projection_bytes,
+    } = collect_blocks(record)?;
+    if let Some(content) = capture_single_string(
+        record,
+        &["message", "content"],
+        MAX_CAPTURE_BYTES.min(remaining_projection_bytes),
+        false,
+    )?
+    .0
+    {
+        charge_projection(&mut remaining_projection_bytes, content.bytes.len())?;
+        message_parts.push(content);
+    }
     if let Some(content) =
-        capture_single_string(record, &["message", "content"], MAX_CAPTURE_BYTES, false)?.0
+        capture_message_block_text(record, &blocks, &mut remaining_projection_bytes)?
     {
         message_parts.push(content);
     }
-    let blocks = collect_blocks(record)?;
     let mut deferred_tools = Vec::new();
-    for (index, mut block) in blocks {
-        match block.kind.as_deref() {
-            Some("text") => {
-                if let Some(text) = block.text.take() {
-                    message_parts.push(text);
-                }
-            }
-            Some("tool_use") => {
-                deferred_tools.push((index, block));
-            }
-            _ => {}
+    for (index, block) in blocks {
+        if block.kind.as_deref() == Some("tool_use") {
+            deferred_tools.push((index, block));
         }
     }
     if let Some(content) = combine_text(message_parts)? {
@@ -466,6 +481,11 @@ struct Block {
     is_error: Option<bool>,
 }
 
+struct CollectedBlocks {
+    blocks: BTreeMap<usize, Block>,
+    remaining_projection_bytes: usize,
+}
+
 fn emit_context_change(
     record: &dyn RecordSource,
     scope: EventScope<'_>,
@@ -476,11 +496,14 @@ fn emit_context_change(
     let normalized_cwd = cwd
         .as_deref()
         .and_then(|value| normalize_context_path(value, scope.context.project_root.as_deref()));
-    let mode = optional_bounded_text(record, &["mode"], MAX_TOOL_NAME_BYTES)?;
-    let permission_mode =
-        optional_bounded_text(record, &["permissionMode"], MAX_TOOL_NAME_BYTES)?.or(
-            optional_bounded_text(record, &["permission-mode"], MAX_TOOL_NAME_BYTES)?,
-        );
+    let mode = optional_bounded_text(record, &["mode"], MAX_TOOL_NAME_BYTES)?.map(Zeroizing::new);
+    let permission_mode = optional_bounded_text(record, &["permissionMode"], MAX_TOOL_NAME_BYTES)?
+        .or(optional_bounded_text(
+            record,
+            &["permission-mode"],
+            MAX_TOOL_NAME_BYTES,
+        )?)
+        .map(Zeroizing::new);
     let branch = capture_single_string(record, &["gitBranch"], 0, true)?.0;
     let branch_hash = branch.map(|value| {
         let mut hasher = blake3::Hasher::new();
@@ -489,9 +512,12 @@ fn emit_context_change(
         hasher.update(value.hash.as_bytes());
         hasher.finalize().to_hex().to_string()
     });
-    let mode = mode.filter(|value| bounded_identifier(value, MAX_TOOL_NAME_BYTES));
-    let permission_mode =
-        permission_mode.filter(|value| bounded_identifier(value, MAX_TOOL_NAME_BYTES));
+    let mode = mode
+        .as_ref()
+        .and_then(|value| canonical_context_mode(value.as_str()));
+    let permission_mode = permission_mode
+        .as_ref()
+        .and_then(|value| canonical_permission_mode(value.as_str()));
     let Some(snapshot) = state.merge_context(normalized_cwd, mode, permission_mode, branch_hash)?
     else {
         return Ok(());
@@ -560,42 +586,133 @@ fn combine_text(
         return Ok(parts.into_iter().next());
     }
     if parts.iter().any(|part| part.truncated) {
-        return Err(DecodeError::OutputTooLarge);
+        return Ok(None);
     }
-    let total_bytes = parts
-        .iter()
-        .try_fold(parts.len() - 1, |total, part| {
-            total.checked_add(part.bytes.len())
-        })
-        .ok_or(DecodeError::OutputTooLarge)?;
-    if total_bytes > MAX_CAPTURE_BYTES {
-        return Err(DecodeError::OutputTooLarge);
-    }
-    let total_bytes_u64 = u64::try_from(total_bytes).map_err(|_| DecodeError::OutputTooLarge)?;
-    let mut bytes = Vec::with_capacity(total_bytes);
+    let mut total_bytes = 0_u64;
+    let mut hasher = blake3::Hasher::new();
+    let mut bytes = Vec::with_capacity(
+        MAX_CAPTURE_BYTES.min(parts.iter().map(|part| part.bytes.len()).sum::<usize>()),
+    );
+    let mut capture_open = true;
     for (index, part) in parts.iter().enumerate() {
         if index > 0 {
-            bytes.push(b'\n');
+            total_bytes = total_bytes
+                .checked_add(1)
+                .ok_or(DecodeError::OutputTooLarge)?;
+            hasher.update(b"\n");
+            if capture_open && bytes.len() < MAX_CAPTURE_BYTES {
+                bytes.push(b'\n');
+            } else {
+                capture_open = false;
+            }
         }
-        bytes.extend_from_slice(&part.bytes);
+        if part.total_bytes
+            != u64::try_from(part.bytes.len()).map_err(|_| DecodeError::OutputTooLarge)?
+        {
+            return Err(DecodeError::Malformed(
+                "invalid-complete-text-capture".to_owned(),
+            ));
+        }
+        total_bytes = total_bytes
+            .checked_add(part.total_bytes)
+            .ok_or(DecodeError::OutputTooLarge)?;
+        hasher.update(&part.bytes);
+        if capture_open
+            && bytes
+                .len()
+                .checked_add(part.bytes.len())
+                .is_some_and(|length| length <= MAX_CAPTURE_BYTES)
+        {
+            bytes.extend_from_slice(&part.bytes);
+        } else {
+            capture_open = false;
+        }
     }
-    let hash = blake3::hash(&bytes).to_hex().to_string();
     Ok(Some(SecureCapturedString {
         bytes: Zeroizing::new(bytes),
-        total_bytes: total_bytes_u64,
-        hash,
-        truncated: false,
+        total_bytes,
+        hash: hasher.finalize().to_hex().to_string(),
+        truncated: !capture_open || total_bytes > MAX_CAPTURE_BYTES as u64,
     }))
 }
 
-fn collect_blocks(record: &dyn RecordSource) -> Result<BTreeMap<usize, Block>, DecodeError> {
+fn capture_message_block_text(
+    record: &dyn RecordSource,
+    blocks: &BTreeMap<usize, Block>,
+    remaining_projection_bytes: &mut usize,
+) -> Result<Option<SecureCapturedString>, DecodeError> {
+    let selected_indices = blocks
+        .iter()
+        .filter(|(_, block)| block.kind.as_deref() == Some("text") && block.text.is_some())
+        .map(|(index, _)| vec![*index])
+        .collect::<Vec<_>>();
+    if selected_indices.is_empty() {
+        return Ok(None);
+    }
+    let mut reader = BoundedJsonReader::new(record.open()?);
+    let capture = reader.capture_joined_matches(
+        &["message", "content", "text"],
+        &selected_indices,
+        MAX_CAPTURE_BYTES.min(*remaining_projection_bytes),
+        MAX_MATCHES,
+    )?;
+    if let Some(value) = &capture {
+        charge_projection(remaining_projection_bytes, value.bytes.len())?;
+    }
+    Ok(capture)
+}
+
+fn prepare_top_result_fallback(
+    record: &dyn RecordSource,
+    blocks: &mut BTreeMap<usize, Block>,
+    remaining_projection_bytes: &mut usize,
+) -> Result<(), DecodeError> {
+    let result_indices = blocks
+        .iter()
+        .filter(|(_, block)| block.kind.as_deref() == Some("tool_result"))
+        .map(|(index, _)| *index)
+        .collect::<Vec<_>>();
+    let [result_index] = result_indices.as_slice() else {
+        return Ok(());
+    };
+    let block = blocks
+        .get_mut(result_index)
+        .ok_or_else(|| DecodeError::Malformed("missing-tool-result-block".to_owned()))?;
+    if block.result_text.is_empty() {
+        let fallback = collect_top_result_text(record, *remaining_projection_bytes)?;
+        let retained = fallback.iter().try_fold(0_usize, |total, value| {
+            total
+                .checked_add(value.bytes.len())
+                .ok_or(DecodeError::OutputTooLarge)
+        })?;
+        charge_projection(remaining_projection_bytes, retained)?;
+        block.result_text.extend(fallback.into_iter().enumerate());
+    }
+    if block.is_error.is_none() {
+        block.is_error = optional_bool(record, &["toolUseResult", "isError"])?;
+    }
+    Ok(())
+}
+
+fn charge_projection(remaining: &mut usize, retained: usize) -> Result<(), DecodeError> {
+    *remaining = remaining
+        .checked_sub(retained)
+        .ok_or(DecodeError::OutputTooLarge)?;
+    Ok(())
+}
+
+fn collect_blocks(record: &dyn RecordSource) -> Result<CollectedBlocks, DecodeError> {
     let mut blocks = BTreeMap::<usize, Block>::new();
     let projection_budget = MAX_RECORD_SEMANTIC_BYTES
         .checked_sub(SEMANTIC_HEADROOM)
         .ok_or(DecodeError::OutputTooLarge)?;
     collect_request_fields(record, &mut blocks, projection_budget)?;
     collect_result_fields(record, &mut blocks, projection_budget)?;
-    Ok(blocks)
+    let remaining_projection_bytes = projection_budget.saturating_sub(projected_bytes(&blocks)?);
+    Ok(CollectedBlocks {
+        blocks,
+        remaining_projection_bytes,
+    })
 }
 
 fn collect_request_fields(
@@ -613,15 +730,9 @@ fn collect_request_fields(
             )
         },
     )?;
-    let remaining = projection_budget.saturating_sub(projected_bytes(blocks)?);
     insert_capture_field(
         blocks,
-        capture_matches_bounded(
-            record,
-            &["message", "content", "text"],
-            MAX_CAPTURE_BYTES.min(remaining),
-            remaining,
-        )?,
+        capture_matches_bounded(record, &["message", "content", "text"], 0, 0)?,
         |block, value| set_once(&mut block.text, value),
     )?;
     ensure_projection_budget(blocks, projection_budget)?;
@@ -982,7 +1093,6 @@ fn emit_tool_request(
 }
 
 fn emit_tool_result(
-    record: &dyn RecordSource,
     scope: EventScope<'_>,
     state: &mut ClaudeStateV1,
     output: &mut Output,
@@ -996,23 +1106,13 @@ fn emit_tool_result(
         return Ok(());
     };
     block.result_text.sort_by_key(|(ordinal, _)| *ordinal);
-    let mut result_parts = block
+    let result_parts = block
         .result_text
         .into_iter()
         .map(|(_, text)| text)
         .collect::<Vec<_>>();
-    let retained = result_parts.iter().try_fold(0_usize, |total, value| {
-        total
-            .checked_add(value.bytes.len())
-            .ok_or(DecodeError::OutputTooLarge)
-    })?;
-    result_parts.extend(collect_top_result_text(
-        record,
-        MAX_CAPTURE_BYTES.saturating_sub(retained),
-    )?);
     let safe_output = combine_text(result_parts)?;
-    let top_error = optional_bool(record, &["toolUseResult", "isError"])?;
-    let failed = block.is_error.or(top_error).unwrap_or(false);
+    let failed = block.is_error.unwrap_or(false);
     let outcome = if failed {
         ActionOutcome::Failed
     } else {
@@ -1125,40 +1225,28 @@ fn collect_top_result_text(
     record: &dyn RecordSource,
     retained_budget: usize,
 ) -> Result<Vec<SecureCapturedString>, DecodeError> {
-    let mut output = Vec::new();
-    let mut remaining = retained_budget;
     for path in [&["toolUseResult"][..], &["toolUseResult", "content"][..]] {
         if let Some(value) =
-            capture_single_string(record, path, remaining.min(MAX_CAPTURE_BYTES), true)?.0
+            capture_single_string(record, path, retained_budget.min(MAX_CAPTURE_BYTES), true)?.0
         {
-            remaining = remaining.saturating_sub(value.bytes.len());
-            output.push(value);
+            return Ok(vec![value]);
         }
     }
-    let retained = output.iter().try_fold(0_usize, |total, value| {
-        total
-            .checked_add(value.bytes.len())
-            .ok_or(DecodeError::OutputTooLarge)
-    })?;
-    let remaining = retained_budget.saturating_sub(retained);
-    output.extend(collect_top_typed_text(
+    let output = collect_top_typed_text(
         record,
         &["toolUseResult", "type"],
         &["toolUseResult", "text"],
-        remaining,
-    )?);
-    let retained = output.iter().try_fold(0_usize, |total, value| {
-        total
-            .checked_add(value.bytes.len())
-            .ok_or(DecodeError::OutputTooLarge)
-    })?;
-    output.extend(collect_top_typed_text(
+        retained_budget,
+    )?;
+    if !output.is_empty() {
+        return Ok(output);
+    }
+    collect_top_typed_text(
         record,
         &["toolUseResult", "content", "type"],
         &["toolUseResult", "content", "text"],
-        retained_budget.saturating_sub(retained),
-    )?);
-    Ok(output)
+        retained_budget,
+    )
 }
 
 fn collect_top_typed_text(

@@ -168,6 +168,74 @@ fn parallel_tools_correlate_out_of_order_and_ignore_duplicates_and_unknown_ids()
 }
 
 #[test]
+fn block_result_text_wins_over_duplicate_top_level_representation() {
+    let request = decode_one(
+        r#"{"type":"assistant","uuid":"a-request","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let result = decode_one(
+        r#"{"type":"user","uuid":"u-result","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"block-safe"}]},"toolUseResult":{"content":"TOP_DUPLICATE"}}"#,
+        request.next_state(),
+    )
+    .unwrap();
+    let output = result
+        .events()
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::ActionFinished {
+                output: Some(output),
+                ..
+            } => Some(output),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(output.hash(), blake3::hash(b"block-safe").to_hex().as_str());
+    assert!(result.evidence().iter().any(|evidence| {
+        &evidence.content == output && evidence.plaintext.as_slice() == b"block-safe"
+    }));
+    assert!(!event_json(&result).contains("TOP_DUPLICATE"));
+    assert!(!result.evidence().iter().any(|evidence| {
+        evidence
+            .plaintext
+            .windows("TOP_DUPLICATE".len())
+            .any(|window| window == b"TOP_DUPLICATE")
+    }));
+}
+
+#[test]
+fn top_level_result_is_ignored_when_multiple_result_blocks_exist() {
+    let request = decode_one(
+        r#"{"type":"assistant","uuid":"a-requests","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{}},{"type":"tool_use","id":"t2","name":"Read","input":{}}]}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let result = decode_one(
+        r#"{"type":"user","uuid":"u-results","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1"},{"type":"tool_result","tool_use_id":"t2"}]},"toolUseResult":{"content":"MUST_NOT_ATTACH","isError":true}}"#,
+        request.next_state(),
+    )
+    .unwrap();
+    let finished = result
+        .events()
+        .iter()
+        .filter_map(|event| match event.payload() {
+            EventPayload::ActionFinished {
+                outcome, output, ..
+            } => Some((outcome, output)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(finished.len(), 2);
+    assert!(
+        finished
+            .iter()
+            .all(|(outcome, output)| **outcome == ActionOutcome::Succeeded && output.is_none())
+    );
+    assert!(!event_json(&result).contains("MUST_NOT_ATTACH"));
+    assert!(result.evidence().is_empty());
+}
+
+#[test]
 fn duplicate_tool_id_replaces_the_older_link_deterministically() {
     let first = decode_one(
         r#"{"type":"assistant","uuid":"a-old","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"tool_use","id":"same","name":"Read","input":{"path":"old"}}]}}"#,
@@ -437,6 +505,71 @@ fn context_change_uses_only_trusted_project_labels_and_branch_hashes() {
 }
 
 #[test]
+fn unknown_context_labels_never_enter_events_state_or_debug() {
+    let safe = decode_one(
+        r#"{"type":"system","uuid":"safe","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","mode":"plan","permissionMode":"safe"}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let unsafe_record = decode_one(
+        r#"{"type":"system","uuid":"unsafe","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","mode":"/Users/alice/key","permissionMode":"token=SECRET"}"#,
+        safe.next_state(),
+    )
+    .unwrap();
+    assert!(unsafe_record.events().is_empty());
+    assert_eq!(unsafe_record.next_state(), safe.next_state());
+    let event = event_json(&unsafe_record);
+    let debug = format!("{unsafe_record:?}");
+    let state = unsafe_record.next_state().as_bytes();
+    for forbidden in [
+        "/Users/alice/key",
+        "token=SECRET",
+        "Bearer ",
+        "sk-ant-",
+        "api_key",
+    ] {
+        assert!(!event.contains(forbidden));
+        assert!(!debug.contains(forbidden));
+        assert!(
+            !state
+                .windows(forbidden.len())
+                .any(|window| window == forbidden.as_bytes())
+        );
+    }
+}
+
+#[test]
+fn legacy_context_hash_state_is_accepted_and_not_reemitted() {
+    let mut legacy = DecoderState::default();
+    legacy
+        .replace(
+            br#"{"unresolved_tools":[],"last_human_turn":null,"last_context_hash":"LEGACY_PRIVATE_HASH"}"#
+                .to_vec(),
+        )
+        .unwrap();
+    let decoded = decode_one(
+        r#"{"type":"system","uuid":"legacy","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","cwd":"/fixture/project"}"#,
+        &legacy,
+    )
+    .unwrap();
+    assert!(
+        decoded
+            .events()
+            .iter()
+            .filter(|event| matches!(event.payload(), EventPayload::SessionContextChanged { .. }))
+            .count()
+            <= 1
+    );
+    assert!(
+        !decoded
+            .next_state()
+            .as_bytes()
+            .windows("LEGACY_PRIVATE_HASH".len())
+            .any(|window| window == b"LEGACY_PRIVATE_HASH")
+    );
+}
+
+#[test]
 fn unknown_fields_are_bounded_and_only_shape_changes_schema_fingerprint() {
     let field = "f".repeat(4096);
     let one = decode_one(
@@ -651,7 +784,53 @@ fn multi_block_hash_matches_exact_joined_evidence_bytes() {
 }
 
 #[test]
-fn shared_projection_budget_stops_before_sixty_four_full_captures() {
+fn aggregate_text_over_inline_limit_preserves_message_hash_and_tool_action() {
+    let first = "a".repeat(40 * 1024);
+    let second = "b".repeat(40 * 1024);
+    let joined = format!("{first}\n{second}");
+    let decoded = decode_one(
+        &format!(
+            r#"{{"type":"assistant","uuid":"large-joined","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{{"content":[{{"type":"text","text":"{first}"}},{{"type":"tool_use","id":"kept-action","name":"Read","input":{{}}}},{{"type":"text","text":"{second}"}}]}}}}"#
+        ),
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let message = decoded
+        .events()
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::MessageCreated { content } => Some(content),
+            _ => None,
+        })
+        .unwrap();
+    assert!(message.is_truncated());
+    assert_eq!(message.byte_length(), joined.len() as u64);
+    assert_eq!(
+        message.hash(),
+        blake3::hash(joined.as_bytes()).to_hex().as_str()
+    );
+    assert!(
+        !decoded
+            .evidence()
+            .iter()
+            .any(|evidence| &evidence.content == message)
+    );
+    assert!(decoded.events().iter().any(|event| matches!(
+        event.payload(),
+        EventPayload::ActionRequested { native_action_id, .. }
+            if native_action_id == "kept-action"
+    )));
+    assert!(
+        decoded
+            .next_state()
+            .as_bytes()
+            .windows("kept-action".len())
+            .any(|window| window == b"kept-action")
+    );
+}
+
+#[test]
+fn sixty_four_full_text_blocks_stream_to_one_truncated_message() {
     let text = "x".repeat(64 * 1024);
     let blocks = (0..64)
         .map(|_| format!(r#"{{"type":"text","text":"{text}"}}"#))
@@ -664,12 +843,74 @@ fn shared_projection_budget_stops_before_sixty_four_full_captures() {
         &DecoderState::default(),
     )
     .unwrap();
-    assert!(decoded.events().is_empty());
+    let EventPayload::MessageCreated { content } = decoded.events()[0].payload() else {
+        panic!("expected message");
+    };
+    let mut hasher = blake3::Hasher::new();
+    for index in 0..64 {
+        if index > 0 {
+            hasher.update(b"\n");
+        }
+        hasher.update(text.as_bytes());
+    }
+    assert_eq!(content.hash(), hasher.finalize().to_hex().as_str());
+    assert_eq!(content.byte_length(), 64_u64 * 64 * 1024 + 63);
+    assert!(content.is_truncated());
     assert!(decoded.evidence().is_empty());
-    assert!(matches!(
-        decoded.disposition(),
-        DecodeDisposition::Oversized { .. }
+    assert!(matches!(decoded.disposition(), DecodeDisposition::Known));
+}
+
+#[test]
+fn late_top_result_uses_only_the_record_projection_budget_remaining() {
+    let request = decode_one(
+        r#"{"type":"assistant","uuid":"budget-request","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"tool_use","id":"budget-tool","name":"Read","input":{}}]}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let full = "x".repeat(64 * 1024 - 2);
+    let nearly_full = "y".repeat(63 * 1024 - 2);
+    let mut blocks = (0..62)
+        .map(|index| format!(r#"{{"type":"metadata-{index}","input":"{full}"}}"#))
+        .collect::<Vec<_>>();
+    blocks.push(format!(
+        r#"{{"type":"metadata-last","input":"{nearly_full}"}}"#
     ));
+    blocks.push(r#"{"type":"tool_result","tool_use_id":"budget-tool"}"#.to_owned());
+    let top_result = "z".repeat(2 * 1024);
+    let result = decode_one(
+        &format!(
+            r#"{{"type":"user","uuid":"budget-result","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{{"content":[{}]}},"toolUseResult":{{"content":"{top_result}"}}}}"#,
+            blocks.join(",")
+        ),
+        request.next_state(),
+    )
+    .unwrap();
+    let output = result
+        .events()
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::ActionFinished {
+                output: Some(output),
+                ..
+            } => Some(output),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        output.hash(),
+        blake3::hash(top_result.as_bytes()).to_hex().as_str()
+    );
+    assert!(
+        output
+            .redacted_excerpt()
+            .is_some_and(|excerpt| excerpt.len() <= 1024)
+    );
+    assert!(
+        !result
+            .evidence()
+            .iter()
+            .any(|evidence| &evidence.content == output)
+    );
 }
 
 #[test]

@@ -15,6 +15,16 @@ const MAX_EVENT_ID_BYTES: usize = 128;
 const MAX_TOOL_NAME_BYTES: usize = 64;
 const MAX_HASH_BYTES: usize = 128;
 const MAX_PROJECT_PATH_BYTES: usize = 512;
+const SAFE_MODES: &[&str] = &["build", "default", "plan"];
+const SAFE_PERMISSION_MODES: &[&str] = &[
+    "acceptEdits",
+    "bypassPermissions",
+    "default",
+    "delegate",
+    "dontAsk",
+    "plan",
+    "safe",
+];
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -211,11 +221,11 @@ impl ContextSnapshot {
             && self
                 .mode
                 .as_ref()
-                .is_none_or(|value| bounded_identifier(value, MAX_TOOL_NAME_BYTES))
+                .is_none_or(|value| SAFE_MODES.contains(&value.as_str()))
             && self
                 .permission
                 .as_ref()
-                .is_none_or(|value| bounded_identifier(value, MAX_TOOL_NAME_BYTES))
+                .is_none_or(|value| SAFE_PERMISSION_MODES.contains(&value.as_str()))
             && self
                 .branch_hash
                 .as_ref()
@@ -228,6 +238,20 @@ impl ContextSnapshot {
             ))
         }
     }
+}
+
+pub(super) fn canonical_context_mode(value: &str) -> Option<String> {
+    SAFE_MODES
+        .iter()
+        .find(|candidate| **candidate == value)
+        .map(|candidate| (*candidate).to_owned())
+}
+
+pub(super) fn canonical_permission_mode(value: &str) -> Option<String> {
+    SAFE_PERMISSION_MODES
+        .iter()
+        .find(|candidate| **candidate == value)
+        .map(|candidate| (*candidate).to_owned())
 }
 
 impl ToolLink {

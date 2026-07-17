@@ -191,6 +191,36 @@ impl<R: Read> BoundedJsonReader<R> {
         Ok(outcome.matches)
     }
 
+    /// Hashes complete decoded string matches in document order, inserting one
+    /// newline between matches, while retaining only a bounded UTF-8 prefix.
+    pub(crate) fn capture_joined_matches(
+        &mut self,
+        path: &[&str],
+        selected_indices: &[Vec<usize>],
+        limit: usize,
+        max_matches: usize,
+    ) -> Result<Option<SecureCapturedString>, DecodeError> {
+        if limit > MAX_CAPTURE_BYTES
+            || max_matches > agbox_core::limits::MAX_EVENTS_PER_RECORD
+            || selected_indices.len() > max_matches
+        {
+            if !self.parsed {
+                self.parsed = true;
+                if let Err(terminal_error) = self.input.drain_to_terminal() {
+                    return Err(DecodeError::Io(terminal_error));
+                }
+            }
+            return Err(DecodeError::OutputTooLarge);
+        }
+        let outcome = self.parse_selected(
+            path,
+            SelectionMode::JoinedMatches { max_matches },
+            limit,
+            selected_indices,
+        )?;
+        Ok(outcome.joined)
+    }
+
     /// Captures complete selected JSON values as bounded raw JSON prefixes.
     /// Hash and byte length cover the whole selected value, including
     /// structured objects or arrays.
@@ -237,12 +267,28 @@ impl<R: Read> BoundedJsonReader<R> {
         mode: SelectionMode,
         selection_limit: usize,
     ) -> Result<ParseOutcome, DecodeError> {
+        self.parse_selected(path, mode, selection_limit, &[])
+    }
+
+    fn parse_selected(
+        &mut self,
+        path: &[&str],
+        mode: SelectionMode,
+        selection_limit: usize,
+        selected_indices: &[Vec<usize>],
+    ) -> Result<ParseOutcome, DecodeError> {
         if self.parsed {
             return Err(DecodeError::Malformed("already-consumed".to_owned()));
         }
         self.parsed = true;
         let parsed = {
-            let mut parser = Parser::new(&mut self.input, path, mode, selection_limit);
+            let mut parser = Parser::new(
+                &mut self.input,
+                path,
+                mode,
+                selection_limit,
+                selected_indices,
+            );
             parser.parse_value(0, Some(0)).and_then(|()| {
                 parser.input.skip_whitespace()?;
                 if parser.input.peek_byte()?.is_some() {
@@ -275,6 +321,10 @@ impl<R: Read> BoundedJsonReader<R> {
                 };
                 total.checked_add(bytes)
             })
+            .ok_or(DecodeError::OutputTooLarge)?;
+        self.retained_bytes = self
+            .retained_bytes
+            .checked_add(outcome.joined.as_ref().map_or(0, |value| value.bytes.len()))
             .ok_or(DecodeError::OutputTooLarge)?;
         self.schema_fingerprint = Some(outcome.schema_fingerprint.clone());
         Ok(outcome)
@@ -389,12 +439,16 @@ enum SelectionMode {
         max_matches: usize,
         max_retained_bytes: usize,
     },
+    JoinedMatches {
+        max_matches: usize,
+    },
 }
 
 struct ParseOutcome {
     string: Option<CapturedString>,
     scalar: Option<Vec<u8>>,
     matches: Vec<CapturedMatch>,
+    joined: Option<SecureCapturedString>,
     schema_fingerprint: String,
 }
 
@@ -408,6 +462,9 @@ struct Parser<'a, R: Read> {
     scalar: Option<Vec<u8>>,
     matches: Vec<CapturedMatch>,
     array_indices: Vec<usize>,
+    selected_indices: &'a [Vec<usize>],
+    joined: Option<StringAccumulator>,
+    joined_matches: usize,
     schema: blake3::Hasher,
 }
 
@@ -417,6 +474,7 @@ impl<'a, R: Read> Parser<'a, R> {
         path: &'a [&'a str],
         mode: SelectionMode,
         selection_limit: usize,
+        selected_indices: &'a [Vec<usize>],
     ) -> Self {
         let mut schema = blake3::Hasher::new();
         schema.update(b"agbox-schema-v1");
@@ -430,15 +488,33 @@ impl<'a, R: Read> Parser<'a, R> {
             scalar: None,
             matches: Vec::new(),
             array_indices: Vec::new(),
+            selected_indices,
+            joined: matches!(mode, SelectionMode::JoinedMatches { .. })
+                .then(|| StringAccumulator::new(selection_limit)),
+            joined_matches: 0,
             schema,
         }
     }
 
-    fn finish(self) -> ParseOutcome {
+    fn finish(mut self) -> ParseOutcome {
+        let joined = if self.joined_matches == 0 {
+            None
+        } else {
+            self.joined.take().map(|accumulator| {
+                let mut value = accumulator.finish();
+                SecureCapturedString {
+                    bytes: Zeroizing::new(value.take_prefix()),
+                    total_bytes: value.total,
+                    hash: value.take_hash(),
+                    truncated: value.truncated,
+                }
+            })
+        };
         ParseOutcome {
             string: self.string,
             scalar: self.scalar,
             matches: self.matches,
+            joined,
             schema_fingerprint: self.schema.finalize().to_hex().to_string(),
         }
     }
@@ -450,19 +526,33 @@ impl<'a, R: Read> Parser<'a, R> {
     ) -> Result<(), DecodeError> {
         self.input.skip_whitespace()?;
         let matches_selected_path = matching_path_index == Some(self.path.len());
+        let matches_selected_index = self.selected_indices.is_empty()
+            || self
+                .selected_indices
+                .iter()
+                .any(|indices| indices == &self.array_indices);
         if self.selected
             && matches_selected_path
-            && !matches!(self.mode, SelectionMode::Matches { .. })
+            && matches_selected_index
+            && !matches!(
+                self.mode,
+                SelectionMode::Matches { .. }
+                    | SelectionMode::RawMatches { .. }
+                    | SelectionMode::JoinedMatches { .. }
+            )
         {
             return Err(DecodeError::Malformed(
                 "duplicate-selected-field".to_owned(),
             ));
         }
         let selected_here = matches_selected_path
+            && matches_selected_index
             && (!self.selected
                 || matches!(
                     self.mode,
-                    SelectionMode::Matches { .. } | SelectionMode::RawMatches { .. }
+                    SelectionMode::Matches { .. }
+                        | SelectionMode::RawMatches { .. }
+                        | SelectionMode::JoinedMatches { .. }
                 ));
         if selected_here
             && let SelectionMode::RawMatches {
@@ -631,6 +721,26 @@ impl<'a, R: Read> Parser<'a, R> {
 
     fn parse_string_value(&mut self, selected_here: bool) -> Result<(), DecodeError> {
         self.schema.update(b"S");
+        if selected_here && let SelectionMode::JoinedMatches { max_matches } = self.mode {
+            if self.joined_matches == max_matches {
+                return Err(DecodeError::OutputTooLarge);
+            }
+            let mut joined = self
+                .joined
+                .take()
+                .ok_or_else(|| DecodeError::Malformed("joined-selection-state".to_owned()))?;
+            if self.joined_matches > 0 {
+                joined.push(b"\n")?;
+            }
+            self.parse_string_into(&mut joined)?;
+            self.joined = Some(joined);
+            self.joined_matches = self
+                .joined_matches
+                .checked_add(1)
+                .ok_or(DecodeError::OutputTooLarge)?;
+            self.selected = true;
+            return Ok(());
+        }
         let capture_limit = if selected_here {
             Some(match self.mode {
                 SelectionMode::Matches {
@@ -677,6 +787,9 @@ impl<'a, R: Read> Parser<'a, R> {
             SelectionMode::RawMatches { .. } => {
                 return Err(DecodeError::Malformed("raw-selection-state".to_owned()));
             }
+            SelectionMode::JoinedMatches { .. } => {
+                return Err(DecodeError::Malformed("joined-selection-state".to_owned()));
+            }
         }
         Ok(())
     }
@@ -697,7 +810,7 @@ impl<'a, R: Read> Parser<'a, R> {
         if selected_here {
             self.selected = true;
             match self.mode {
-                SelectionMode::String => {
+                SelectionMode::String | SelectionMode::JoinedMatches { .. } => {
                     return Err(DecodeError::Malformed("selected-non-string".to_owned()));
                 }
                 SelectionMode::Scalar => {
@@ -748,7 +861,7 @@ impl<'a, R: Read> Parser<'a, R> {
         if let Some(bytes) = selected_bytes {
             self.selected = true;
             match self.mode {
-                SelectionMode::String => {
+                SelectionMode::String | SelectionMode::JoinedMatches { .. } => {
                     return Err(DecodeError::Malformed("selected-non-string".to_owned()));
                 }
                 SelectionMode::Scalar => {
@@ -779,7 +892,9 @@ impl<'a, R: Read> Parser<'a, R> {
             | SelectionMode::RawMatches {
                 max_retained_bytes, ..
             } => max_retained_bytes,
-            SelectionMode::String | SelectionMode::Scalar => usize::MAX,
+            SelectionMode::String | SelectionMode::Scalar | SelectionMode::JoinedMatches { .. } => {
+                usize::MAX
+            }
         };
         let value_bytes = match &value {
             CapturedValue::String(value) => value.bytes.len(),
@@ -812,13 +927,21 @@ impl<'a, R: Read> Parser<'a, R> {
     }
 
     fn parse_string(&mut self, capture_limit: usize) -> Result<StringInfo, DecodeError> {
-        self.input.expect(b'"')?;
         let mut accumulator = StringAccumulator::new(capture_limit);
+        self.parse_string_into(&mut accumulator)?;
+        Ok(accumulator.finish())
+    }
+
+    fn parse_string_into(
+        &mut self,
+        accumulator: &mut StringAccumulator,
+    ) -> Result<(), DecodeError> {
+        self.input.expect(b'"')?;
         loop {
             let byte = self.input.required_byte()?;
             match byte {
-                b'"' => return Ok(accumulator.finish()),
-                b'\\' => self.parse_escape(&mut accumulator)?,
+                b'"' => return Ok(()),
+                b'\\' => self.parse_escape(accumulator)?,
                 0x00..=0x1f => {
                     return Err(DecodeError::Malformed("string-control".to_owned()));
                 }
