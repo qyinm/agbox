@@ -7,6 +7,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 use crate::{
@@ -62,12 +65,19 @@ pub(crate) fn open_writer(path: &Path) -> Result<OpenedWriter, StoreError> {
     let wal_name = sidecar_name(name, "-wal");
     let shm_name = sidecar_name(name, "-shm");
 
-    validate_optional_owner_file(&directory, name)?;
+    let database_exists = owner_file_exists(&directory, name)?;
     validate_optional_owner_file(&directory, &wal_name)?;
     validate_optional_owner_file(&directory, &shm_name)?;
-    ensure_owner_file(&directory, name)?;
 
     let database_path = canonical_parent.join(name);
+    let version = if database_exists {
+        validate_existing_database(&database_path)?;
+        1
+    } else {
+        ensure_owner_file(&directory, name)?;
+        0
+    };
+
     let mut connection = Connection::open_with_flags(
         database_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -76,14 +86,6 @@ pub(crate) fn open_writer(path: &Path) -> Result<OpenedWriter, StoreError> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     connection.busy_timeout(Duration::from_secs(5))?;
-
-    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version != 0 && version != 1 {
-        return Err(StoreError::UnsupportedSchema(version));
-    }
-    if version == 1 {
-        validate_v1_schema(&connection)?;
-    }
 
     // Reserve SQLite's sidecar names through the held directory descriptor.
     // SQLite then opens owner-only regular files instead of creating them by
@@ -106,6 +108,7 @@ pub(crate) fn open_writer(path: &Path) -> Result<OpenedWriter, StoreError> {
             [],
         )?;
         transaction.commit()?;
+        checkpoint_schema_contract(&connection)?;
         validate_v1_schema(&connection)?;
     }
 
@@ -117,6 +120,63 @@ pub(crate) fn open_writer(path: &Path) -> Result<OpenedWriter, StoreError> {
         connection,
         directory,
     })
+}
+
+fn validate_existing_database(path: &Path) -> Result<(), StoreError> {
+    // Schema DDL, migration markers, and user_version are checkpointed into
+    // the main database before a newly initialized writer is returned.
+    // Runtime WAL traffic is DML-only, so immutable mode can validate the
+    // stable schema contract without recovery or WAL-index writes. Every
+    // future schema migration must preserve this checkpoint boundary.
+    let connection = Connection::open_with_flags(
+        immutable_database_uri(path),
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match version {
+        1 => validate_v1_schema(&connection),
+        0 => Err(StoreError::IncompatibleSchema),
+        unsupported => Err(StoreError::UnsupportedSchema(unsupported)),
+    }
+}
+
+fn checkpoint_schema_contract(connection: &Connection) -> Result<(), StoreError> {
+    let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+        connection.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    if busy == 0 && log_frames == checkpointed_frames {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::InvalidQuery.into())
+    }
+}
+
+fn immutable_database_uri(path: &Path) -> String {
+    #[cfg(unix)]
+    let bytes = path.as_os_str().as_bytes();
+    #[cfg(not(unix))]
+    let path_text = path.to_string_lossy();
+    #[cfg(not(unix))]
+    let bytes = path_text.as_bytes();
+
+    let mut uri = String::with_capacity(bytes.len().saturating_mul(3).saturating_add(17));
+    uri.push_str("file:");
+    for byte in bytes {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~') {
+            uri.push(char::from(*byte));
+        } else {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            uri.push('%');
+            uri.push(char::from(HEX[usize::from(byte >> 4)]));
+            uri.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    uri.push_str("?immutable=1");
+    uri
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -139,7 +199,7 @@ fn v1_schema_is_compatible(connection: &Connection) -> rusqlite::Result<bool> {
     let mut table_statement = connection.prepare(
         "SELECT name
          FROM sqlite_schema
-         WHERE type IN ('table', 'view')",
+         WHERE type = 'table'",
     )?;
     let tables: HashSet<String> = table_statement
         .query_map([], |row| row.get(0))?
@@ -232,6 +292,14 @@ fn validate_optional_owner_file(directory: &File, name: &OsStr) -> Result<(), io
     match validate_owner_file(directory, name) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn owner_file_exists(directory: &File, name: &OsStr) -> Result<bool, io::Error> {
+    match validate_owner_file(directory, name) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
 }

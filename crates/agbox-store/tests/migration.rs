@@ -7,9 +7,31 @@ use std::{
 };
 
 #[cfg(feature = "test-support")]
-use agbox_store::{MemoryKeyProvider, StoreRuntime};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+#[cfg(feature = "test-support")]
+use agbox_store::{CryptoError, KeyProvider, MemoryKeyProvider, StoreRuntime};
 use agbox_store::{Store, StoreError};
 use rusqlite::{Connection, params};
+#[cfg(feature = "test-support")]
+use zeroize::Zeroizing;
+
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+struct CountingKeyProvider {
+    calls: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "test-support")]
+impl KeyProvider for CountingKeyProvider {
+    fn master_key(&self) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Zeroizing::new([37_u8; 32]))
+    }
+}
 
 #[test]
 fn creates_v2_schema_without_touching_legacy_db() {
@@ -52,7 +74,27 @@ fn creates_v2_schema_without_touching_legacy_db() {
     ] {
         assert!(store.table_exists(table).unwrap(), "missing {table}");
     }
-    let connection = Connection::open(home.path().join("state.db")).unwrap();
+    let connection = Connection::open_with_flags(
+        format!(
+            "file:{}?immutable=1",
+            home.path()
+                .canonicalize()
+                .unwrap()
+                .join("state.db")
+                .display()
+        ),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
     let manifest_column: (String, i64) = connection
         .query_row(
             "SELECT type, \"notnull\"
@@ -100,6 +142,20 @@ fn rejects_an_unsupported_schema_version_without_migrating_it() {
 }
 
 #[test]
+fn reopens_a_database_whose_canonical_path_needs_uri_percent_encoding() {
+    let home = tempfile::tempdir().unwrap();
+    set_mode(home.path(), 0o700);
+    let database = home.path().join("state ?#%.db");
+
+    let store = Store::open_new(&database).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 1);
+    drop(store);
+
+    let reopened = Store::open_new(&database).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 1);
+}
+
+#[test]
 fn rejects_an_earlier_pre_manifest_v1_without_mutating_it() {
     let home = tempfile::tempdir().unwrap();
     set_mode(home.path(), 0o700);
@@ -123,11 +179,31 @@ fn rejects_an_earlier_pre_manifest_v1_without_mutating_it() {
     assert_pre_manifest_v1_unchanged(&database);
 }
 
+#[test]
+fn rejects_an_existing_v0_with_restored_sidecars_without_reinitializing_it() {
+    let home = tempfile::tempdir().unwrap();
+    set_mode(home.path(), 0o700);
+    let database = home.path().join("state.db");
+    restore_v0_with_crash_left_wal_snapshot(&database);
+    let wal = home.path().join("state.db-wal");
+    let shm = home.path().join("state.db-shm");
+    let snapshots = [&database, &wal, &shm].map(|path| snapshot_file(path));
+
+    let error = Store::open_new(&database).unwrap_err();
+
+    assert!(matches!(error, StoreError::IncompatibleSchema));
+    for (path, snapshot) in [&database, &wal, &shm].into_iter().zip(snapshots) {
+        assert!(
+            snapshot_file(path) == snapshot,
+            "{} changed while rejecting existing v0",
+            path.display()
+        );
+    }
+}
+
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn runtime_rejects_an_earlier_pre_manifest_v1_before_sidecar_or_key_startup() {
-    use std::sync::Arc;
-
     let home = tempfile::tempdir().unwrap();
     set_mode(home.path(), 0o700);
     let database = home.path().join("state.db");
@@ -146,6 +222,63 @@ async fn runtime_rejects_an_earlier_pre_manifest_v1_before_sidecar_or_key_startu
     assert!(!home.path().join("state.db-wal").exists());
     assert!(!home.path().join("state.db-shm").exists());
     assert_pre_manifest_v1_unchanged(&database);
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn runtime_rejects_incompatible_v1_without_touching_restored_live_wal_snapshot_or_keys() {
+    let home = tempfile::tempdir().unwrap();
+    set_mode(home.path(), 0o700);
+    let database = home.path().join("state.db");
+    create_pre_manifest_v1(&database);
+    restore_crash_left_wal_snapshot(&database);
+    let wal = home.path().join("state.db-wal");
+    let shm = home.path().join("state.db-shm");
+    let snapshots = [&database, &wal, &shm].map(|path| snapshot_file(path));
+    let key_calls = Arc::new(AtomicUsize::new(0));
+
+    let error = StoreRuntime::start_with_key_provider(
+        &database,
+        Arc::new(CountingKeyProvider {
+            calls: Arc::clone(&key_calls),
+        }),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, StoreError::IncompatibleSchema));
+    assert_eq!(key_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        format!("{error:?}"),
+        "StoreError { kind: \"IncompatibleSchema\" }"
+    );
+    assert_eq!(
+        error.to_string(),
+        "database schema is incompatible with this runtime"
+    );
+    for (path, snapshot) in [&database, &wal, &shm].into_iter().zip(snapshots) {
+        assert!(
+            snapshot_file(path) == snapshot,
+            "{} changed during incompatible-schema rejection",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn rejects_a_view_spoofing_a_required_v1_table() {
+    let home = tempfile::tempdir().unwrap();
+    set_mode(home.path(), 0o700);
+    let database = home.path().join("state.db");
+    create_v1_with_required_table_replaced_by_view(&database);
+    let bytes_before = fs::read(&database).unwrap();
+
+    let error = Store::open_new(&database).unwrap_err();
+
+    assert!(matches!(error, StoreError::IncompatibleSchema));
+    assert_eq!(fs::read(&database).unwrap(), bytes_before);
+    assert!(!home.path().join("state.db-wal").exists());
+    assert!(!home.path().join("state.db-shm").exists());
 }
 
 #[test]
@@ -340,6 +473,110 @@ fn create_pre_manifest_v1(path: &Path) {
         .unwrap();
     drop(connection);
     set_mode(path, 0o600);
+}
+
+fn restore_crash_left_wal_snapshot(path: &Path) {
+    let connection = Connection::open(path).unwrap();
+    let journal_mode: String = connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_mode, "delete");
+    let journal_mode: String = connection
+        .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_mode, "wal");
+    connection
+        .pragma_update(None, "wal_autocheckpoint", 0)
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO projects(
+                 project_id, repository_identity, encrypted_root_path, created_at, updated_at
+             ) VALUES ('wal_project', 'wal_repository', X'00', 'created', 'updated')",
+            [],
+        )
+        .unwrap();
+    assert!(path.with_file_name("state.db-wal").is_file());
+    assert!(path.with_file_name("state.db-shm").is_file());
+    for sidecar in [
+        path,
+        path.with_file_name("state.db-wal").as_path(),
+        path.with_file_name("state.db-shm").as_path(),
+    ] {
+        set_mode(sidecar, 0o600);
+    }
+    let wal = path.with_file_name("state.db-wal");
+    let shm = path.with_file_name("state.db-shm");
+    let snapshots = [path, wal.as_path(), shm.as_path()].map(snapshot_file);
+    drop(connection);
+    for (file, (bytes, mode)) in [path, wal.as_path(), shm.as_path()]
+        .into_iter()
+        .zip(snapshots)
+    {
+        fs::write(file, bytes).unwrap();
+        set_mode(file, mode);
+    }
+}
+
+fn restore_v0_with_crash_left_wal_snapshot(path: &Path) {
+    let connection = Connection::open(path).unwrap();
+    let journal_mode: String = connection
+        .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_mode, "wal");
+    connection
+        .pragma_update(None, "wal_autocheckpoint", 0)
+        .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE unfinished(value TEXT);
+             INSERT INTO unfinished(value) VALUES ('not-a-v1-schema');",
+        )
+        .unwrap();
+    let wal = path.with_file_name("state.db-wal");
+    let shm = path.with_file_name("state.db-shm");
+    for file in [path, wal.as_path(), shm.as_path()] {
+        set_mode(file, 0o600);
+    }
+    let snapshots = [path, wal.as_path(), shm.as_path()].map(snapshot_file);
+    drop(connection);
+    for (file, (bytes, mode)) in [path, wal.as_path(), shm.as_path()]
+        .into_iter()
+        .zip(snapshots)
+    {
+        fs::write(file, bytes).unwrap();
+        set_mode(file, mode);
+    }
+}
+
+fn create_v1_with_required_table_replaced_by_view(path: &Path) {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(include_str!("../src/schema/0001_initial.sql"))
+        .unwrap();
+    connection
+        .execute_batch(
+            "DROP INDEX action_facts_project_input;
+             DROP TABLE action_facts;
+             CREATE VIEW action_facts AS SELECT project_id FROM projects;",
+        )
+        .unwrap();
+    connection.pragma_update(None, "user_version", 1).unwrap();
+    connection
+        .execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (1, 'view-spoof')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    set_mode(path, 0o600);
+}
+
+fn snapshot_file(path: &Path) -> (Vec<u8>, u32) {
+    (
+        fs::read(path).unwrap(),
+        fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+    )
 }
 
 fn assert_pre_manifest_v1_unchanged(path: &Path) {
