@@ -447,3 +447,373 @@ fn known_agents_and_finished_agents_are_opaque_historical_bounded_sets() {
             .any(|agent| *agent == terminal_state["finished_agents"][0]["agent_id"])
     );
 }
+
+#[test]
+fn retained_finished_marker_suppresses_restart_after_known_history_eviction() {
+    let started = decode_one(
+        r#"{"type":"assistant","uuid":"lifecycle-a-start","sessionId":"session-lifecycle-retained","timestamp":"2026-07-17T10:00:00Z","agentId":"lifecycle-a","message":{"content":[]}}"#,
+        &DecoderState::default(),
+    );
+    let agent_id = started
+        .events()
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::AgentStarted { native_agent_id } => Some(native_agent_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let finished = decode_one(
+        r#"{"type":"result","subtype":"success","uuid":"lifecycle-a-finish","sessionId":"session-lifecycle-retained","timestamp":"2026-07-17T10:00:01Z","agentId":"lifecycle-a"}"#,
+        started.next_state(),
+    );
+
+    let mut state = finished.next_state().clone();
+    for index in 0..128 {
+        let decoded = decode_one(
+            &format!(
+                r#"{{"type":"assistant","uuid":"lifecycle-pressure-{index}","sessionId":"session-lifecycle-retained","timestamp":"2026-07-17T10:00:02Z","agentId":"lifecycle-pressure-{index}","message":{{"content":[]}}}}"#
+            ),
+            &state,
+        );
+        state = decoded.next_state().clone();
+    }
+
+    let bounded: serde_json::Value = serde_json::from_slice(state.as_bytes()).unwrap();
+    assert!(
+        !bounded["known_agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|known| known == &agent_id)
+    );
+    assert!(
+        bounded["finished_agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finished| finished["agent_id"] == agent_id)
+    );
+
+    let resighted = decode_one(
+        r#"{"type":"assistant","uuid":"lifecycle-a-resighted","sessionId":"session-lifecycle-retained","timestamp":"2026-07-17T10:00:03Z","agentId":"lifecycle-a","message":{"content":[]}}"#,
+        &state,
+    );
+    assert!(
+        !resighted
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::AgentStarted { .. }))
+    );
+    let replayed_finish = decode_one(
+        r#"{"type":"result","subtype":"failed","uuid":"lifecycle-a-replayed-finish","sessionId":"session-lifecycle-retained","timestamp":"2026-07-17T10:00:04Z","agentId":"lifecycle-a"}"#,
+        resighted.next_state(),
+    );
+    assert!(
+        !replayed_finish
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::AgentFinished { .. }))
+    );
+}
+
+#[test]
+fn unresolved_tool_pressure_does_not_repeat_unretained_agent_starts() {
+    const STATE_BOUND: usize = 32 * 1024;
+
+    let mut links = Vec::new();
+    for index in 0..128 {
+        let candidate = serde_json::json!({
+            "tool_use_id": format!("pending-{index}-{}", "i".repeat(100)),
+            "request_event_id": format!("evt-{index}-{}", "e".repeat(100)),
+            "tool_name": "R".repeat(64),
+            "input_hash": "a".repeat(128),
+            "project_relative_path": null,
+        });
+        links.push(candidate);
+        let encoded = serde_json::to_vec(&serde_json::json!({
+            "unresolved_tools": links,
+            "known_agents": [],
+            "finished_agents": [],
+            "assistant_spawns": [],
+            "last_human_turn": null,
+            "context": {
+                "cwd": null,
+                "mode": null,
+                "permission": null,
+                "branch_hash": null,
+            },
+        }))
+        .unwrap();
+        if encoded.len() > STATE_BOUND {
+            let _ = links.pop();
+            break;
+        }
+    }
+
+    for index in 0..links.len() {
+        for path_bytes in 1..=503 {
+            links[index]["project_relative_path"] =
+                serde_json::Value::String(format!("$PROJECT/{}", "p".repeat(path_bytes)));
+            let encoded = serde_json::to_vec(&serde_json::json!({
+                "unresolved_tools": links,
+                "known_agents": [],
+                "finished_agents": [],
+                "assistant_spawns": [],
+                "last_human_turn": null,
+                "context": {
+                    "cwd": null,
+                    "mode": null,
+                    "permission": null,
+                    "branch_hash": null,
+                },
+            }))
+            .unwrap();
+            if encoded.len() > STATE_BOUND {
+                links[index]["project_relative_path"] = if path_bytes == 1 {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(format!("$PROJECT/{}", "p".repeat(path_bytes - 1)))
+                };
+                break;
+            }
+        }
+    }
+
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "unresolved_tools": links,
+        "known_agents": [],
+        "finished_agents": [],
+        "assistant_spawns": [],
+        "last_human_turn": null,
+        "context": {
+            "cwd": null,
+            "mode": null,
+            "permission": null,
+            "branch_hash": null,
+        },
+    }))
+    .unwrap();
+    assert_eq!(bytes.len(), STATE_BOUND);
+    let mut state = DecoderState::default();
+    state.replace(bytes).unwrap();
+
+    for ordinal in 0..2 {
+        let decoded = decode_one(
+            &format!(
+                r#"{{"type":"assistant","uuid":"unretained-agent-{ordinal}","sessionId":"session-unretained-agent","timestamp":"2026-07-17T11:00:00Z","agentId":"unretained-agent","message":{{"content":[]}}}}"#
+            ),
+            &state,
+        );
+        assert!(
+            !decoded
+                .events()
+                .iter()
+                .any(|event| matches!(event.payload(), EventPayload::AgentStarted { .. }))
+        );
+        state = decoded.next_state().clone();
+    }
+}
+
+#[test]
+fn lifecycle_restarts_only_after_both_bounded_history_markers_are_evicted() {
+    let initial_start = decode_one(
+        r#"{"type":"assistant","uuid":"window-a-start","sessionId":"session-lifecycle-window","timestamp":"2026-07-17T12:00:00Z","agentId":"window-a","message":{"content":[]}}"#,
+        &DecoderState::default(),
+    );
+    let initial_agent_id = initial_start
+        .events()
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::AgentStarted { native_agent_id } => Some(native_agent_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let initial_finish = decode_one(
+        r#"{"type":"result","subtype":"success","uuid":"window-a-finish","sessionId":"session-lifecycle-window","timestamp":"2026-07-17T12:00:01Z","agentId":"window-a"}"#,
+        initial_start.next_state(),
+    );
+    let mut state = initial_finish.next_state().clone();
+
+    for index in 0..129 {
+        let start = decode_one(
+            &format!(
+                r#"{{"type":"assistant","uuid":"window-pressure-start-{index}","sessionId":"session-lifecycle-window","timestamp":"2026-07-17T12:00:02Z","agentId":"window-pressure-{index}","message":{{"content":[]}}}}"#
+            ),
+            &state,
+        );
+        let finish = decode_one(
+            &format!(
+                r#"{{"type":"result","subtype":"success","uuid":"window-pressure-finish-{index}","sessionId":"session-lifecycle-window","timestamp":"2026-07-17T12:00:03Z","agentId":"window-pressure-{index}"}}"#
+            ),
+            start.next_state(),
+        );
+        state = finish.next_state().clone();
+    }
+
+    let evicted: serde_json::Value = serde_json::from_slice(state.as_bytes()).unwrap();
+    assert!(
+        !evicted["known_agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|known| known == &initial_agent_id)
+    );
+    assert!(
+        !evicted["finished_agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finished| finished["agent_id"] == initial_agent_id)
+    );
+
+    let finish_without_resight = decode_one(
+        r#"{"type":"result","subtype":"failed","uuid":"window-a-stale-finish","sessionId":"session-lifecycle-window","timestamp":"2026-07-17T12:00:04Z","agentId":"window-a"}"#,
+        &state,
+    );
+    assert!(
+        !finish_without_resight
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::AgentFinished { .. }))
+    );
+
+    let restarted = decode_one(
+        r#"{"type":"assistant","uuid":"window-a-restart","sessionId":"session-lifecycle-window","timestamp":"2026-07-17T12:00:05Z","agentId":"window-a","message":{"content":[]}}"#,
+        finish_without_resight.next_state(),
+    );
+    assert!(
+        restarted
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::AgentStarted { .. }))
+    );
+    let refinished = decode_one(
+        r#"{"type":"result","subtype":"success","uuid":"window-a-refinish","sessionId":"session-lifecycle-window","timestamp":"2026-07-17T12:00:06Z","agentId":"window-a"}"#,
+        restarted.next_state(),
+    );
+    assert!(
+        refinished
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::AgentFinished { .. }))
+    );
+}
+
+#[test]
+fn finished_history_eviction_allows_one_bounded_window_reclose() {
+    let mut state = DecoderState::default();
+    for index in 0..127 {
+        let started = decode_one(
+            &format!(
+                r#"{{"type":"assistant","uuid":"reclose-older-start-{index}","sessionId":"session-reclose-window","timestamp":"2026-07-17T12:30:00Z","agentId":"reclose-older-{index}","message":{{"content":[]}}}}"#
+            ),
+            &state,
+        );
+        state = started.next_state().clone();
+    }
+    let target_start = decode_one(
+        r#"{"type":"assistant","uuid":"reclose-target-start","sessionId":"session-reclose-window","timestamp":"2026-07-17T12:30:01Z","agentId":"reclose-target","message":{"content":[]}}"#,
+        &state,
+    );
+    let target_agent_id = target_start
+        .events()
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::AgentStarted { native_agent_id } => Some(native_agent_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let target_finish = decode_one(
+        r#"{"type":"result","subtype":"success","uuid":"reclose-target-finish","sessionId":"session-reclose-window","timestamp":"2026-07-17T12:30:02Z","agentId":"reclose-target"}"#,
+        target_start.next_state(),
+    );
+    state = target_finish.next_state().clone();
+
+    for index in 0..127 {
+        let finished = decode_one(
+            &format!(
+                r#"{{"type":"result","subtype":"success","uuid":"reclose-older-finish-{index}","sessionId":"session-reclose-window","timestamp":"2026-07-17T12:30:03Z","agentId":"reclose-older-{index}"}}"#
+            ),
+            &state,
+        );
+        state = finished.next_state().clone();
+    }
+    let pressure_start = decode_one(
+        r#"{"type":"assistant","uuid":"reclose-pressure-start","sessionId":"session-reclose-window","timestamp":"2026-07-17T12:30:04Z","agentId":"reclose-pressure","message":{"content":[]}}"#,
+        &state,
+    );
+    let pressure_finish = decode_one(
+        r#"{"type":"result","subtype":"success","uuid":"reclose-pressure-finish","sessionId":"session-reclose-window","timestamp":"2026-07-17T12:30:05Z","agentId":"reclose-pressure"}"#,
+        pressure_start.next_state(),
+    );
+
+    let evicted: serde_json::Value =
+        serde_json::from_slice(pressure_finish.next_state().as_bytes()).unwrap();
+    assert!(
+        evicted["known_agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|known| known == &target_agent_id)
+    );
+    assert!(
+        !evicted["finished_agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finished| finished["agent_id"] == target_agent_id)
+    );
+
+    let reclosed = decode_one(
+        r#"{"type":"result","subtype":"failed","uuid":"reclose-target-again","sessionId":"session-reclose-window","timestamp":"2026-07-17T12:30:06Z","agentId":"reclose-target"}"#,
+        pressure_finish.next_state(),
+    );
+    assert!(
+        reclosed
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::AgentFinished { .. }))
+    );
+    let replay = decode_one(
+        r#"{"type":"result","subtype":"cancelled","uuid":"reclose-target-replay","sessionId":"session-reclose-window","timestamp":"2026-07-17T12:30:07Z","agentId":"reclose-target"}"#,
+        reclosed.next_state(),
+    );
+    assert!(
+        !replay
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::AgentFinished { .. }))
+    );
+}
+
+#[test]
+fn assistant_error_validation_drains_both_locations_before_emitting() {
+    let pending = decode_one(
+        r#"{"type":"assistant","uuid":"error-validation-request","sessionId":"session-error-validation","timestamp":"2026-07-17T13:00:00Z","message":{"content":[{"type":"tool_use","id":"rollback-tool","name":"Read","input":{"path":"src/lib.rs"}}]}}"#,
+        &DecoderState::default(),
+    );
+    let oversized_nested = "x".repeat(129);
+    let invalid_records = [
+        r#"{"type":"assistant","uuid":"error-duplicate-nested","sessionId":"session-error-validation","timestamp":"2026-07-17T13:00:01Z","error":"top","message":{"error":"nested-one","error":"nested-two","content":[]}}"#.to_owned(),
+        r#"{"type":"assistant","uuid":"error-container-nested","sessionId":"session-error-validation","timestamp":"2026-07-17T13:00:02Z","error":"top","message":{"error":{"code":"nested"},"content":[]}}"#.to_owned(),
+        format!(
+            r#"{{"type":"assistant","uuid":"error-oversized-nested","sessionId":"session-error-validation","timestamp":"2026-07-17T13:00:03Z","error":"top","message":{{"error":"{oversized_nested}","content":[]}}}}"#
+        ),
+    ];
+
+    for invalid in invalid_records {
+        let error = try_decode(&invalid, pending.next_state()).unwrap_err();
+        assert!(matches!(error, DecodeError::Malformed(_)));
+
+        let recovery = decode_one(
+            r#"{"type":"user","uuid":"error-validation-recovery","sessionId":"session-error-validation","timestamp":"2026-07-17T13:00:04Z","message":{"content":[{"type":"tool_result","tool_use_id":"rollback-tool","content":"ok","is_error":false}]}}"#,
+            pending.next_state(),
+        );
+        assert!(
+            recovery
+                .events()
+                .iter()
+                .any(|event| matches!(event.payload(), EventPayload::ActionFinished { .. }))
+        );
+    }
+}

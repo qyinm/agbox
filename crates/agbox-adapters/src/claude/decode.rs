@@ -390,7 +390,11 @@ fn decode_activity_record(
         spawn_request_event_id: spawn_request_event_id.as_deref(),
     };
     let decoded = (|| {
-        emit_agent_starts(scope, &graph.agent_ids, &mut state, &mut output)?;
+        // Terminal records may close retained starts, but never manufacture a
+        // new lifecycle after the bounded start history has expired.
+        if native_type != "result" {
+            emit_agent_starts(scope, &graph.agent_ids, &mut state, &mut output)?;
+        }
         if graph.is_sidechain {
             emit_diagnostic(
                 scope,
@@ -873,7 +877,7 @@ fn emit_agent_starts(
     output: &mut Output,
 ) -> Result<(), DecodeError> {
     for (index, agent_id) in agent_ids.iter().enumerate() {
-        if !state.observe_agent(agent_id.clone())? {
+        if !state.observe_agent(agent_id)? {
             continue;
         }
         let ordinal = 300_u32
@@ -1027,6 +1031,7 @@ fn decode_result(record: &dyn RecordSource) -> Result<Option<ActionOutcome>, Dec
 }
 
 fn assistant_error_present(record: &dyn RecordSource) -> Result<bool, DecodeError> {
+    let mut positive_locations = 0_u8;
     for path in [&["error"][..], &["message", "error"][..]] {
         let matches = capture_matches_bounded(record, path, MAX_ID_BYTES, MAX_ID_BYTES * 2)?;
         if matches.len() > 1 {
@@ -1035,18 +1040,32 @@ fn assistant_error_present(record: &dyn RecordSource) -> Result<bool, DecodeErro
             ));
         }
         if let Some(captured) = matches.into_iter().next() {
-            match captured.value {
-                CapturedValue::String(value) if value.total_bytes > 0 => return Ok(true),
-                CapturedValue::String(_) => {}
-                CapturedValue::Scalar(value) if value == "true" => return Ok(true),
-                CapturedValue::Scalar(value) if matches!(value.as_str(), "false" | "null") => {}
+            let present = match captured.value {
+                CapturedValue::String(value)
+                    if value.truncated || value.total_bytes > MAX_ID_BYTES as u64 =>
+                {
+                    return Err(DecodeError::Malformed(
+                        "oversized-assistant-error".to_owned(),
+                    ));
+                }
+                CapturedValue::String(value) => value.total_bytes > 0,
+                CapturedValue::Scalar(value) if value == "true" => true,
+                CapturedValue::Scalar(value) if matches!(value.as_str(), "false" | "null") => false,
                 CapturedValue::Scalar(_) | CapturedValue::Container => {
                     return Err(DecodeError::Malformed("invalid-assistant-error".to_owned()));
                 }
+            };
+            if present {
+                positive_locations = positive_locations.saturating_add(1);
             }
         }
     }
-    Ok(false)
+    if positive_locations > 1 {
+        return Err(DecodeError::Malformed(
+            "duplicate-assistant-error".to_owned(),
+        ));
+    }
+    Ok(positive_locations == 1)
 }
 
 fn emit_private_diagnostic(

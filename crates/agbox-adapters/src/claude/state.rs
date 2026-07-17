@@ -156,19 +156,24 @@ impl ClaudeStateV1 {
         self.unresolved_tools.remove(index)
     }
 
-    pub fn observe_agent(&mut self, agent_id: String) -> Result<bool, DecodeError> {
-        if !opaque_graph_identifier(&agent_id) {
+    pub fn observe_agent(&mut self, agent_id: &str) -> Result<bool, DecodeError> {
+        if !opaque_graph_identifier(agent_id) {
             return Err(DecodeError::Malformed("invalid-claude-agent-id".to_owned()));
         }
-        if self.known_agents.iter().any(|known| known == &agent_id) {
+        if self.known_agents.iter().any(|known| known == agent_id)
+            || self
+                .finished_agents
+                .iter()
+                .any(|finished| finished.agent_id == agent_id)
+        {
             return Ok(false);
         }
-        self.known_agents.push_back(agent_id);
+        self.known_agents.push_back(agent_id.to_owned());
         while self.known_agents.len() > MAX_KNOWN_AGENTS {
             let _ = self.known_agents.pop_front();
         }
         self.fit_serialized_bound()?;
-        Ok(true)
+        Ok(self.known_agents.iter().any(|known| known == agent_id))
     }
 
     pub fn finish_agent(
@@ -186,6 +191,9 @@ impl ClaudeStateV1 {
         {
             return Ok(false);
         }
+        if !self.known_agents.iter().any(|known| known == agent_id) {
+            return Ok(false);
+        }
         self.finished_agents.push_back(FinishedAgent {
             agent_id: agent_id.to_owned(),
             outcome,
@@ -194,7 +202,10 @@ impl ClaudeStateV1 {
             let _ = self.finished_agents.pop_front();
         }
         self.fit_serialized_bound()?;
-        Ok(true)
+        Ok(self
+            .finished_agents
+            .iter()
+            .any(|finished| finished.agent_id == agent_id))
     }
 
     pub fn set_assistant_spawn(
