@@ -34,6 +34,8 @@ pub enum StoreError {
     LegacyDatabaseReserved,
     #[error("unsupported database schema version {0}")]
     UnsupportedSchema(i64),
+    #[error("database schema is incompatible with this runtime")]
+    IncompatibleSchema,
     #[error("ingestion batch is invalid")]
     InvalidBatch,
     #[error("content reference ID is not the stable project-scoped ID")]
@@ -65,6 +67,7 @@ impl fmt::Debug for StoreError {
             Self::Serialization(_) => "Serialization",
             Self::LegacyDatabaseReserved => "LegacyDatabaseReserved",
             Self::UnsupportedSchema(_) => "UnsupportedSchema",
+            Self::IncompatibleSchema => "IncompatibleSchema",
             Self::InvalidBatch => "InvalidBatch",
             Self::InvalidContentRefId => "InvalidContentRefId",
             Self::SourceNotFound => "SourceNotFound",

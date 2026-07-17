@@ -6,6 +6,8 @@ use std::{
     path::Path,
 };
 
+#[cfg(feature = "test-support")]
+use agbox_store::{MemoryKeyProvider, StoreRuntime};
 use agbox_store::{Store, StoreError};
 use rusqlite::{Connection, params};
 
@@ -61,6 +63,10 @@ fn creates_v2_schema_without_touching_legacy_db() {
         )
         .unwrap();
     assert_eq!(manifest_column, ("TEXT".into(), 1));
+    drop(connection);
+    drop(store);
+    let reopened = Store::open_new(home.path().join("state.db")).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 1);
 }
 
 #[test]
@@ -91,6 +97,55 @@ fn rejects_an_unsupported_schema_version_without_migrating_it() {
     assert_eq!(read_user_version(&database), 2);
     assert!(!home.path().join("state.db-wal").exists());
     assert!(!home.path().join("state.db-shm").exists());
+}
+
+#[test]
+fn rejects_an_earlier_pre_manifest_v1_without_mutating_it() {
+    let home = tempfile::tempdir().unwrap();
+    set_mode(home.path(), 0o700);
+    let database = home.path().join("state.db");
+    create_pre_manifest_v1(&database);
+    let bytes_before = fs::read(&database).unwrap();
+
+    let error = Store::open_new(&database).unwrap_err();
+
+    assert!(matches!(error, StoreError::IncompatibleSchema));
+    let debug = format!("{error:?}");
+    let display = error.to_string();
+    assert!(!debug.contains(home.path().to_string_lossy().as_ref()));
+    assert!(!debug.contains("source_cursors"));
+    assert!(!debug.contains("last_commit_digest"));
+    assert!(!display.contains(home.path().to_string_lossy().as_ref()));
+    assert!(!display.contains("source_cursors"));
+    assert_eq!(fs::read(&database).unwrap(), bytes_before);
+    assert!(!home.path().join("state.db-wal").exists());
+    assert!(!home.path().join("state.db-shm").exists());
+    assert_pre_manifest_v1_unchanged(&database);
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn runtime_rejects_an_earlier_pre_manifest_v1_before_sidecar_or_key_startup() {
+    use std::sync::Arc;
+
+    let home = tempfile::tempdir().unwrap();
+    set_mode(home.path(), 0o700);
+    let database = home.path().join("state.db");
+    create_pre_manifest_v1(&database);
+    let bytes_before = fs::read(&database).unwrap();
+
+    let error = StoreRuntime::start_with_key_provider(
+        &database,
+        Arc::new(MemoryKeyProvider::fixed([31_u8; 32])),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, StoreError::IncompatibleSchema));
+    assert_eq!(fs::read(&database).unwrap(), bytes_before);
+    assert!(!home.path().join("state.db-wal").exists());
+    assert!(!home.path().join("state.db-shm").exists());
+    assert_pre_manifest_v1_unchanged(&database);
 }
 
 #[test]
@@ -225,6 +280,101 @@ fn refuses_symlinks_for_database_and_sqlite_sidecars_without_following_them() {
             "error debug leaked the state path: {debug}"
         );
     }
+}
+
+fn create_pre_manifest_v1(path: &Path) {
+    let current = include_str!("../src/schema/0001_initial.sql");
+    let earlier = current.replace(
+        concat!(
+            "    -- Bounded whole-chunk identity for exact replay of only the latest commit.\n",
+            "    last_commit_digest TEXT NOT NULL CHECK (length(last_commit_digest) = 64),\n",
+        ),
+        "",
+    );
+    assert_ne!(current, earlier);
+    let connection = Connection::open(path).unwrap();
+    connection.execute_batch(&earlier).unwrap();
+    connection.pragma_update(None, "user_version", 1).unwrap();
+    connection
+        .execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (1, 'before-manifest')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO projects(
+                 project_id, repository_identity, encrypted_root_path, created_at, updated_at
+             ) VALUES ('project_old', 'repository_old', X'00', 'created', 'updated')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO sources(
+                 source_id, project_id, provider, root_class, encrypted_path,
+                 file_identity, created_at, updated_at
+             ) VALUES (
+                 'source_old', 'project_old', 'codex', 'active', X'00',
+                 'identity_old', 'created', 'updated'
+             )",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO source_generations(
+                 source_id, generation, size_bytes, mtime, session_time,
+                 schema_fingerprint, status
+             ) VALUES ('source_old', 1, 42, 'mtime', NULL, NULL, 'active')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO source_cursors(
+                 source_id, generation, cursor_offset, parser_state, updated_at
+             ) VALUES ('source_old', 1, 42, X'7374617465', 'before-manifest')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    set_mode(path, 0o600);
+}
+
+fn assert_pre_manifest_v1_unchanged(path: &Path) {
+    let connection = Connection::open(path).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 1);
+    let columns: Vec<String> = connection
+        .prepare("SELECT name FROM pragma_table_info('source_cursors') ORDER BY cid")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        columns,
+        [
+            "source_id",
+            "generation",
+            "cursor_offset",
+            "parser_state",
+            "updated_at"
+        ]
+    );
+    let cursor: (i64, Vec<u8>, String) = connection
+        .query_row(
+            "SELECT cursor_offset, parser_state, updated_at
+             FROM source_cursors
+             WHERE source_id = 'source_old' AND generation = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(cursor, (42, b"state".to_vec(), "before-manifest".into()));
 }
 
 fn read_user_version(path: &Path) -> i64 {
