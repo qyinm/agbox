@@ -19,6 +19,10 @@ pub use agbox_core::limits::{
 use crate::BoundedJsonReader;
 
 const MAX_NATIVE_IDENTIFIER_BYTES: usize = 128;
+// A reduced diagnostic is mechanically bounded. If checked serialization ever
+// fails despite that invariant, preserve fail-closed semantics rather than
+// publishing an apparently small semantic count.
+const SEMANTIC_MEASUREMENT_FAILURE_SENTINEL: usize = usize::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RootClass {
@@ -391,11 +395,10 @@ impl DecodedRecord {
             self.evidence = Vec::new();
             self.disposition = DecodeDisposition::oversized("normalized-output");
             self.next_state = prior_state.clone();
-            self.semantic_bytes = self
-                .next_state
-                .as_bytes()
-                .len()
-                .saturating_add(self.disposition.class().map_or(0, str::len));
+            self.semantic_bytes = match self.measure_semantic_bytes() {
+                Some(measured) => measured,
+                None => SEMANTIC_MEASUREMENT_FAILURE_SENTINEL,
+            };
         }
         self
     }

@@ -318,30 +318,18 @@ fn observation_preview_is_included_in_internal_semantic_measurement() {
     );
     assert_eq!(exact.semantic_bytes(), MAX_RECORD_SEMANTIC_BYTES);
 
-    let preview = "p".repeat(agbox_core::limits::MAX_PREVIEW_BYTES);
-    let redacted = RedactionPolicy::new()
-        .unwrap()
-        .redact(&preview, None, DisclosureClass::ObservedState)
-        .unwrap();
-    let bounded_record = ContentRef::bounded(
-        "preview-content".to_owned(),
-        preview.len() as u64,
-        "text/plain",
-        None,
-        DisclosureClass::ObservedState,
-        Some(redacted),
-    )
-    .unwrap();
-    let observation_with_preview = SourceObservation::new(SourceObservationDraft {
-        observation_id: base.observation().observation_id().to_owned(),
-        source: base.observation().source().clone(),
-        range: base.observation().range().clone(),
-        observed_at: base.observation().observed_at(),
-        status: base.observation().status(),
-        bounded_record: Some(bounded_record),
-        schema_fingerprint: base.observation().schema_fingerprint().to_owned(),
-    })
-    .unwrap();
+    let observation_with_preview = observation_with_max_preview(&base);
+    let expected_reduced = DecodedRecord::new(
+        DecodedRecordDraft {
+            observation: observation_with_preview.clone(),
+            events: Vec::new(),
+            evidence: Vec::new(),
+            disposition: DecodeDisposition::oversized("normalized-output"),
+            next_state: DecoderState::default(),
+            semantic_bytes: 0,
+        },
+        &DecoderState::default(),
+    );
     let tipped_over = DecodedRecord::new(
         DecodedRecordDraft {
             observation: observation_with_preview,
@@ -357,6 +345,38 @@ fn observation_preview_is_included_in_internal_semantic_measurement() {
         tipped_over.disposition(),
         DecodeDisposition::Oversized { .. }
     ));
+    assert_eq!(
+        tipped_over.semantic_bytes(),
+        expected_reduced.semantic_bytes(),
+        "oversized reduction must remeasure its retained observation preview"
+    );
+}
+
+fn observation_with_max_preview(base: &DecodedRecord) -> SourceObservation {
+    let preview = "p".repeat(agbox_core::limits::MAX_PREVIEW_BYTES);
+    let redacted = RedactionPolicy::new()
+        .unwrap()
+        .redact(&preview, None, DisclosureClass::ObservedState)
+        .unwrap();
+    let bounded_record = ContentRef::bounded(
+        "preview-content".to_owned(),
+        preview.len() as u64,
+        "text/plain",
+        None,
+        DisclosureClass::ObservedState,
+        Some(redacted),
+    )
+    .unwrap();
+    SourceObservation::new(SourceObservationDraft {
+        observation_id: base.observation().observation_id().to_owned(),
+        source: base.observation().source().clone(),
+        range: base.observation().range().clone(),
+        observed_at: base.observation().observed_at(),
+        status: base.observation().status(),
+        bounded_record: Some(bounded_record),
+        schema_fingerprint: base.observation().schema_fingerprint().to_owned(),
+    })
+    .unwrap()
 }
 
 #[test]
