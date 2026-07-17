@@ -2816,6 +2816,20 @@ impl<R: std::io::Read> BoundedJsonReader<R> {
 
 Compute `schema_fingerprint` in the same stream by hashing container boundaries plus field-name hashes and scalar type tags; never collect a key list or hash scalar values into the schema identity. Depth 129 is malformed, and an individual field name over 128 bytes contributes only a streaming hash plus length.
 
+**Task 7 implementation amendment:** Struson 0.7.2 exposes decoded member
+names only through `next_name`/`next_name_owned`, which retain the complete
+name; its bounded `skip_name` path does not expose bytes for field-name hashing
+or selected-path comparison. The approved implementation therefore uses a
+bounded RFC 8259 structural tokenizer for traversal, decoded field-name
+hashing, path selection, depth enforcement, and trailing-input validation.
+Struson remains an independent validator for already bounded selected number
+tokens, and differential/property tests compare tokenizer acceptance and
+decoded bounded strings with both Struson and `serde_json`. The tokenizer may
+retain at most a 128-byte field-name prefix plus hash/length, and compares
+longer borrowed selected paths by length and BLAKE3 hash. Every error path
+drains the source to terminal EOF so `RecordWindow` integrity errors take
+precedence over an earlier syntax, type, duplicate, or size diagnostic.
+
 Add `zeroize.workspace = true` to the adapter manifest. Add `MemoryRecordSource` only behind the `test-support` feature. The registry in `lib.rs` returns exactly `ClaudeAdapter` and `CodexAdapter` after Tasks 8 and 10; until those tasks it returns an empty vector and the fixture helper explicitly selects its test decoder.
 
 The adapter manifest's normal dependencies are `agbox-core`, `serde`, `serde_json`, `struson`, `thiserror`, `time`, and `zeroize`; fixture/property dev-dependencies are `proptest` and `tempfile`.

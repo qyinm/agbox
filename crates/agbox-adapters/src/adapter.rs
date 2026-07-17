@@ -1,6 +1,6 @@
 use std::{
     fmt,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -156,11 +156,50 @@ impl fmt::Debug for DecodeContext {
 }
 
 #[derive(Clone, Eq, PartialEq)]
+pub struct NativeIdentifier(String);
+
+impl NativeIdentifier {
+    fn from_raw_or(raw: &str, fallback: &'static str) -> Self {
+        if allowlisted_native_identifier(raw.as_bytes()) {
+            Self(raw.to_owned())
+        } else {
+            Self(fallback.to_owned())
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for NativeIdentifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeIdentifier")
+            .field("byte_length", &self.0.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq<str> for NativeIdentifier {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for NativeIdentifier {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub enum DecodeDisposition {
     Known,
-    UnknownType { native_type: String },
-    Malformed { class: String },
-    Oversized { class: String },
+    UnknownType { native_type: NativeIdentifier },
+    Malformed { class: NativeIdentifier },
+    Oversized { class: NativeIdentifier },
 }
 
 impl fmt::Debug for DecodeDisposition {
@@ -172,6 +211,45 @@ impl fmt::Debug for DecodeDisposition {
             }
             Self::Malformed { .. } => formatter.write_str("Malformed { class: <redacted> }"),
             Self::Oversized { .. } => formatter.write_str("Oversized { class: <redacted> }"),
+        }
+    }
+}
+
+impl DecodeDisposition {
+    #[must_use]
+    pub fn unknown_type(raw: &str) -> Self {
+        Self::UnknownType {
+            native_type: NativeIdentifier::from_raw_or(raw, "invalid-native-type"),
+        }
+    }
+
+    #[must_use]
+    pub fn malformed(class: &str) -> Self {
+        Self::Malformed {
+            class: NativeIdentifier::from_raw_or(class, "invalid-malformed-class"),
+        }
+    }
+
+    #[must_use]
+    pub fn oversized(class: &str) -> Self {
+        Self::Oversized {
+            class: NativeIdentifier::from_raw_or(class, "invalid-oversized-class"),
+        }
+    }
+
+    #[must_use]
+    pub fn native_type(&self) -> Option<&str> {
+        match self {
+            Self::UnknownType { native_type } => Some(native_type.as_str()),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn class(&self) -> Option<&str> {
+        match self {
+            Self::Malformed { class } | Self::Oversized { class } => Some(class.as_str()),
+            _ => None,
         }
     }
 }
@@ -197,13 +275,37 @@ impl fmt::Debug for DecodedEvidence {
 }
 
 #[derive(Clone)]
-pub struct DecodedRecord {
+pub struct DecodedRecordDraft {
     pub observation: SourceObservation,
     pub events: Vec<ActivityEventV1>,
     pub evidence: Vec<DecodedEvidence>,
     pub disposition: DecodeDisposition,
     pub next_state: DecoderState,
     pub semantic_bytes: usize,
+}
+
+impl fmt::Debug for DecodedRecordDraft {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DecodedRecordDraft")
+            .field("observation", &self.observation)
+            .field("event_count", &self.events.len())
+            .field("evidence_count", &self.evidence.len())
+            .field("disposition", &self.disposition)
+            .field("next_state_bytes", &self.next_state.as_bytes().len())
+            .field("reported_semantic_bytes", &self.semantic_bytes)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct DecodedRecord {
+    observation: SourceObservation,
+    events: Vec<ActivityEventV1>,
+    evidence: Vec<DecodedEvidence>,
+    disposition: DecodeDisposition,
+    next_state: DecoderState,
+    semantic_bytes: usize,
 }
 
 impl fmt::Debug for DecodedRecord {
@@ -221,28 +323,139 @@ impl fmt::Debug for DecodedRecord {
 }
 
 impl DecodedRecord {
-    /// Replaces any over-limit normalized output with a bounded diagnostic.
+    /// Constructs a record and replaces over-limit normalized output with a
+    /// bounded diagnostic. The draft's reported semantic byte count is ignored
+    /// and replaced by an internal streaming measurement.
+    #[must_use]
+    pub fn new(draft: DecodedRecordDraft, prior_state: &DecoderState) -> Self {
+        let record = Self {
+            observation: draft.observation,
+            events: draft.events,
+            evidence: draft.evidence,
+            disposition: draft.disposition,
+            next_state: draft.next_state,
+            semantic_bytes: 0,
+        };
+        record.enforce_limits(prior_state)
+    }
+
+    #[must_use]
+    pub fn observation(&self) -> &SourceObservation {
+        &self.observation
+    }
+
+    #[must_use]
+    pub fn events(&self) -> &[ActivityEventV1] {
+        &self.events
+    }
+
+    #[must_use]
+    pub fn evidence(&self) -> &[DecodedEvidence] {
+        &self.evidence
+    }
+
+    #[must_use]
+    pub fn disposition(&self) -> &DecodeDisposition {
+        &self.disposition
+    }
+
+    #[must_use]
+    pub fn next_state(&self) -> &DecoderState {
+        &self.next_state
+    }
+
+    #[must_use]
+    pub const fn semantic_bytes(&self) -> usize {
+        self.semantic_bytes
+    }
+
+    /// Revalidates a previously constructed record against all output bounds.
     #[must_use]
     pub fn enforce_limits(mut self, prior_state: &DecoderState) -> Self {
-        let evidence_too_large = self
-            .evidence
-            .iter()
-            .any(|item| item.plaintext.len() > agbox_core::limits::MAX_INLINE_BYTES);
-        let too_large = self.events.len() > MAX_EVENTS_PER_RECORD
-            || self.evidence.len() > MAX_EVIDENCE_PER_RECORD
-            || evidence_too_large
-            || self.next_state.as_bytes().len() > MAX_DECODER_STATE_BYTES
-            || self.semantic_bytes > MAX_RECORD_SEMANTIC_BYTES;
+        let too_large = match self.measure_semantic_bytes() {
+            Some(measured) => {
+                self.semantic_bytes = measured;
+                measured > MAX_RECORD_SEMANTIC_BYTES
+            }
+            None => true,
+        };
         if too_large {
             self.events.clear();
             self.evidence.clear();
-            self.disposition = DecodeDisposition::Oversized {
-                class: "normalized-output".to_owned(),
-            };
+            self.disposition = DecodeDisposition::oversized("normalized-output");
             self.next_state = prior_state.clone();
-            self.semantic_bytes = prior_state.as_bytes().len();
+            self.semantic_bytes = self
+                .next_state
+                .as_bytes()
+                .len()
+                .saturating_add(self.disposition.class().map_or(0, str::len));
         }
         self
+    }
+
+    fn measure_semantic_bytes(&self) -> Option<usize> {
+        if self.events.len() > MAX_EVENTS_PER_RECORD
+            || self.evidence.len() > MAX_EVIDENCE_PER_RECORD
+            || self.next_state.as_bytes().len() > MAX_DECODER_STATE_BYTES
+        {
+            return None;
+        }
+        if self
+            .evidence
+            .iter()
+            .any(|item| item.plaintext.len() > agbox_core::limits::MAX_INLINE_BYTES)
+        {
+            return None;
+        }
+
+        let mut counter = SemanticCounter::default();
+        counter.add(self.next_state.as_bytes().len())?;
+        counter.add(
+            self.disposition
+                .native_type()
+                .or_else(|| self.disposition.class())
+                .map_or(0, str::len),
+        )?;
+        for event in &self.events {
+            counter.serialized(event).ok()?;
+        }
+        for evidence in &self.evidence {
+            counter.add(evidence.evidence_id.as_str().len())?;
+            counter.add(evidence.owner_event_id.as_str().len())?;
+            counter.serialized(&evidence.content).ok()?;
+            counter.add(evidence.plaintext.len())?;
+        }
+        Some(counter.bytes)
+    }
+}
+
+#[derive(Default)]
+struct SemanticCounter {
+    bytes: usize,
+}
+
+impl SemanticCounter {
+    fn add(&mut self, bytes: usize) -> Option<()> {
+        self.bytes = self.bytes.checked_add(bytes)?;
+        Some(())
+    }
+
+    fn serialized<T: serde::Serialize>(&mut self, value: &T) -> Result<(), serde_json::Error> {
+        serde_json::to_writer(self, value)
+    }
+}
+
+impl Write for SemanticCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(buffer.len())
+            .ok_or_else(|| io::Error::other("semantic byte count overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -306,14 +519,14 @@ pub fn adapters() -> &'static [&'static dyn SourceAdapter] {
     &[]
 }
 
-fn allowlisted_native_identifier(value: &[u8]) -> Option<String> {
+fn allowlisted_native_identifier(value: &[u8]) -> bool {
     if value.is_empty()
         || value.len() > MAX_NATIVE_IDENTIFIER_BYTES
         || !value.iter().all(u8::is_ascii_graphic)
     {
-        return None;
+        return false;
     }
-    std::str::from_utf8(value).ok().map(str::to_owned)
+    std::str::from_utf8(value).is_ok()
 }
 
 #[cfg(feature = "test-support")]
@@ -385,8 +598,12 @@ pub fn decode_fixture(
         .schema_fingerprint()
         .ok_or_else(|| DecodeError::Malformed("missing-schema".to_owned()))?
         .to_owned();
-    let native_type = allowlisted_native_identifier(&native_type.bytes)
-        .unwrap_or_else(|| "invalid-native-type".to_owned());
+    let raw_native_type = std::str::from_utf8(&native_type.bytes).unwrap_or("");
+    let disposition = DecodeDisposition::unknown_type(raw_native_type);
+    let native_type = disposition
+        .native_type()
+        .ok_or_else(|| DecodeError::Malformed("missing-native-type".to_owned()))?
+        .to_owned();
     let source = SourceRef::new(SourceRefDraft {
         provider,
         format: "fixture-jsonl".to_owned(),
@@ -416,12 +633,15 @@ pub fn decode_fixture(
         schema_fingerprint,
     })
     .map_err(|_| DecodeError::Malformed("invalid-observation".to_owned()))?;
-    Ok(DecodedRecord {
-        observation,
-        events: Vec::new(),
-        evidence: Vec::new(),
-        disposition: DecodeDisposition::UnknownType { native_type },
-        next_state: DecoderState::default(),
-        semantic_bytes: 0,
-    })
+    Ok(DecodedRecord::new(
+        DecodedRecordDraft {
+            observation,
+            events: Vec::new(),
+            evidence: Vec::new(),
+            disposition,
+            next_state: DecoderState::default(),
+            semantic_bytes: 0,
+        },
+        &DecoderState::default(),
+    ))
 }

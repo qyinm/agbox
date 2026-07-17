@@ -89,6 +89,12 @@ impl<R: Read> BoundedJsonReader<R> {
         limit: usize,
     ) -> Result<Option<String>, DecodeError> {
         if limit > MAX_CAPTURE_BYTES {
+            if !self.parsed {
+                self.parsed = true;
+                if let Err(terminal_error) = self.input.drain_to_terminal() {
+                    return Err(DecodeError::Io(terminal_error));
+                }
+            }
             return Err(DecodeError::OutputTooLarge);
         }
         let outcome = self.parse(path, SelectionMode::Scalar, limit)?;
@@ -119,13 +125,25 @@ impl<R: Read> BoundedJsonReader<R> {
             return Err(DecodeError::Malformed("already-consumed".to_owned()));
         }
         self.parsed = true;
-        let mut parser = Parser::new(&mut self.input, path, mode, selection_limit);
-        parser.parse_value(0, Some(0))?;
-        parser.input.skip_whitespace()?;
-        if parser.input.peek_byte()?.is_some() {
-            return Err(DecodeError::Malformed("trailing-json".to_owned()));
-        }
-        let outcome = parser.finish();
+        let parsed = {
+            let mut parser = Parser::new(&mut self.input, path, mode, selection_limit);
+            parser.parse_value(0, Some(0)).and_then(|()| {
+                parser.input.skip_whitespace()?;
+                if parser.input.peek_byte()?.is_some() {
+                    return Err(DecodeError::Malformed("trailing-json".to_owned()));
+                }
+                Ok(parser.finish())
+            })
+        };
+        let outcome = match parsed {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Err(terminal_error) = self.input.drain_to_terminal() {
+                    return Err(DecodeError::Io(terminal_error));
+                }
+                return Err(error);
+            }
+        };
         self.retained_bytes = outcome.string.as_ref().map_or_else(
             || outcome.scalar.as_ref().map_or(0, Vec::len),
             |value| value.bytes.len(),
@@ -185,6 +203,18 @@ impl<R: Read> Input<R> {
             let _ = self.read_byte()?;
         }
         Ok(())
+    }
+
+    fn drain_to_terminal(&mut self) -> std::io::Result<()> {
+        let _ = self.peeked.take();
+        loop {
+            let buffered = self.reader.fill_buf()?;
+            if buffered.is_empty() {
+                return Ok(());
+            }
+            let length = buffered.len();
+            self.reader.consume(length);
+        }
     }
 }
 
@@ -575,7 +605,14 @@ struct StringInfo {
 
 impl StringInfo {
     fn equals(&self, expected: &[u8]) -> bool {
-        u64::try_from(expected.len()) == Ok(self.total) && self.prefix == expected
+        if u64::try_from(expected.len()) != Ok(self.total) {
+            return false;
+        }
+        if expected.len() <= MAX_FIELD_NAME_BYTES {
+            return self.prefix == expected;
+        }
+        self.prefix == expected[..MAX_FIELD_NAME_BYTES]
+            && self.hash == blake3::hash(expected).to_hex().as_str()
     }
 }
 

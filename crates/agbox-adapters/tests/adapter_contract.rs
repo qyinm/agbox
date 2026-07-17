@@ -3,13 +3,14 @@
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
 use agbox_adapters::{
-    BoundedJsonReader, DecodeDisposition, DecodedEvidence, DecoderState, MAX_CAPTURE_BYTES,
-    MAX_DECODER_STATE_BYTES, MAX_EVENTS_PER_RECORD, MAX_RECORD_SEMANTIC_BYTES, MemoryRecordSource,
-    RecordSource,
+    BoundedJsonReader, DecodeDisposition, DecodeError, DecodedEvidence, DecodedRecord,
+    DecodedRecordDraft, DecoderState, MAX_CAPTURE_BYTES, MAX_DECODER_STATE_BYTES,
+    MAX_EVENTS_PER_RECORD, MAX_RECORD_SEMANTIC_BYTES, MemoryRecordSource, RecordSource,
 };
 use agbox_core::{ActivityEventV1, ContentRef, DisclosureClass, EvidenceId};
 use agbox_ingest::{RecordScanner, ScanOutcome};
 use proptest::prelude::*;
+use struson::reader::{JsonReader, JsonStreamReader};
 
 #[test]
 fn unknown_top_level_type_is_preserved_as_drift() {
@@ -17,13 +18,13 @@ fn unknown_top_level_type_is_preserved_as_drift() {
         MemoryRecordSource::new(br#"{"type":"future-record","nested":{"value":1}}"#.to_vec());
     let decoded = agbox_adapters::decode_fixture("claude", &source).unwrap();
     assert!(matches!(
-        decoded.disposition,
-        DecodeDisposition::UnknownType { ref native_type }
+        decoded.disposition(),
+        DecodeDisposition::UnknownType { native_type }
             if native_type == "future-record"
     ));
-    assert!(decoded.events.is_empty());
-    assert!(!decoded.observation.schema_fingerprint().is_empty());
-    assert!(!format!("{:?}", decoded.disposition).contains("future-record"));
+    assert!(decoded.events().is_empty());
+    assert!(!decoded.observation().schema_fingerprint().is_empty());
+    assert!(!format!("{:?}", decoded.disposition()).contains("future-record"));
 }
 
 #[test]
@@ -32,12 +33,22 @@ fn native_type_allowlist_replaces_non_ascii_and_overlong_values_without_debug_le
         let source = MemoryRecordSource::new(format!(r#"{{"type":"{native_type}"}}"#).into_bytes());
         let decoded = agbox_adapters::decode_fixture("claude", &source).unwrap();
         assert!(matches!(
-            decoded.disposition,
-            DecodeDisposition::UnknownType { ref native_type }
+            decoded.disposition(),
+            DecodeDisposition::UnknownType { native_type }
                 if native_type == "invalid-native-type"
         ));
         assert!(!format!("{decoded:?}").contains(&native_type));
     }
+
+    let class_secret = "클래스-secret";
+    let malformed = DecodeDisposition::malformed(class_secret);
+    assert_eq!(malformed.class(), Some("invalid-malformed-class"));
+    assert!(!format!("{malformed:?}").contains(class_secret));
+
+    let long_class = "x".repeat(129);
+    let oversized = DecodeDisposition::oversized(&long_class);
+    assert_eq!(oversized.class(), Some("invalid-oversized-class"));
+    assert!(!format!("{oversized:?}").contains(&long_class));
 }
 
 #[test]
@@ -197,6 +208,25 @@ fn overlong_field_names_are_streamed_and_debug_is_sanitized() {
 }
 
 #[test]
+fn overlong_borrowed_path_selects_and_duplicate_rejects_by_streaming_hash() {
+    let field = "selected-field-".repeat(32);
+    let input = format!(r#"{{"{field}":"selected"}}"#);
+    let mut reader = BoundedJsonReader::new(input.as_bytes());
+    assert_eq!(
+        reader
+            .capture_string(&[field.as_str()])
+            .unwrap()
+            .unwrap()
+            .bytes,
+        b"selected"
+    );
+
+    let duplicate = format!(r#"{{"{field}":"first","{field}":"second"}}"#);
+    let mut reader = BoundedJsonReader::new(duplicate.as_bytes());
+    assert!(reader.capture_string(&[field.as_str()]).is_err());
+}
+
+#[test]
 fn decoder_state_rejection_preserves_prior_state() {
     let mut state = DecoderState::default();
     state.replace(b"prior".to_vec()).unwrap();
@@ -214,17 +244,23 @@ fn decoder_state_rejection_preserves_prior_state() {
 fn normalized_output_limits_discard_partial_results_and_preserve_identity_state() {
     let source = MemoryRecordSource::new(br#"{"type":"future-record"}"#.to_vec());
     let base = agbox_adapters::decode_fixture("claude", &source).unwrap();
-    let observation = base.observation.clone();
+    assert!(base.semantic_bytes() > 0);
+    let observation = base.observation().clone();
     let mut prior = DecoderState::default();
     prior.replace(b"prior-state".to_vec()).unwrap();
     let event = ActivityEventV1::fixture_message();
 
-    let oversized_events = agbox_adapters::DecodedRecord {
-        events: vec![event.clone(); MAX_EVENTS_PER_RECORD + 1],
-        next_state: DecoderState::default(),
-        ..base.clone()
-    }
-    .enforce_limits(&prior);
+    let oversized_events = DecodedRecord::new(
+        DecodedRecordDraft {
+            observation: base.observation().clone(),
+            events: vec![event.clone(); MAX_EVENTS_PER_RECORD + 1],
+            evidence: base.evidence().to_vec(),
+            disposition: base.disposition().clone(),
+            next_state: DecoderState::default(),
+            semantic_bytes: 0,
+        },
+        &prior,
+    );
     assert_oversized_is_bounded(&oversized_events, &observation, &prior);
 
     let content_secret = "content-secret-sentinel";
@@ -248,32 +284,68 @@ fn normalized_output_limits_discard_partial_results_and_preserve_identity_state(
     assert!(!evidence_debug.contains("plaintext-secret-sentinel"));
     assert!(evidence_debug.len() < 512);
 
-    let oversized_evidence_count = agbox_adapters::DecodedRecord {
-        evidence: vec![evidence.clone(); agbox_adapters::MAX_EVIDENCE_PER_RECORD + 1],
-        next_state: DecoderState::default(),
-        ..base.clone()
-    }
-    .enforce_limits(&prior);
+    let oversized_evidence_count = DecodedRecord::new(
+        DecodedRecordDraft {
+            observation: base.observation().clone(),
+            events: base.events().to_vec(),
+            evidence: vec![evidence.clone(); agbox_adapters::MAX_EVIDENCE_PER_RECORD + 1],
+            disposition: base.disposition().clone(),
+            next_state: DecoderState::default(),
+            semantic_bytes: 0,
+        },
+        &prior,
+    );
     assert_oversized_is_bounded(&oversized_evidence_count, &observation, &prior);
 
-    let oversized_plaintext = agbox_adapters::DecodedRecord {
-        evidence: vec![DecodedEvidence {
-            plaintext: zeroize::Zeroizing::new(vec![b'x'; MAX_CAPTURE_BYTES + 1]),
-            ..evidence
-        }],
-        next_state: DecoderState::default(),
-        ..base.clone()
-    }
-    .enforce_limits(&prior);
+    let maximum_evidence = DecodedEvidence {
+        plaintext: zeroize::Zeroizing::new(vec![b'x'; MAX_CAPTURE_BYTES]),
+        ..evidence.clone()
+    };
+    let underreported_semantics = DecodedRecord::new(
+        DecodedRecordDraft {
+            observation: base.observation().clone(),
+            events: base.events().to_vec(),
+            evidence: vec![maximum_evidence; agbox_adapters::MAX_EVIDENCE_PER_RECORD],
+            disposition: base.disposition().clone(),
+            next_state: DecoderState::default(),
+            semantic_bytes: 0,
+        },
+        &prior,
+    );
+    assert_oversized_is_bounded(&underreported_semantics, &observation, &prior);
+
+    let oversized_plaintext = DecodedRecord::new(
+        DecodedRecordDraft {
+            observation: base.observation().clone(),
+            events: base.events().to_vec(),
+            evidence: vec![DecodedEvidence {
+                plaintext: zeroize::Zeroizing::new(vec![b'x'; MAX_CAPTURE_BYTES + 1]),
+                ..evidence
+            }],
+            disposition: base.disposition().clone(),
+            next_state: DecoderState::default(),
+            semantic_bytes: 0,
+        },
+        &prior,
+    );
     assert_oversized_is_bounded(&oversized_plaintext, &observation, &prior);
 
-    let oversized_semantics = agbox_adapters::DecodedRecord {
-        semantic_bytes: MAX_RECORD_SEMANTIC_BYTES + 1,
-        next_state: DecoderState::default(),
-        ..base
-    }
-    .enforce_limits(&prior);
-    assert_oversized_is_bounded(&oversized_semantics, &observation, &prior);
+    let overreported_semantics = DecodedRecord::new(
+        DecodedRecordDraft {
+            observation: base.observation().clone(),
+            events: base.events().to_vec(),
+            evidence: base.evidence().to_vec(),
+            disposition: base.disposition().clone(),
+            next_state: DecoderState::default(),
+            semantic_bytes: MAX_RECORD_SEMANTIC_BYTES + 1,
+        },
+        &prior,
+    );
+    assert_eq!(
+        overreported_semantics.semantic_bytes(),
+        base.semantic_bytes(),
+        "caller-reported semantic bytes must be ignored"
+    );
 }
 
 fn assert_oversized_is_bounded(
@@ -281,12 +353,12 @@ fn assert_oversized_is_bounded(
     observation: &agbox_core::SourceObservation,
     prior: &DecoderState,
 ) {
-    assert_eq!(&decoded.observation, observation);
-    assert!(decoded.events.is_empty());
-    assert!(decoded.evidence.is_empty());
-    assert_eq!(&decoded.next_state, prior);
+    assert_eq!(decoded.observation(), observation);
+    assert!(decoded.events().is_empty());
+    assert!(decoded.evidence().is_empty());
+    assert_eq!(decoded.next_state(), prior);
     assert!(matches!(
-        decoded.disposition,
+        decoded.disposition(),
         DecodeDisposition::Oversized { .. }
     ));
 }
@@ -335,6 +407,12 @@ fn terminal_source_integrity_failure_discards_partial_decode() {
         bytes: br#"{"type":"future-record"}"#.to_vec(),
     };
     assert!(agbox_adapters::decode_fixture("claude", &source).is_err());
+
+    let mut reader = BoundedJsonReader::new(source.open().unwrap());
+    assert!(matches!(
+        reader.capture_scalar(&["type"], MAX_CAPTURE_BYTES + 1),
+        Err(DecodeError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
+    ));
 }
 
 #[test]
@@ -371,7 +449,88 @@ fn record_window_mutation_and_truncation_cannot_yield_a_partial_success() {
     assert!(agbox_adapters::decode_fixture("claude", &truncated_window).is_err());
 }
 
+#[test]
+fn early_parser_errors_still_drain_large_windows_and_surface_terminal_integrity_failure() {
+    let malformed = format!(r#"{{"type":[}},"padding":"{}"}}"#, "x".repeat(16 * 1024));
+    let (mut file, window) = scanned_window(format!("{malformed}\n").as_bytes());
+    file.as_file_mut().seek(SeekFrom::End(-2)).unwrap();
+    file.as_file_mut().write_all(b"y").unwrap();
+    file.flush().unwrap();
+    assert!(matches!(
+        agbox_adapters::decode_fixture("claude", &window),
+        Err(DecodeError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
+    ));
+
+    let scalar = format!(
+        r#"{{"number":123456,"padding":"{}"}}"#,
+        "x".repeat(16 * 1024)
+    );
+    let (file, window) = scanned_window(format!("{scalar}\n").as_bytes());
+    file.as_file().set_len(4 * 1024).unwrap();
+    let mut reader = BoundedJsonReader::new(RecordSource::open(&window).unwrap());
+    assert!(matches!(
+        reader.capture_scalar(&["number"], 3),
+        Err(DecodeError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof
+    ));
+    assert!(reader.schema_fingerprint().is_none());
+    assert_eq!(reader.retained_bytes(), 0);
+}
+
+fn scanned_window(bytes: &[u8]) -> (tempfile::NamedTempFile, agbox_ingest::RecordWindow) {
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(bytes).unwrap();
+    file.flush().unwrap();
+    let mut scanner = RecordScanner::new(file.reopen().unwrap(), 0, bytes.len() as u64).unwrap();
+    let ScanOutcome::Complete(window) = scanner.next().unwrap() else {
+        panic!("fixture record must scan");
+    };
+    (file, window)
+}
+
 proptest! {
+    #[test]
+    fn bounded_parser_acceptance_matches_struson_and_serde_json(
+        input in prop::collection::vec(any::<u8>(), 0..512),
+    ) {
+        let mut bounded = BoundedJsonReader::new(input.as_slice());
+        let bounded_accepts = bounded.capture_string(&["never-selected"]).is_ok();
+
+        let mut struson = JsonStreamReader::new(input.as_slice());
+        let struson_accepts = struson
+            .skip_value()
+            .and_then(|()| struson.consume_trailing_whitespace())
+            .is_ok();
+        let serde_accepts = serde_json::from_slice::<serde::de::IgnoredAny>(&input).is_ok();
+
+        prop_assert_eq!(bounded_accepts, struson_accepts);
+        prop_assert_eq!(bounded_accepts, serde_accepts);
+    }
+
+    #[test]
+    fn selected_decoded_strings_match_struson_and_serde_json(value in any::<String>()) {
+        let encoded = serde_json::to_string(&value).unwrap();
+        let input = format!(r#"{{"message":{encoded},"other":1}}"#);
+
+        let mut bounded = BoundedJsonReader::new(input.as_bytes());
+        let captured = bounded.capture_string(&["message"]).unwrap().unwrap();
+
+        let decoded: serde_json::Value = serde_json::from_str(&input).unwrap();
+        let serde_value = decoded["message"].as_str().unwrap();
+
+        let mut struson = JsonStreamReader::new(input.as_bytes());
+        struson.begin_object().unwrap();
+        prop_assert_eq!(struson.next_name().unwrap(), "message");
+        let struson_value = struson.next_string().unwrap();
+        prop_assert_eq!(struson.next_name().unwrap(), "other");
+        struson.skip_value().unwrap();
+        struson.end_object().unwrap();
+        struson.consume_trailing_whitespace().unwrap();
+
+        prop_assert_eq!(captured.bytes, value.as_bytes());
+        prop_assert_eq!(serde_value, value.as_str());
+        prop_assert_eq!(struson_value.as_str(), value.as_str());
+    }
+
     #[test]
     fn capture_is_deterministic_across_escapes_utf8_and_boundaries(
         prefix in prop::collection::vec("[a-z🦀]{0,4}", 0..64),
