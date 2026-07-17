@@ -6,7 +6,7 @@
 
 **Architecture:** Build a clean-slate seven-crate Cargo workspace beside the legacy Go runtime, ship testable vertical slices through a single owner daemon and SQLite writer, then remove Go only after the Rust release gates pass. Agent-specific JSONL records enter through streaming adapters, become immutable `ActivityEventV1` facts, reduce into a `WorkGraph`, and produce immediately readable `WorkContractRevision` values through owner-only local IPC.
 
-**Tech Stack:** Rust 1.94.1, edition 2024, Tokio 1.52.4, Serde 1.0.228, Struson 0.7.2, rusqlite 0.40.1 with bundled SQLite, notify 8.2.0, XChaCha20-Poly1305 0.11.0, keyring 3.6.3, interprocess 2.4.2, sysinfo 0.38.4 in process-only single-threaded mode, clap 4.6.2, Ratatui 0.30.2, rmcp 2.2.0, SQLite WAL.
+**Tech Stack:** Rust 1.97.1, edition 2024, Tokio 1.52.4, Serde 1.0.228, Struson 0.7.2, rusqlite 0.40.1 with bundled SQLite, notify 8.2.0, XChaCha20-Poly1305 0.11.0, keyring 3.6.3, interprocess 2.4.2, sysinfo 0.38.4 in process-only single-threaded mode, clap 4.6.2, Ratatui 0.30.2, rmcp 2.2.0, SQLite WAL.
 
 **Approved Spec:** `docs/specs/2026-07-17-rust-v2-work-handoff-design.md`
 
@@ -74,7 +74,7 @@ No crate may introduce a reverse edge. The diagram lists dependency inputs above
 |---|---|
 | `Cargo.toml` | Workspace members, exact dependency families, shared lint policy |
 | `Cargo.lock` | Reproducible application dependency lock |
-| `rust-toolchain.toml` | Pin Rust 1.94.1 with rustfmt and clippy |
+| `rust-toolchain.toml` | Pin Rust 1.97.1 with rustfmt and clippy |
 | `rustfmt.toml` | Edition-aware formatting |
 | `.cargo/config.toml` | Target-specific linker and macOS deployment settings |
 | `.github/workflows/rust-ci.yml` | Rust format, clippy, unit, property, integration, and security checks before cutover |
@@ -253,7 +253,7 @@ Create `rust-toolchain.toml`:
 
 ```toml
 [toolchain]
-channel = "1.94.1"
+channel = "1.97.1"
 components = ["clippy", "rustfmt"]
 profile = "minimal"
 ```
@@ -268,7 +268,7 @@ members = ["crates/*", "tools/*"]
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.94.1"
+rust-version = "1.97.1"
 license = "MIT"
 repository = "https://github.com/qyinm/agbox"
 
@@ -6738,7 +6738,7 @@ Expected final state:
 
 Re-check these primary sources when beginning Task 1 and update only when a newer compatible release preserves the plan's contracts:
 
-- [Rust 1.94.1 release/toolchain documentation](https://doc.rust-lang.org/stable/releases.html)
+- [Rust 1.97.1 release/toolchain documentation](https://doc.rust-lang.org/stable/releases.html)
 - [Tokio task, synchronization, signal, and I/O documentation](https://docs.rs/tokio/1.52.4/tokio/)
 - [tokio-util codec and cancellation documentation](https://docs.rs/tokio-util/latest/tokio_util/)
 - [rusqlite transaction and bundled SQLite documentation](https://docs.rs/rusqlite/0.40.1/rusqlite/)
