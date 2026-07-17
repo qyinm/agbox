@@ -208,6 +208,25 @@ impl ClaudeStateV1 {
             .any(|finished| finished.agent_id == agent_id))
     }
 
+    pub fn retains_agent_lifecycle(&self, agent_id: &str) -> bool {
+        self.known_agents.iter().any(|known| known == agent_id)
+            || self
+                .finished_agents
+                .iter()
+                .any(|finished| finished.agent_id == agent_id)
+    }
+
+    pub fn finished_agent_outcome(&self, agent_id: &str) -> Option<ActionOutcome> {
+        self.finished_agents
+            .iter()
+            .find(|finished| finished.agent_id == agent_id)
+            .map(|finished| finished.outcome)
+    }
+
+    pub fn finalize_record(&mut self) -> Result<(), DecodeError> {
+        self.fit_serialized_bound()
+    }
+
     pub fn set_assistant_spawn(
         &mut self,
         assistant_record_id: String,

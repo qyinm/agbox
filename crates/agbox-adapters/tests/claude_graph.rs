@@ -61,6 +61,63 @@ fn relationship_count(record: &agbox_adapters::DecodedRecord) -> usize {
         .count()
 }
 
+fn unresolved_pressure_state(free_bytes: usize, known_agents: &[String]) -> DecoderState {
+    const STATE_BOUND: usize = 32 * 1024;
+    let target = STATE_BOUND.checked_sub(free_bytes).unwrap();
+    let encode = |links: &[serde_json::Value]| {
+        serde_json::to_vec(&serde_json::json!({
+            "unresolved_tools": links,
+            "known_agents": known_agents,
+            "finished_agents": [],
+            "assistant_spawns": [],
+            "last_human_turn": null,
+            "context": {
+                "cwd": null,
+                "mode": null,
+                "permission": null,
+                "branch_hash": null,
+            },
+        }))
+        .unwrap()
+    };
+
+    let mut links = Vec::new();
+    for index in 0..128 {
+        links.push(serde_json::json!({
+            "tool_use_id": format!("pending-{index}-{}", "i".repeat(100)),
+            "request_event_id": format!("evt-{index}-{}", "e".repeat(100)),
+            "tool_name": "R".repeat(64),
+            "input_hash": "a".repeat(128),
+            "project_relative_path": null,
+        }));
+        if encode(&links).len() > target {
+            let _ = links.pop();
+            break;
+        }
+    }
+
+    for index in 0..links.len() {
+        for path_bytes in 1..=503 {
+            links[index]["project_relative_path"] =
+                serde_json::Value::String(format!("$PROJECT/{}", "p".repeat(path_bytes)));
+            if encode(&links).len() > target {
+                links[index]["project_relative_path"] = if path_bytes == 1 {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(format!("$PROJECT/{}", "p".repeat(path_bytes - 1)))
+                };
+                break;
+            }
+        }
+    }
+
+    let bytes = encode(&links);
+    assert_eq!(bytes.len(), target);
+    let mut state = DecoderState::default();
+    state.replace(bytes).unwrap();
+    state
+}
+
 #[test]
 fn claude_graph_uses_opaque_joinable_ids_and_authoritative_terminal_lifecycle() {
     let records = decode_fixture_file("claude", fixture("sidechain.jsonl")).unwrap();
@@ -518,84 +575,7 @@ fn retained_finished_marker_suppresses_restart_after_known_history_eviction() {
 
 #[test]
 fn unresolved_tool_pressure_does_not_repeat_unretained_agent_starts() {
-    const STATE_BOUND: usize = 32 * 1024;
-
-    let mut links = Vec::new();
-    for index in 0..128 {
-        let candidate = serde_json::json!({
-            "tool_use_id": format!("pending-{index}-{}", "i".repeat(100)),
-            "request_event_id": format!("evt-{index}-{}", "e".repeat(100)),
-            "tool_name": "R".repeat(64),
-            "input_hash": "a".repeat(128),
-            "project_relative_path": null,
-        });
-        links.push(candidate);
-        let encoded = serde_json::to_vec(&serde_json::json!({
-            "unresolved_tools": links,
-            "known_agents": [],
-            "finished_agents": [],
-            "assistant_spawns": [],
-            "last_human_turn": null,
-            "context": {
-                "cwd": null,
-                "mode": null,
-                "permission": null,
-                "branch_hash": null,
-            },
-        }))
-        .unwrap();
-        if encoded.len() > STATE_BOUND {
-            let _ = links.pop();
-            break;
-        }
-    }
-
-    for index in 0..links.len() {
-        for path_bytes in 1..=503 {
-            links[index]["project_relative_path"] =
-                serde_json::Value::String(format!("$PROJECT/{}", "p".repeat(path_bytes)));
-            let encoded = serde_json::to_vec(&serde_json::json!({
-                "unresolved_tools": links,
-                "known_agents": [],
-                "finished_agents": [],
-                "assistant_spawns": [],
-                "last_human_turn": null,
-                "context": {
-                    "cwd": null,
-                    "mode": null,
-                    "permission": null,
-                    "branch_hash": null,
-                },
-            }))
-            .unwrap();
-            if encoded.len() > STATE_BOUND {
-                links[index]["project_relative_path"] = if path_bytes == 1 {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::Value::String(format!("$PROJECT/{}", "p".repeat(path_bytes - 1)))
-                };
-                break;
-            }
-        }
-    }
-
-    let bytes = serde_json::to_vec(&serde_json::json!({
-        "unresolved_tools": links,
-        "known_agents": [],
-        "finished_agents": [],
-        "assistant_spawns": [],
-        "last_human_turn": null,
-        "context": {
-            "cwd": null,
-            "mode": null,
-            "permission": null,
-            "branch_hash": null,
-        },
-    }))
-    .unwrap();
-    assert_eq!(bytes.len(), STATE_BOUND);
-    let mut state = DecoderState::default();
-    state.replace(bytes).unwrap();
+    let mut state = unresolved_pressure_state(0, &[]);
 
     for ordinal in 0..2 {
         let decoded = decode_one(
@@ -612,6 +592,194 @@ fn unresolved_tool_pressure_does_not_repeat_unretained_agent_starts() {
         );
         state = decoded.next_state().clone();
     }
+}
+
+#[test]
+fn staged_start_is_filtered_when_later_context_pressure_evicts_its_marker() {
+    let pressure = unresolved_pressure_state(64, &[]);
+    let plain = decode_one(
+        r#"{"type":"assistant","uuid":"context-stage-plain","sessionId":"session-context-stage","timestamp":"2026-07-17T11:10:00Z","agentId":"context-stage-agent","message":{"content":[]}}"#,
+        &pressure,
+    );
+    assert!(
+        plain
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::AgentStarted { .. }))
+    );
+
+    let with_context = decode_one(
+        r#"{"type":"assistant","uuid":"context-stage-mutating","sessionId":"session-context-stage","timestamp":"2026-07-17T11:10:01Z","agentId":"context-stage-agent","cwd":"/fixture/project","message":{"content":[]}}"#,
+        &pressure,
+    );
+    assert!(
+        !with_context
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::AgentStarted { .. }))
+    );
+    let final_state: serde_json::Value =
+        serde_json::from_slice(with_context.next_state().as_bytes()).unwrap();
+    assert!(final_state["known_agents"].as_array().unwrap().is_empty());
+
+    let following = decode_one(
+        r#"{"type":"assistant","uuid":"context-stage-following","sessionId":"session-context-stage","timestamp":"2026-07-17T11:10:02Z","agentId":"context-stage-agent","message":{"content":[]}}"#,
+        with_context.next_state(),
+    );
+    let starts = with_context
+        .events()
+        .iter()
+        .chain(following.events())
+        .filter(|event| matches!(event.payload(), EventPayload::AgentStarted { .. }))
+        .count();
+    assert!(starts <= 1);
+}
+
+#[test]
+fn staged_start_is_filtered_when_tool_and_spawn_state_evict_its_marker() {
+    let pressure = unresolved_pressure_state(64, &[]);
+    let request = decode_one(
+        r#"{"type":"assistant","uuid":"tool-stage-request","sessionId":"session-tool-stage","timestamp":"2026-07-17T11:20:00Z","agentId":"tool-stage-agent","message":{"content":[{"type":"tool_use","id":"tool-stage-id","name":"Task","input":{"path":"src/lib.rs"}}]}}"#,
+        &pressure,
+    );
+    assert!(
+        request
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::ActionRequested { .. }))
+    );
+    assert!(
+        !request
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::AgentStarted { .. }))
+    );
+    let final_state: serde_json::Value =
+        serde_json::from_slice(request.next_state().as_bytes()).unwrap();
+    assert!(final_state["known_agents"].as_array().unwrap().is_empty());
+    assert_eq!(final_state["assistant_spawns"].as_array().unwrap().len(), 1);
+
+    let following = decode_one(
+        r#"{"type":"assistant","uuid":"tool-stage-following","sessionId":"session-tool-stage","timestamp":"2026-07-17T11:20:01Z","agentId":"tool-stage-agent","message":{"content":[]}}"#,
+        request.next_state(),
+    );
+    let starts = request
+        .events()
+        .iter()
+        .chain(following.events())
+        .filter(|event| matches!(event.payload(), EventPayload::AgentStarted { .. }))
+        .count();
+    assert!(starts <= 1);
+}
+
+#[test]
+fn staged_multi_agent_starts_only_emit_final_retained_markers() {
+    let baseline = decode_one(
+        r#"{"type":"assistant","uuid":"multi-stage-baseline","sessionId":"session-multi-stage","timestamp":"2026-07-17T11:30:00Z","agentId":"multi-stage-first","attributionAgent":"multi-stage-second","message":{"content":[]}}"#,
+        &DecoderState::default(),
+    );
+    let expected_ids = baseline
+        .events()
+        .iter()
+        .filter_map(|event| match event.payload() {
+            EventPayload::AgentStarted { native_agent_id } => Some(native_agent_id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(expected_ids.len(), 2);
+
+    let pressure = unresolved_pressure_state(64, &[]);
+    let pressured = decode_one(
+        r#"{"type":"assistant","uuid":"multi-stage-pressured","sessionId":"session-multi-stage","timestamp":"2026-07-17T11:30:01Z","agentId":"multi-stage-first","attributionAgent":"multi-stage-second","message":{"content":[]}}"#,
+        &pressure,
+    );
+    let emitted_ids = pressured
+        .events()
+        .iter()
+        .filter_map(|event| match event.payload() {
+            EventPayload::AgentStarted { native_agent_id } => Some(native_agent_id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(emitted_ids, vec![expected_ids[1].clone()]);
+
+    let following_survivor = decode_one(
+        r#"{"type":"assistant","uuid":"multi-stage-following-survivor","sessionId":"session-multi-stage","timestamp":"2026-07-17T11:30:02Z","agentId":"multi-stage-second","message":{"content":[]}}"#,
+        pressured.next_state(),
+    );
+    assert!(
+        !following_survivor
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::AgentStarted { .. }))
+    );
+    let following_filtered = decode_one(
+        r#"{"type":"assistant","uuid":"multi-stage-following-filtered","sessionId":"session-multi-stage","timestamp":"2026-07-17T11:30:03Z","agentId":"multi-stage-first","message":{"content":[]}}"#,
+        following_survivor.next_state(),
+    );
+    assert!(
+        following_filtered
+            .events()
+            .iter()
+            .filter(|event| matches!(event.payload(), EventPayload::AgentStarted { .. }))
+            .count()
+            <= 1
+    );
+}
+
+#[test]
+fn staged_terminal_events_require_final_matching_finished_markers() {
+    let baseline = decode_one(
+        r#"{"type":"assistant","uuid":"terminal-stage-baseline","sessionId":"session-terminal-stage","timestamp":"2026-07-17T11:40:00Z","agentId":"terminal-stage-first","attributionAgent":"terminal-stage-second","message":{"content":[]}}"#,
+        &DecoderState::default(),
+    );
+    let known_agents = baseline
+        .events()
+        .iter()
+        .filter_map(|event| match event.payload() {
+            EventPayload::AgentStarted { native_agent_id } => Some(native_agent_id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(known_agents.len(), 2);
+    let pressure = unresolved_pressure_state(50, &known_agents);
+
+    let terminal = decode_one(
+        r#"{"type":"result","subtype":"success","uuid":"terminal-stage-result","sessionId":"session-terminal-stage","timestamp":"2026-07-17T11:40:01Z","agentId":"terminal-stage-first","attributionAgent":"terminal-stage-second"}"#,
+        &pressure,
+    );
+    let final_state: serde_json::Value =
+        serde_json::from_slice(terminal.next_state().as_bytes()).unwrap();
+    let final_finished = final_state["finished_agents"].as_array().unwrap();
+    let emitted_finished = terminal
+        .events()
+        .iter()
+        .filter_map(|event| match event.payload() {
+            EventPayload::AgentFinished {
+                native_agent_id,
+                outcome,
+            } => Some((native_agent_id, outcome)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!emitted_finished.is_empty());
+    for (agent_id, outcome) in emitted_finished {
+        assert!(final_finished.iter().any(|finished| {
+            finished["agent_id"] == *agent_id
+                && finished["outcome"] == serde_json::to_value(outcome).unwrap()
+        }));
+    }
+
+    let replay = decode_one(
+        r#"{"type":"result","subtype":"failed","uuid":"terminal-stage-replay","sessionId":"session-terminal-stage","timestamp":"2026-07-17T11:40:02Z","agentId":"terminal-stage-first","attributionAgent":"terminal-stage-second"}"#,
+        terminal.next_state(),
+    );
+    assert!(
+        !replay
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::AgentFinished { .. }))
+    );
 }
 
 #[test]

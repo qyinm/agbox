@@ -378,6 +378,7 @@ fn decode_activity_record(
     } = activity;
     let mut state = ClaudeStateV1::decode(prior_state)?;
     let mut output = Output::default();
+    let mut lifecycle = LifecycleCandidates::default();
     let spawn_request_event_id = graph
         .source_assistant_record_id
         .as_deref()
@@ -393,7 +394,7 @@ fn decode_activity_record(
         // Terminal records may close retained starts, but never manufacture a
         // new lifecycle after the bounded start history has expired.
         if native_type != "result" {
-            emit_agent_starts(scope, &graph.agent_ids, &mut state, &mut output)?;
+            stage_agent_starts(scope, &graph.agent_ids, &mut state, &mut lifecycle)?;
         }
         if graph.is_sidechain {
             emit_diagnostic(
@@ -424,8 +425,10 @@ fn decode_activity_record(
             _ => None,
         };
         if let Some(outcome) = terminal_outcome {
-            emit_agent_finishes(scope, &graph.agent_ids, outcome, &mut state, &mut output)?;
+            stage_agent_finishes(scope, &graph.agent_ids, outcome, &mut state, &mut lifecycle)?;
         }
+        state.finalize_record()?;
+        lifecycle.finalize(&state, &mut output)?;
         Ok(())
     })();
     if matches!(decoded, Err(DecodeError::OutputTooLarge)) {
@@ -539,6 +542,26 @@ impl Output {
             .len();
         self.reserve(bytes)?;
         self.events.push(event);
+        Ok(())
+    }
+
+    fn prepend_events(&mut self, mut events: Vec<ActivityEventV1>) -> Result<(), DecodeError> {
+        let total = self
+            .events
+            .len()
+            .checked_add(events.len())
+            .ok_or(DecodeError::OutputTooLarge)?;
+        if total > MAX_EVENTS_PER_RECORD {
+            return Err(DecodeError::OutputTooLarge);
+        }
+        for event in &events {
+            let bytes = serde_json::to_vec(event)
+                .map_err(|_| DecodeError::Malformed("measure-event".to_owned()))?
+                .len();
+            self.reserve(bytes)?;
+        }
+        events.append(&mut self.events);
+        self.events = events;
         Ok(())
     }
 
@@ -870,14 +893,77 @@ fn opaque_graph_id_from_bytes(domain: &str, session_id: &str, value: &[u8]) -> S
     )
 }
 
-fn emit_agent_starts(
+#[derive(Default)]
+struct LifecycleCandidates {
+    starts: Vec<StagedAgentStart>,
+    finishes: Vec<StagedAgentFinish>,
+}
+
+struct StagedAgentStart {
+    agent_id: String,
+    event: ActivityEventV1,
+}
+
+struct StagedAgentFinish {
+    agent_id: String,
+    outcome: ActionOutcome,
+    event: ActivityEventV1,
+}
+
+impl LifecycleCandidates {
+    fn push_start(&mut self, agent_id: String, event: ActivityEventV1) {
+        if !self
+            .starts
+            .iter()
+            .any(|candidate| candidate.agent_id == agent_id)
+        {
+            self.starts.push(StagedAgentStart { agent_id, event });
+        }
+    }
+
+    fn push_finish(&mut self, agent_id: String, outcome: ActionOutcome, event: ActivityEventV1) {
+        if !self
+            .finishes
+            .iter()
+            .any(|candidate| candidate.agent_id == agent_id)
+        {
+            self.finishes.push(StagedAgentFinish {
+                agent_id,
+                outcome,
+                event,
+            });
+        }
+    }
+
+    fn finalize(&mut self, state: &ClaudeStateV1, output: &mut Output) -> Result<(), DecodeError> {
+        let starts = std::mem::take(&mut self.starts)
+            .into_iter()
+            .filter(|candidate| state.retains_agent_lifecycle(&candidate.agent_id))
+            .map(|candidate| candidate.event)
+            .collect();
+        output.prepend_events(starts)?;
+
+        for candidate in std::mem::take(&mut self.finishes) {
+            if state.finished_agent_outcome(&candidate.agent_id) == Some(candidate.outcome) {
+                output.push_event(candidate.event)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn stage_agent_starts(
     scope: EventScope<'_>,
     agent_ids: &[String],
     state: &mut ClaudeStateV1,
-    output: &mut Output,
+    lifecycle: &mut LifecycleCandidates,
 ) -> Result<(), DecodeError> {
-    for (index, agent_id) in agent_ids.iter().enumerate() {
-        if !state.observe_agent(agent_id)? {
+    let previously_seen = agent_ids
+        .iter()
+        .map(|agent_id| state.retains_agent_lifecycle(agent_id))
+        .collect::<Vec<_>>();
+    for (index, (agent_id, was_seen)) in agent_ids.iter().zip(previously_seen).enumerate() {
+        if !state.observe_agent(agent_id)? || was_seen {
             continue;
         }
         let ordinal = 300_u32
@@ -900,20 +986,24 @@ fn emit_agent_starts(
                 native_agent_id: agent_id.clone(),
             },
         )?;
-        output.push_event(event)?;
+        lifecycle.push_start(agent_id.clone(), event);
     }
     Ok(())
 }
 
-fn emit_agent_finishes(
+fn stage_agent_finishes(
     scope: EventScope<'_>,
     agent_ids: &[String],
     outcome: ActionOutcome,
     state: &mut ClaudeStateV1,
-    output: &mut Output,
+    lifecycle: &mut LifecycleCandidates,
 ) -> Result<(), DecodeError> {
-    for (index, agent_id) in agent_ids.iter().enumerate() {
-        if !state.finish_agent(agent_id, outcome)? {
+    let previously_finished = agent_ids
+        .iter()
+        .map(|agent_id| state.finished_agent_outcome(agent_id).is_some())
+        .collect::<Vec<_>>();
+    for (index, (agent_id, was_finished)) in agent_ids.iter().zip(previously_finished).enumerate() {
+        if !state.finish_agent(agent_id, outcome)? || was_finished {
             continue;
         }
         let ordinal = 340_u32
@@ -937,7 +1027,7 @@ fn emit_agent_finishes(
                 outcome,
             },
         )?;
-        output.push_event(event)?;
+        lifecycle.push_finish(agent_id.clone(), outcome, event);
     }
     Ok(())
 }
