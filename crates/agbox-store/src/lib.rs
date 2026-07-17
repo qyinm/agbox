@@ -2,8 +2,10 @@ mod crypto;
 mod evidence;
 mod fs_security;
 mod migrate;
+mod read;
+mod writer;
 
-use std::{ffi::OsStr, fs::File, path::Path};
+use std::{ffi::OsStr, fmt, fs::File, path::Path, sync::Arc};
 
 use rusqlite::Connection;
 
@@ -11,27 +13,226 @@ use rusqlite::Connection;
 pub use crypto::MemoryKeyProvider;
 pub use crypto::{CryptoError, KeyProvider, KeyringKeyProvider};
 pub use evidence::{EvidenceContext, EvidenceError, EvidenceOwnerRef, EvidenceVault};
+pub use read::{READ_POOL_SIZE, ReadPool, ReadStore};
+pub use writer::{
+    CommitReceipt, ContentRefWrite, CursorState, EvidenceLink, EvidenceOwner, EvidenceWrite,
+    IngestionChunk, IngestionFault, MAX_BATCH_BYTES, MAX_BATCH_RECORDS, SchemaFingerprintUpdate,
+    WRITER_QUEUE_CAPACITY, WriterHandle, stable_content_ref_id,
+};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum StoreError {
     #[error("filesystem security check failed")]
     Io(#[from] std::io::Error),
     #[error("database operation failed")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("evidence persistence failed")]
+    Evidence(#[from] EvidenceError),
+    #[error("normalized value serialization failed")]
+    Serialization(#[from] serde_json::Error),
     #[error("the legacy database name is reserved")]
     LegacyDatabaseReserved,
     #[error("unsupported database schema version {0}")]
     UnsupportedSchema(i64),
+    #[error("ingestion batch is invalid")]
+    InvalidBatch,
+    #[error("content reference ID is not the stable project-scoped ID")]
+    InvalidContentRefId,
+    #[error("registered source was not found")]
+    SourceNotFound,
+    #[error("ingestion project or provider does not match the registered source")]
+    ProjectMismatch,
+    #[error("cursor conflict")]
+    CursorConflict,
+    #[error("immutable row conflict")]
+    ImmutableConflict,
+    #[error("writer stopped")]
+    WriterStopped,
+    #[error("read pool stopped")]
+    ReaderStopped,
+    #[error("read pool size must be exactly four")]
+    InvalidReadPoolSize,
+}
+
+impl fmt::Debug for StoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Io(_) => "Io",
+            Self::Sqlite(_) => "Sqlite",
+            Self::Evidence(_) => "Evidence",
+            Self::Serialization(_) => "Serialization",
+            Self::LegacyDatabaseReserved => "LegacyDatabaseReserved",
+            Self::UnsupportedSchema(_) => "UnsupportedSchema",
+            Self::InvalidBatch => "InvalidBatch",
+            Self::InvalidContentRefId => "InvalidContentRefId",
+            Self::SourceNotFound => "SourceNotFound",
+            Self::ProjectMismatch => "ProjectMismatch",
+            Self::CursorConflict => "CursorConflict",
+            Self::ImmutableConflict => "ImmutableConflict",
+            Self::WriterStopped => "WriterStopped",
+            Self::ReaderStopped => "ReaderStopped",
+            Self::InvalidReadPoolSize => "InvalidReadPoolSize",
+        };
+        formatter
+            .debug_struct("StoreError")
+            .field("kind", &label)
+            .finish()
+    }
 }
 
 pub struct Store {
-    writer: Connection,
-    _directory: File,
+    pub(crate) writer: Connection,
+    pub(crate) _directory: File,
 }
 
 impl std::fmt::Debug for Store {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("Store").finish_non_exhaustive()
+    }
+}
+
+pub struct StoreRuntime {
+    writer: WriterHandle,
+    read: ReadStore,
+    _directory: File,
+    writer_thread: Option<std::thread::JoinHandle<()>>,
+    shutdown_enqueued: bool,
+}
+
+impl fmt::Debug for StoreRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StoreRuntime")
+            .field("writer", &self.writer)
+            .field("read", &self.read)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StoreRuntime {
+    /// Starts the production store runtime with the OS credential provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database, read pool, evidence vault, or
+    /// dedicated writer thread cannot start.
+    pub async fn start(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::start_with_key_provider(path, Arc::new(KeyringKeyProvider)).await
+    }
+
+    /// Starts the same production runtime with a dependency-injected key source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database, read pool, evidence vault, or
+    /// dedicated writer thread cannot start.
+    pub async fn start_with_key_provider(
+        path: impl AsRef<Path>,
+        keys: Arc<dyn KeyProvider>,
+    ) -> Result<Self, StoreError> {
+        let path = path.as_ref().to_path_buf();
+        let (connection, directory, read, vault) = tokio::task::spawn_blocking(move || {
+            let store = Store::open_new(&path)?;
+            let read = ReadStore::new(ReadPool::open(&path, READ_POOL_SIZE)?);
+            let evidence_root = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "state database path has no parent directory",
+                    )
+                })?
+                .join("evidence");
+            let vault = Arc::new(EvidenceVault::open(evidence_root, keys)?);
+            let Store {
+                writer: connection,
+                _directory: directory,
+            } = store;
+            Ok::<_, StoreError>((connection, directory, read, vault))
+        })
+        .await
+        .map_err(|_| StoreError::WriterStopped)??;
+        let (sender, receiver) = tokio::sync::mpsc::channel(WRITER_QUEUE_CAPACITY);
+        let writer = WriterHandle { sender };
+        let writer_thread = std::thread::Builder::new()
+            .name("agbox-sqlite-writer".into())
+            .spawn(move || writer::run_writer(connection, vault, receiver))?;
+        Ok(Self {
+            writer,
+            read,
+            _directory: directory,
+            writer_thread: Some(writer_thread),
+            shutdown_enqueued: false,
+        })
+    }
+
+    #[must_use]
+    pub fn writer(&self) -> &WriterHandle {
+        &self.writer
+    }
+
+    #[must_use]
+    pub fn read(&self) -> &ReadStore {
+        &self.read
+    }
+
+    /// Drains queued writes and joins the dedicated writer without blocking an
+    /// async executor thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::WriterStopped`] if the writer has already stopped
+    /// or its thread panics during shutdown.
+    pub async fn shutdown(mut self) -> Result<(), StoreError> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let send_result = self
+            .writer
+            .sender
+            .send(writer::WriteCommand::Shutdown { reply })
+            .await
+            .map_err(|_| StoreError::WriterStopped);
+        if send_result.is_ok() {
+            self.shutdown_enqueued = true;
+        }
+        let receive_result = if send_result.is_ok() {
+            receive.await.map_err(|_| StoreError::WriterStopped)
+        } else {
+            Err(StoreError::WriterStopped)
+        };
+        let thread = self.writer_thread.take();
+        let join_result = tokio::task::spawn_blocking(move || {
+            thread
+                .map(std::thread::JoinHandle::join)
+                .transpose()
+                .map_err(|_| StoreError::WriterStopped)
+        })
+        .await
+        .map_err(|_| StoreError::WriterStopped)?;
+        send_result?;
+        receive_result?;
+        join_result.map(|_| ())
+    }
+}
+
+impl Drop for StoreRuntime {
+    fn drop(&mut self) {
+        if !self.shutdown_enqueued {
+            let (reply, _receive) = tokio::sync::oneshot::channel();
+            let mut shutdown = writer::WriteCommand::Shutdown { reply };
+            loop {
+                match self.writer.sender.try_send(shutdown) {
+                    Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
+                        shutdown = command;
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        }
+        if let Some(thread) = self.writer_thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
