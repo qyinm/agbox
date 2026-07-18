@@ -1,11 +1,12 @@
 use std::{
+    ffi::OsStr,
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     future::Future,
     io::{self, Read, Write},
     os::unix::{
         ffi::OsStrExt,
-        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        fs::{MetadataExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     sync::{
@@ -30,6 +31,8 @@ pub const MAX_SPOOL_ENTRIES: usize = 1_024;
 const ENVELOPE_OVERHEAD: usize = 5 + 24 + 16;
 const MAX_SESSION_ID_BYTES: usize = 1_024;
 const MAX_HOOK_PATH_BYTES: usize = 4 * 1_024;
+const LOCK_FILE_NAME: &[u8] = b".spool.lock";
+const TEMP_SUFFIX: &[u8] = b".agbx.tmp";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -71,16 +74,6 @@ impl Serialize for HookSignal {
     }
 }
 
-impl<'de> Deserialize<'de> for HookSignal {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let wire = HookSignalWire::deserialize(deserializer)?;
-        Self::from_wire(wire).map_err(serde::de::Error::custom)
-    }
-}
-
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct HookSignalWire {
@@ -114,7 +107,7 @@ impl HookSignal {
     ///
     /// Rejects empty or oversized session identifiers and normalized signals
     /// that do not fit the spool entry contract.
-    pub fn new(
+    fn new(
         provider: Provider,
         kind: HookEventKind,
         native_session_id: impl AsRef<[u8]>,
@@ -137,6 +130,26 @@ impl HookSignal {
         };
         signal.validate()?;
         Ok(signal)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn fixture_for_test(
+        provider: Provider,
+        kind: HookEventKind,
+        native_session_id: impl AsRef<[u8]>,
+        source: &SourceKey,
+        observed_at: OffsetDateTime,
+        target_size: u64,
+    ) -> Result<Self, SpoolError> {
+        Self::new(
+            provider,
+            kind,
+            native_session_id,
+            source,
+            observed_at,
+            target_size,
+        )
     }
 
     /// Streaming-extracts only the normalized allowlisted hook fields.
@@ -313,7 +326,9 @@ impl fmt::Debug for SpoolError {
 }
 
 pub struct HookSpool {
-    directory: PathBuf,
+    directory_path: PathBuf,
+    directory: File,
+    lock_file: File,
     key: Zeroizing<[u8; 32]>,
     limits: HookSpoolLimits,
     sequence: AtomicU64,
@@ -355,16 +370,24 @@ impl HookSpool {
         limits: HookSpoolLimits,
     ) -> Result<Self, SpoolError> {
         validate_limits(limits)?;
-        let directory = prepare_directory(directory.as_ref())?;
+        let (directory_path, directory) = prepare_directory(directory.as_ref())?;
+        let lock_file = open_lock_file(&directory)?;
         let key = keys.master_key()?;
-        Ok(Self {
+        let spool = Self {
+            directory_path,
             directory,
+            lock_file,
             key,
             limits,
             sequence: AtomicU64::new(0),
             gate: Mutex::new(()),
             drain_gate: tokio::sync::Mutex::new(()),
-        })
+        };
+        {
+            let _lock = spool.lock_sync()?;
+            spool.cleanup_temps()?;
+        }
+        Ok(spool)
     }
 
     /// Encrypts and atomically adds a normalized entry after checking all caps.
@@ -375,6 +398,8 @@ impl HookSpool {
     /// count, byte, or per-entry cap would be exceeded.
     pub fn enqueue(&self, signal: &HookSignal) -> Result<(), SpoolError> {
         let _guard = self.gate.lock().map_err(|_| SpoolError::InvalidEntry)?;
+        let _lock = self.lock_sync()?;
+        self.cleanup_temps()?;
         let plaintext =
             Zeroizing::new(serde_json::to_vec(signal).map_err(|_| SpoolError::InvalidEntry)?);
         if plaintext.len() > self.limits.max_entry_bytes {
@@ -397,14 +422,38 @@ impl HookSpool {
         {
             return Err(SpoolError::Full);
         }
-        let path = self.directory.join(&name);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
+        let temporary = format!(".{name}.tmp");
+        let mut file = rustix::fs::openat(
+            &self.directory,
+            temporary.as_str(),
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .map(File::from)
+        .map_err(io::Error::from)?;
+        rustix::fs::fchmod(&file, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR)
+            .map_err(io::Error::from)?;
+        let mut cleanup = TempCleanup {
+            directory: &self.directory,
+            name: temporary.as_bytes(),
+            published: false,
+        };
         file.write_all(&envelope)?;
         file.sync_all()?;
+        rustix::fs::renameat_with(
+            &self.directory,
+            temporary.as_str(),
+            &self.directory,
+            name.as_str(),
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(io::Error::from)?;
+        cleanup.published = true;
+        self.directory.sync_all()?;
         Ok(())
     }
 
@@ -422,25 +471,32 @@ impl HookSpool {
         Fut: Future<Output = Result<(), E>>,
     {
         let _drain = self.drain_gate.lock().await;
-        let entries = {
-            let _guard = self.gate.lock().map_err(|_| SpoolError::InvalidEntry)?;
-            self.scan_entries()?
-        };
+        let _file_lock = self.lock_async().await?;
+        self.cleanup_temps()?;
+        let entries = self.scan_entries()?;
         let mut committed = 0_usize;
         for entry in entries {
             let plaintext = self.read_entry(&entry)?;
-            let signal: HookSignal =
+            let wire: HookSignalWire =
                 serde_json::from_slice(&plaintext).map_err(|_| SpoolError::InvalidEntry)?;
+            let signal = HookSignal::from_wire(wire)?;
             commit(signal).await.map_err(|_| SpoolError::CommitFailed)?;
-            let _guard = self.gate.lock().map_err(|_| SpoolError::InvalidEntry)?;
-            let current = fs::symlink_metadata(&entry.path)?;
-            if !current.file_type().is_file()
-                || current.dev() != entry.device
-                || current.ino() != entry.inode
-            {
+            let current = rustix::fs::statat(
+                &self.directory,
+                OsStr::from_bytes(&entry.name),
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(io::Error::from)?;
+            if !entry.matches(&current) {
                 return Err(SpoolError::InvalidEntry);
             }
-            fs::remove_file(&entry.path)?;
+            rustix::fs::unlinkat(
+                &self.directory,
+                OsStr::from_bytes(&entry.name),
+                rustix::fs::AtFlags::empty(),
+            )
+            .map_err(io::Error::from)?;
+            self.directory.sync_all()?;
             committed = committed.saturating_add(1);
         }
         Ok(committed)
@@ -449,10 +505,13 @@ impl HookSpool {
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn entry_paths(&self) -> Result<Vec<PathBuf>, SpoolError> {
+        let _guard = self.gate.lock().map_err(|_| SpoolError::InvalidEntry)?;
+        let _lock = self.lock_sync()?;
+        self.cleanup_temps()?;
         Ok(self
             .scan_entries()?
             .into_iter()
-            .map(|entry| entry.path)
+            .map(|entry| self.directory_path.join(OsStr::from_bytes(&entry.name)))
             .collect())
     }
 
@@ -462,7 +521,21 @@ impl HookSpool {
             .max_entry_bytes
             .checked_add(ENVELOPE_OVERHEAD)
             .ok_or(SpoolError::InvalidEntry)?;
-        let file = File::open(&entry.path)?;
+        let file = rustix::fs::openat(
+            &self.directory,
+            OsStr::from_bytes(&entry.name),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(io::Error::from)?;
+        let current = rustix::fs::fstat(&file).map_err(io::Error::from)?;
+        if !entry.matches(&current) {
+            return Err(SpoolError::InvalidEntry);
+        }
         let entry_capacity = usize::try_from(entry.bytes).unwrap_or(usize::MAX);
         let mut bytes = Vec::with_capacity(max_envelope.min(entry_capacity));
         file.take(u64::try_from(max_envelope + 1).map_err(|_| SpoolError::InvalidEntry)?)
@@ -470,40 +543,50 @@ impl HookSpool {
         if bytes.len() > max_envelope {
             return Err(SpoolError::InvalidEntry);
         }
-        let name = entry
-            .path
-            .file_name()
-            .ok_or(SpoolError::InvalidEntry)?
-            .as_bytes();
-        open(&self.key, name, &bytes)
+        open(&self.key, &entry.name, &bytes)
             .map(Zeroizing::new)
             .map_err(|_| SpoolError::InvalidEntry)
     }
 
     fn scan_entries(&self) -> Result<Vec<SpoolEntry>, SpoolError> {
         let mut entries = Vec::with_capacity(self.limits.max_entries.min(64));
-        for entry in fs::read_dir(&self.directory)?.take(self.limits.max_entries + 1) {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name_bytes = name.as_bytes();
-            if !name_bytes.ends_with(b".agbx") {
+        let directory = directory_stream(&self.directory)?;
+        let mut visited = 0_usize;
+        for entry in directory {
+            let entry = entry.map_err(io::Error::from)?;
+            let name = entry.file_name().to_bytes();
+            if matches!(name, b"." | b"..") || name == LOCK_FILE_NAME {
+                continue;
+            }
+            visited = visited.saturating_add(1);
+            if visited > self.limits.max_entries + MAX_SPOOL_ENTRIES {
+                return Err(SpoolError::Full);
+            }
+            if name.ends_with(TEMP_SUFFIX) || !name.ends_with(b".agbx") {
                 return Err(SpoolError::InvalidEntry);
             }
-            let metadata = fs::symlink_metadata(entry.path())?;
-            if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o077 != 0 {
+            let stat = rustix::fs::statat(
+                &self.directory,
+                OsStr::from_bytes(name),
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(io::Error::from)?;
+            if !rustix::fs::FileType::from_raw_mode(stat.st_mode).is_file()
+                || stat.st_mode & 0o077 != 0
+            {
                 return Err(SpoolError::InvalidEntry);
             }
             entries.push(SpoolEntry {
-                path: entry.path(),
-                bytes: metadata.len(),
-                device: metadata.dev(),
-                inode: metadata.ino(),
+                name: name.to_vec(),
+                bytes: u64::try_from(stat.st_size).map_err(|_| SpoolError::InvalidEntry)?,
+                device: u64::try_from(stat.st_dev).map_err(|_| SpoolError::InvalidEntry)?,
+                inode: u128::from(stat.st_ino),
             });
             if entries.len() > self.limits.max_entries {
                 return Err(SpoolError::Full);
             }
         }
-        entries.sort_by(|left, right| left.path.file_name().cmp(&right.path.file_name()));
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(entries)
     }
 
@@ -515,13 +598,91 @@ impl HookSpool {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
         Ok(format!("{nanos:020}-{sequence:016x}.agbx"))
     }
+
+    fn cleanup_temps(&self) -> Result<(), SpoolError> {
+        let directory = directory_stream(&self.directory)?;
+        let mut temps = 0_usize;
+        for entry in directory {
+            let entry = entry.map_err(io::Error::from)?;
+            let name = entry.file_name().to_bytes();
+            if name.ends_with(TEMP_SUFFIX) {
+                temps = temps.saturating_add(1);
+                if temps > MAX_SPOOL_ENTRIES {
+                    return Err(SpoolError::Full);
+                }
+                rustix::fs::unlinkat(
+                    &self.directory,
+                    OsStr::from_bytes(name),
+                    rustix::fs::AtFlags::empty(),
+                )
+                .map_err(io::Error::from)?;
+            }
+        }
+        if temps != 0 {
+            self.directory.sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn lock_sync(&self) -> Result<OwnedSpoolLock, SpoolError> {
+        let lock = self.lock_file.try_clone()?;
+        OwnedSpoolLock::acquire(lock)
+    }
+
+    async fn lock_async(&self) -> Result<OwnedSpoolLock, SpoolError> {
+        let lock = self.lock_file.try_clone()?;
+        tokio::task::spawn_blocking(move || OwnedSpoolLock::acquire(lock))
+            .await
+            .map_err(|_| SpoolError::InvalidEntry)?
+    }
 }
 
 struct SpoolEntry {
-    path: PathBuf,
+    name: Vec<u8>,
     bytes: u64,
     device: u64,
-    inode: u64,
+    inode: u128,
+}
+
+impl SpoolEntry {
+    fn matches(&self, stat: &rustix::fs::Stat) -> bool {
+        u64::try_from(stat.st_dev).ok() == Some(self.device)
+            && u128::from(stat.st_ino) == self.inode
+    }
+}
+
+struct TempCleanup<'a> {
+    directory: &'a File,
+    name: &'a [u8],
+    published: bool,
+}
+
+impl Drop for TempCleanup<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = rustix::fs::unlinkat(
+                self.directory,
+                OsStr::from_bytes(self.name),
+                rustix::fs::AtFlags::empty(),
+            );
+        }
+    }
+}
+
+struct OwnedSpoolLock(File);
+
+impl OwnedSpoolLock {
+    fn acquire(file: File) -> Result<Self, SpoolError> {
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
+            .map_err(io::Error::from)?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for OwnedSpoolLock {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
 }
 
 fn validate_limits(limits: HookSpoolLimits) -> Result<(), SpoolError> {
@@ -537,7 +698,7 @@ fn validate_limits(limits: HookSpoolLimits) -> Result<(), SpoolError> {
     Ok(())
 }
 
-fn prepare_directory(path: &Path) -> Result<PathBuf, SpoolError> {
+fn prepare_directory(path: &Path) -> Result<(PathBuf, File), SpoolError> {
     if path.as_os_str().is_empty() {
         return Err(SpoolError::InvalidEntry);
     }
@@ -553,7 +714,67 @@ fn prepare_directory(path: &Path) -> Result<PathBuf, SpoolError> {
     if !metadata.file_type().is_dir() || metadata.permissions().mode() & 0o077 != 0 {
         return Err(SpoolError::InvalidEntry);
     }
-    Ok(canonical)
+    let directory = rustix::fs::open(
+        &canonical,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::DIRECTORY,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(io::Error::from)?;
+    rustix::fs::fchmod(
+        &directory,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR | rustix::fs::Mode::XUSR,
+    )
+    .map_err(io::Error::from)?;
+    let stat = rustix::fs::fstat(&directory).map_err(io::Error::from)?;
+    if !rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir()
+        || u64::try_from(stat.st_dev).ok() != Some(metadata.dev())
+        || u128::from(stat.st_ino) != u128::from(metadata.ino())
+    {
+        return Err(SpoolError::InvalidEntry);
+    }
+    Ok((canonical, directory))
+}
+
+fn open_lock_file(directory: &File) -> Result<File, SpoolError> {
+    let file = rustix::fs::openat(
+        directory,
+        OsStr::from_bytes(LOCK_FILE_NAME),
+        rustix::fs::OFlags::RDWR
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )
+    .map(File::from)
+    .map_err(io::Error::from)?;
+    rustix::fs::fchmod(&file, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR)
+        .map_err(io::Error::from)?;
+    let stat = rustix::fs::fstat(&file).map_err(io::Error::from)?;
+    if !rustix::fs::FileType::from_raw_mode(stat.st_mode).is_file() {
+        return Err(SpoolError::InvalidEntry);
+    }
+    Ok(file)
+}
+
+fn directory_stream(directory: &File) -> Result<rustix::fs::Dir, SpoolError> {
+    let stream = rustix::fs::openat(
+        directory,
+        ".",
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::DIRECTORY,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(io::Error::from)?;
+    rustix::fs::Dir::new(stream)
+        .map_err(io::Error::from)
+        .map_err(SpoolError::from)
 }
 
 fn parse_provider(value: &str) -> Result<Provider, SpoolError> {

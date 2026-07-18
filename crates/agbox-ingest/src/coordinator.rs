@@ -1255,11 +1255,25 @@ impl IngestionRuntime {
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), IngestError> {
         let handle = watcher.start(shutdown).await?;
-        let (input, watcher_task) = handle.into_runtime_parts()?;
+        let (input, watcher_task, mut readiness) = handle.into_runtime_parts()?;
         // Watcher cancellation closes admission only after its bounded backend
         // signals have been reconciled. The unchanged four-worker `run` path
         // then drains the input channel and keyed queue before joining.
-        let runtime_result = self.run(input).await;
+        let runtime = self.run(input);
+        tokio::pin!(runtime);
+        let mut runtime_result = None;
+        tokio::select! {
+            ready = &mut readiness => {
+                ready.map_err(|_| IngestError::WatcherStopped)?;
+            }
+            result = &mut runtime => {
+                runtime_result = Some(result);
+            }
+        }
+        let runtime_result = match runtime_result {
+            Some(result) => result,
+            None => runtime.await,
+        };
         let watcher_result = watcher_task
             .await
             .map_err(|_| IngestError::WatcherStopped)?

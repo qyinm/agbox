@@ -3,7 +3,10 @@
 use std::{
     io::Cursor,
     os::unix::fs::{PermissionsExt, symlink},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use agbox_core::Provider;
@@ -32,7 +35,7 @@ impl HookSourceVerifier for Verifier {
 }
 
 fn fixture(index: u8) -> HookSignal {
-    HookSignal::new(
+    HookSignal::fixture_for_test(
         Provider::Codex,
         HookEventKind::SessionEnd,
         format!("session-{index}").as_bytes(),
@@ -257,5 +260,99 @@ fn symlink_spool_directory_is_rejected_without_touching_target() {
     assert_eq!(
         std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
         0o755
+    );
+}
+
+#[tokio::test]
+async fn stale_partial_temp_is_cleaned_and_never_blocks_lexical_drain() {
+    let directory = tempfile::tempdir().unwrap();
+    let initial_spool = spool(&directory, HookSpoolLimits::default());
+    initial_spool.enqueue(&fixture(1)).unwrap();
+    drop(initial_spool);
+    let partial = directory
+        .path()
+        .join(".00000000000000000000-0000000000000000.agbx.tmp");
+    std::fs::write(&partial, b"AGBX\x01partial").unwrap();
+    let reopened = spool(&directory, HookSpoolLimits::default());
+    assert!(!partial.exists());
+    assert_eq!(
+        reopened
+            .drain(|_| async { Ok::<(), ()>(()) })
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(reopened.entry_paths().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn two_spool_instances_drain_each_entry_only_after_one_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = Arc::new(spool(&directory, HookSpoolLimits::default()));
+    let second = Arc::new(spool(&directory, HookSpoolLimits::default()));
+    for index in 1..=8 {
+        first.enqueue(&fixture(index)).unwrap();
+    }
+    let commits = Arc::new(AtomicUsize::new(0));
+    let left_commits = Arc::clone(&commits);
+    let left = {
+        let first = Arc::clone(&first);
+        tokio::spawn(async move {
+            first
+                .drain(move |_| {
+                    let commits = Arc::clone(&left_commits);
+                    async move {
+                        commits.fetch_add(1, Ordering::Relaxed);
+                        Ok::<(), ()>(())
+                    }
+                })
+                .await
+        })
+    };
+    let right_commits = Arc::clone(&commits);
+    let right = {
+        let second = Arc::clone(&second);
+        tokio::spawn(async move {
+            second
+                .drain(move |_| {
+                    let commits = Arc::clone(&right_commits);
+                    async move {
+                        commits.fetch_add(1, Ordering::Relaxed);
+                        Ok::<(), ()>(())
+                    }
+                })
+                .await
+        })
+    };
+    let drained = left.await.unwrap().unwrap() + right.await.unwrap().unwrap();
+    assert_eq!(drained, 8);
+    assert_eq!(commits.load(Ordering::Relaxed), 8);
+    assert!(first.entry_paths().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn directory_rebinding_cannot_redirect_descriptor_relative_spool_ops() {
+    let parent = tempfile::tempdir().unwrap();
+    let original = parent.path().join("spool");
+    std::fs::create_dir(&original).unwrap();
+    let spool = HookSpool::new(&original, Arc::new(MemoryKeyProvider::fixed([7; 32]))).unwrap();
+    let moved = parent.path().join("bound-spool");
+    std::fs::rename(&original, &moved).unwrap();
+    std::fs::create_dir(&original).unwrap();
+    std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    spool.enqueue(&fixture(9)).unwrap();
+    assert_eq!(
+        spool.drain(|_| async { Ok::<(), ()>(()) }).await.unwrap(),
+        1
+    );
+    assert_eq!(std::fs::read_dir(&original).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::read_dir(&moved)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name() != ".spool.lock")
+            .count(),
+        0
     );
 }
