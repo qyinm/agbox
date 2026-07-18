@@ -5,6 +5,8 @@ mod identity;
 mod project;
 mod queue;
 mod record;
+mod spool;
+mod watcher;
 
 pub use discovery::{
     DISCOVERY_ENTRIES_PER_YIELD, DiscoveryBatch, DiscoveryCursor, DiscoveryError, DiscoveryFault,
@@ -23,6 +25,15 @@ pub use queue::{
     WorkPriority, validate_decoder_workers, validate_source_queue_capacity,
 };
 pub use record::{READ_BUFFER_BYTES, RecordScanner, RecordWindow, ScanOutcome, WindowReader};
+pub use spool::{
+    HookEventKind, HookSignal, HookSourceVerifier, HookSpool, HookSpoolLimits,
+    MAX_HOOK_PAYLOAD_BYTES, MAX_SPOOL_BYTES, MAX_SPOOL_ENTRIES, MAX_SPOOL_ENTRY_BYTES, SpoolError,
+};
+pub use watcher::{
+    MAX_BACKEND_EVENT_PATHS, POLL_INTERVAL, WATCH_SIGNAL_CAPACITY, WatchEventKind, WatchRoot,
+    WatchSignal, WatchSignalBridge, WatchedSource, WatcherCatalog, WatcherError, WatcherHandle,
+    WatcherRuntime,
+};
 
 #[cfg(feature = "test-support")]
 pub mod test_support {

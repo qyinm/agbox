@@ -18,6 +18,7 @@ agbox-adapters.workspace = true
 agbox-core.workspace = true
 agbox-store.workspace = true
 blake3.workspace = true
+notify.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -27,7 +27,7 @@ use tokio::sync::Notify;
 
 use crate::{
     DECODER_WORKERS, KeyedQueue, QueueError, QueueItem, RecordScanner, ScanOutcome, SourceKey,
-    VerifiedOpenError, VerifiedSourceOpener, WorkPriority,
+    VerifiedOpenError, VerifiedSourceOpener, WatcherError, WatcherRuntime, WorkPriority,
 };
 
 /// Immutable source facts needed to decode one registered generation.
@@ -85,6 +85,8 @@ pub enum IngestError {
     NoProgress,
     #[error("decoder worker stopped")]
     WorkerStopped,
+    #[error("source watcher stopped")]
+    WatcherStopped,
     #[error("injected retryable ingestion failure")]
     InjectedRetry(RetryClass),
 }
@@ -102,6 +104,7 @@ impl fmt::Debug for IngestError {
             Self::SemanticMeasurementMismatch => "SemanticMeasurementMismatch",
             Self::NoProgress => "NoProgress",
             Self::WorkerStopped => "WorkerStopped",
+            Self::WatcherStopped => "WatcherStopped",
             Self::InjectedRetry(_) => "InjectedRetry",
         })
     }
@@ -110,6 +113,12 @@ impl fmt::Debug for IngestError {
 impl From<VerifiedOpenError> for IngestError {
     fn from(_: VerifiedOpenError) -> Self {
         Self::IdentityChanged
+    }
+}
+
+impl From<WatcherError> for IngestError {
+    fn from(_: WatcherError) -> Self {
+        Self::WatcherStopped
     }
 }
 
@@ -1232,6 +1241,30 @@ impl IngestionRuntime {
         let result = self.run_until(input, receive_shutdown).await;
         drop(shutdown);
         result
+    }
+
+    /// Starts a live watcher through its readiness barrier, then feeds its
+    /// bounded signals through the same four-worker keyed-queue runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns watcher startup/failure or the first coordinator worker failure.
+    pub async fn run_watcher_until(
+        self,
+        watcher: WatcherRuntime,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), IngestError> {
+        let handle = watcher.start(shutdown).await?;
+        let (input, watcher_task) = handle.into_runtime_parts()?;
+        // Watcher cancellation closes admission only after its bounded backend
+        // signals have been reconciled. The unchanged four-worker `run` path
+        // then drains the input channel and keyed queue before joining.
+        let runtime_result = self.run(input).await;
+        let watcher_result = watcher_task
+            .await
+            .map_err(|_| IngestError::WatcherStopped)?
+            .map_err(IngestError::from);
+        runtime_result.and(watcher_result)
     }
 
     /// Runs exactly four workers until input closes or explicit shutdown is signaled.

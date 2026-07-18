@@ -88,6 +88,11 @@ impl KeyProvider for KeyringKeyProvider {
     }
 }
 
+/// Seals plaintext in the versioned authenticated-encryption envelope.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::Cipher`] if encryption fails.
 pub fn seal(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let cipher = XChaCha20Poly1305::new(key.into());
     let nonce = XNonce::generate();
@@ -106,6 +111,12 @@ pub fn seal(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Cry
     Ok(envelope)
 }
 
+/// Opens and authenticates a versioned encrypted envelope.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::Cipher`] for malformed, unauthenticated, or
+/// undecryptable envelopes.
 pub fn open(key: &[u8; 32], aad: &[u8], envelope: &[u8]) -> Result<Vec<u8>, CryptoError> {
     if envelope.len() < 5 + 24 || &envelope[..5] != b"AGBX\x01" {
         return Err(CryptoError::Cipher);

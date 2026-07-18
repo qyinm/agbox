@@ -11,7 +11,7 @@ use rusqlite::Connection;
 
 #[cfg(feature = "test-support")]
 pub use crypto::MemoryKeyProvider;
-pub use crypto::{CryptoError, KeyProvider, KeyringKeyProvider};
+pub use crypto::{CryptoError, KeyProvider, KeyringKeyProvider, open, seal};
 pub use evidence::{EvidenceContext, EvidenceError, EvidenceOwnerRef, EvidenceVault};
 pub use read::{READ_POOL_SIZE, ReadPool, ReadStore};
 pub use writer::{
