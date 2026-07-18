@@ -7,7 +7,7 @@ use agbox_adapters::{
     SourceAdapter, adapters, test_support::decode_fixture_file,
 };
 use agbox_core::{ActionOutcome, EventPayload, ProjectId, Provider};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 
 fn context() -> DecodeContext {
     DecodeContext {
@@ -27,6 +27,18 @@ fn decode_one(
     CodexAdapter.decode(
         &MemoryRecordSource::new(json.as_bytes().to_vec()),
         &context(),
+        state,
+    )
+}
+
+fn decode_with_context(
+    json: &str,
+    state: &DecoderState,
+    context: &DecodeContext,
+) -> Result<agbox_adapters::DecodedRecord, agbox_adapters::DecodeError> {
+    CodexAdapter.decode(
+        &MemoryRecordSource::new(json.as_bytes().to_vec()),
+        context,
         state,
     )
 }
@@ -61,6 +73,44 @@ fn drain_continuations(mut state: DecoderState) -> Vec<agbox_adapters::DecodedRe
         records.push(decoded);
     }
     records
+}
+
+fn active_continuation_state(context: &DecodeContext) -> DecoderState {
+    let mut state = decode_with_context(
+        r#"{"timestamp":"2026-07-17T02:00:00Z","type":"session_meta","payload":{}}"#,
+        &DecoderState::default(),
+        context,
+    )
+    .unwrap()
+    .next_state()
+    .clone();
+    for index in 0..33 {
+        let request = decode_with_context(
+            &format!(
+                r#"{{"timestamp":"2026-07-17T02:00:01Z","type":"response_item","payload":{{"type":"custom_tool_call","name":"apply_patch","input":"patch","path":"src/{index}.rs","call_id":"call-{index}"}}}}"#
+            ),
+            &state,
+            context,
+        )
+        .unwrap();
+        let staged = decode_with_context(
+            &format!(
+                r#"{{"timestamp":"2026-07-17T02:00:02Z","type":"response_item","payload":{{"type":"function_call_output","call_id":"call-{index}","status":"completed","output":"done"}}}}"#
+            ),
+            request.next_state(),
+            context,
+        )
+        .unwrap();
+        state = staged.next_state().clone();
+    }
+    decode_with_context(
+        r#"{"timestamp":"2026-07-17T02:00:03Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+        &state,
+        context,
+    )
+    .unwrap()
+    .next_state()
+    .clone()
 }
 
 #[test]
@@ -937,8 +987,27 @@ fn maximum_pending_window_fits_and_drains_atomically_across_continuations() {
     reloaded
         .replace(terminal.next_state().as_bytes().to_vec())
         .unwrap();
+    let uninterrupted = drain_continuations(terminal.next_state().clone());
+    let reloaded_pages = drain_continuations(reloaded);
+    let identity = |records: &[agbox_adapters::DecodedRecord]| {
+        records
+            .iter()
+            .map(|record| {
+                (
+                    serde_json::to_vec(record.observation()).unwrap(),
+                    record
+                        .events()
+                        .iter()
+                        .map(|event| serde_json::to_vec(event).unwrap())
+                        .collect::<Vec<_>>(),
+                    record.next_state().as_bytes().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(identity(&uninterrupted), identity(&reloaded_pages));
     let mut pages = vec![terminal];
-    pages.extend(drain_continuations(reloaded));
+    pages.extend(reloaded_pages);
     let page_summary = pages
         .iter()
         .map(|record| {
@@ -1125,6 +1194,96 @@ fn fixture_helper_polls_bounded_continuations_until_none() {
             .decode_continuation(&context(), records.last().unwrap().next_state())
             .unwrap()
             .is_none()
+    );
+}
+
+#[test]
+fn continuation_is_bound_to_the_verified_context_without_leaking_it() {
+    let mut original_context = context();
+    original_context.project_id = ProjectId::for_test("project_CONTINUATION_SECRET");
+    original_context.source_id = "source_CONTINUATION_SECRET".to_owned();
+    original_context.project_root = Some("/fixture/CONTINUATION_ROOT_SECRET".into());
+    let state = active_continuation_state(&original_context);
+    let serialized = String::from_utf8(state.as_bytes().to_vec()).unwrap();
+    assert!(!serialized.contains("CONTINUATION_SECRET"));
+    assert!(!serialized.contains("CONTINUATION_ROOT_SECRET"));
+    assert!(!format!("{state:?}").contains("CONTINUATION"));
+
+    let mut reloaded = DecoderState::default();
+    reloaded.replace(state.as_bytes().to_vec()).unwrap();
+    let expected = CodexAdapter
+        .decode_continuation(&original_context, &state)
+        .unwrap()
+        .unwrap();
+    let resumed = CodexAdapter
+        .decode_continuation(&original_context, &reloaded)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(expected.observation()).unwrap(),
+        serde_json::to_vec(resumed.observation()).unwrap()
+    );
+    assert_eq!(
+        expected
+            .events()
+            .iter()
+            .map(|event| serde_json::to_vec(event).unwrap())
+            .collect::<Vec<_>>(),
+        resumed
+            .events()
+            .iter()
+            .map(|event| serde_json::to_vec(event).unwrap())
+            .collect::<Vec<_>>()
+    );
+
+    let mut mutations = Vec::new();
+    let mut changed_project = original_context.clone();
+    changed_project.project_id = ProjectId::for_test("project_other");
+    mutations.push(changed_project);
+    let mut changed_source = original_context.clone();
+    changed_source.source_id = "source_other".to_owned();
+    mutations.push(changed_source);
+    let mut changed_generation = original_context.clone();
+    changed_generation.source_generation += 1;
+    mutations.push(changed_generation);
+    let mut changed_observed_at = original_context.clone();
+    changed_observed_at.observed_at += Duration::seconds(1);
+    mutations.push(changed_observed_at);
+    let mut changed_root = original_context.clone();
+    changed_root.project_root = Some("/fixture/other-root".into());
+    mutations.push(changed_root);
+    let original_bytes = state.as_bytes().to_vec();
+    for mutation in mutations {
+        assert!(CodexAdapter.decode_continuation(&mutation, &state).is_err());
+        assert_eq!(state.as_bytes(), original_bytes);
+    }
+
+    let mut malformed_json: serde_json::Value = serde_json::from_slice(state.as_bytes()).unwrap();
+    malformed_json["continuation"][8] = serde_json::Value::String("bad".to_owned());
+    let mut malformed = DecoderState::default();
+    malformed
+        .replace(serde_json::to_vec(&malformed_json).unwrap())
+        .unwrap();
+    assert!(
+        CodexAdapter
+            .decode_continuation(&original_context, &malformed)
+            .is_err()
+    );
+    assert_eq!(
+        malformed.as_bytes(),
+        serde_json::to_vec(&malformed_json).unwrap()
+    );
+
+    let mut missing_json: serde_json::Value = serde_json::from_slice(state.as_bytes()).unwrap();
+    let _ = missing_json["continuation"].as_array_mut().unwrap().pop();
+    let mut missing = DecoderState::default();
+    missing
+        .replace(serde_json::to_vec(&missing_json).unwrap())
+        .unwrap();
+    assert!(
+        CodexAdapter
+            .decode_continuation(&original_context, &missing)
+            .is_err()
     );
 }
 

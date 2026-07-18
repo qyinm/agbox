@@ -275,6 +275,7 @@ impl SourceAdapter for CodexAdapter {
                         schema_fingerprint.clone(),
                         timestamp.unix_timestamp_nanos().to_string(),
                         output.next_event_ordinal,
+                        continuation_context_digest(context),
                     )));
                 }
                 let observation = make_observation(
@@ -338,6 +339,11 @@ impl SourceAdapter for CodexAdapter {
         let Some(marker) = state.continuation().cloned() else {
             return Ok(None);
         };
+        if marker.8 != continuation_context_digest(context) {
+            return Err(DecodeError::Malformed(
+                "codex-continuation-context-mismatch".to_owned(),
+            ));
+        }
         let occurred_at = marker
             .6
             .parse::<i128>()
@@ -2057,6 +2063,57 @@ fn session_id(context: &DecodeContext) -> String {
         u64::try_from(source.len()).unwrap_or(u64::MAX),
         blake3::hash(source.as_bytes()).to_hex().as_str(),
     )
+}
+
+fn continuation_context_digest(context: &DecodeContext) -> String {
+    fn update_field(hasher: &mut blake3::Hasher, label: &[u8], value: &[u8]) {
+        hasher.update(&(label.len() as u64).to_le_bytes());
+        hasher.update(label);
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"agbox-codex-continuation-context-v1");
+    update_field(
+        &mut hasher,
+        b"provider",
+        Provider::Codex.as_str().as_bytes(),
+    );
+    update_field(
+        &mut hasher,
+        b"project_id",
+        context.project_id.as_str().as_bytes(),
+    );
+    update_field(&mut hasher, b"source_id", context.source_id.as_bytes());
+    update_field(
+        &mut hasher,
+        b"source_generation",
+        &context.source_generation.to_le_bytes(),
+    );
+    let derived_session = session_id(context);
+    update_field(
+        &mut hasher,
+        b"derived_session_id",
+        derived_session.as_bytes(),
+    );
+    update_field(
+        &mut hasher,
+        b"observed_at",
+        &context.observed_at.unix_timestamp_nanos().to_le_bytes(),
+    );
+    match &context.project_root {
+        Some(root) => {
+            update_field(&mut hasher, b"project_root_present", b"1");
+            update_field(
+                &mut hasher,
+                b"project_root",
+                root.as_os_str().as_encoded_bytes(),
+            );
+        }
+        None => update_field(&mut hasher, b"project_root_present", b"0"),
+    }
+    encode_base64_url(hasher.finalize().as_bytes())
 }
 
 fn safe_native_id(value: &str, domain: &str) -> bool {

@@ -121,6 +121,7 @@ pub(super) struct Continuation(
     pub String,
     pub String,
     pub u32,
+    pub String,
 );
 
 impl CodexStateV1 {
@@ -379,7 +380,12 @@ impl Continuation {
             && bounded_identifier(&self.3, MAX_NATIVE_TYPE_BYTES)
             && bounded_identifier(&self.5, MAX_SCHEMA_BYTES)
             && !self.6.is_empty()
-            && self.6.len() <= MAX_EVENT_ID_BYTES;
+            && self.6.len() <= MAX_EVENT_ID_BYTES
+            && self.8.len() == MAX_COMPACT_HASH_BYTES
+            && self
+                .8
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
         if valid {
             Ok(())
         } else {
