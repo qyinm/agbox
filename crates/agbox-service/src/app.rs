@@ -390,7 +390,8 @@ where
                     return Ok(AppResponse::NotFound);
                 };
                 let field_name = correction_field_name(field);
-                let receipt = self
+                let audit_work_id = work_id.clone();
+                let receipt = match self
                     .writer
                     .correct(
                         scope.project_id(),
@@ -399,7 +400,15 @@ where
                         value,
                         OffsetDateTime::now_utc(),
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        self.audit(&scope, "handoff.correction", Some(audit_work_id), "failed")
+                            .await?;
+                        return Err(error.into());
+                    }
+                };
                 self.audit_detail(
                     &scope,
                     "handoff.correction",
