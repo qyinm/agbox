@@ -91,6 +91,18 @@ fn action_request(action_id: &str, input: &str, evidence: &str) -> ReducedFact {
     }
 }
 
+fn agent_run_finished(evidence: &str) -> ReducedFact {
+    ReducedFact::AgentRunFinished {
+        project_id: project(),
+        session_id: session(),
+        provider: agbox_core::Provider::Codex,
+        native_agent_id: "run-a".into(),
+        succeeded: true,
+        observed_at: datetime!(2026-07-17 12:03 UTC),
+        evidence: event_id(evidence),
+    }
+}
+
 #[test]
 fn provisional_contract_is_useful_without_a_model() {
     let facts = facts_for_active_parser_work();
@@ -190,6 +202,78 @@ fn new_observed_activity_reopens_a_completed_contract() {
     assert_eq!(reopened.status, WorkStatus::Active);
     assert_eq!(reopened.revision, 2);
     assert_eq!(reopened.artifacts, ["src/parser.rs"]);
+}
+
+#[test]
+fn reopened_completion_stays_active_until_a_new_authoritative_success() {
+    let neutral_facts = vec![
+        agent_run_finished("evt-run-finished"),
+        ReducedFact::SessionContext {
+            project_id: project(),
+            session_id: session(),
+            provider: agbox_core::Provider::Codex,
+            branch_hash: Some("b3:main".into()),
+            observed_at: datetime!(2026-07-17 12:03 UTC),
+            evidence: event_id("evt-session-context"),
+        },
+        ReducedFact::AgentStatement {
+            project_id: project(),
+            content_hash: "b3:waiting".into(),
+            redacted_text: Some("Waiting for another verification".into()),
+            observed_at: datetime!(2026-07-17 12:03 UTC),
+            evidence: event_id("evt-agent-statement"),
+        },
+        observed_finish(
+            "verify",
+            false,
+            datetime!(2026-07-17 12:03 UTC),
+            "evt-mismatched-finish",
+        ),
+    ];
+
+    for neutral_fact in neutral_facts {
+        let builder = ProvisionalContractBuilder::new("deterministic-v1")
+            .for_work(WorkId::for_test("work-a"));
+        let completed = builder
+            .build(
+                None,
+                &[action_verification(
+                    "verify",
+                    true,
+                    Some("cargo test"),
+                    datetime!(2026-07-17 12:01 UTC),
+                    "evt-completed",
+                )],
+            )
+            .unwrap();
+        let reopened = builder
+            .build(
+                Some(&completed),
+                &[artifact(Some("src/parser.rs"), "evt-reopen")],
+            )
+            .unwrap();
+        let neutral = builder
+            .build(Some(&reopened), std::slice::from_ref(&neutral_fact))
+            .unwrap();
+        let reverified = builder
+            .build(
+                Some(&neutral),
+                &[action_verification(
+                    "verify",
+                    true,
+                    Some("cargo test"),
+                    datetime!(2026-07-17 12:04 UTC),
+                    "evt-reverified",
+                )],
+            )
+            .unwrap();
+
+        assert_eq!(completed.status, WorkStatus::Completed);
+        assert_eq!(reopened.status, WorkStatus::Active);
+        assert_eq!(neutral.status, WorkStatus::Active, "{neutral_fact:?}");
+        assert_eq!(reverified.status, WorkStatus::Completed);
+        assert_eq!(reverified.revision, neutral.revision + 1);
+    }
 }
 
 #[test]

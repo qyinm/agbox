@@ -186,12 +186,25 @@ impl ProvisionalContractBuilder {
         let activity_changed = draft.activity_projection() != previous_activity;
         let authoritative_changed =
             draft.projection_state.authoritative_digest() != previous_authoritative;
+        let new_authoritative_success =
+            authoritative_changed && facts.iter().any(ReducedFact::successful_structured_result);
+        if previous.is_some_and(|contract| contract.status == WorkStatus::Completed)
+            && activity_changed
+            && !new_authoritative_success
+        {
+            draft.projection_state.completion_reopened = true;
+        }
+        if draft.projection_state.completion_reopened
+            && new_authoritative_success
+            && !draft.projection_state.has_failed_authority()
+        {
+            draft.projection_state.completion_reopened = false;
+        }
         let (status, status_evidence) = derive_status(
             &draft.projection_state,
             facts,
             previous.map(|value| value.status),
             activity_changed,
-            authoritative_changed,
         );
         draft.status = status;
         draft
@@ -280,6 +293,8 @@ impl ProvisionalContractBuilder {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct ProjectionState {
     actions: BTreeMap<String, ActionProjection>,
+    #[serde(default)]
+    completion_reopened: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -309,6 +324,13 @@ impl ProjectionState {
             .iter()
             .map(|(key, action)| (key.clone(), action.authoritative.clone()))
             .collect()
+    }
+
+    fn has_failed_authority(&self) -> bool {
+        self.actions
+            .values()
+            .filter_map(|action| action.authoritative.as_ref())
+            .any(|outcome| !outcome.succeeded)
     }
 }
 
@@ -685,7 +707,6 @@ fn derive_status(
     facts: &[ReducedFact],
     previous: Option<WorkStatus>,
     activity_changed: bool,
-    authoritative_changed: bool,
 ) -> (WorkStatus, Vec<EventId>) {
     let abandonment = facts
         .iter()
@@ -706,6 +727,15 @@ fn derive_status(
     if !failed.is_empty() {
         return (WorkStatus::Blocked, failed);
     }
+    if projection.completion_reopened {
+        return (
+            WorkStatus::Active,
+            facts
+                .iter()
+                .map(|fact| fact.evidence_id().clone())
+                .collect(),
+        );
+    }
     let completed = projection
         .actions
         .values()
@@ -713,7 +743,7 @@ fn derive_status(
         .filter(|outcome| outcome.succeeded)
         .map(|outcome| outcome.evidence.clone())
         .collect::<Vec<_>>();
-    if !completed.is_empty() && (previous.is_none() || authoritative_changed || !activity_changed) {
+    if !completed.is_empty() {
         return (WorkStatus::Completed, completed);
     }
     let active = facts
@@ -723,9 +753,6 @@ fn derive_status(
         .collect::<Vec<_>>();
     if activity_changed && !active.is_empty() {
         return (WorkStatus::Active, active);
-    }
-    if !completed.is_empty() {
-        return (WorkStatus::Completed, completed);
     }
     (
         previous.unwrap_or(WorkStatus::Observed),
