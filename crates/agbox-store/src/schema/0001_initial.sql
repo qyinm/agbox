@@ -35,6 +35,15 @@ CREATE TABLE source_generations (
     PRIMARY KEY (source_id, generation)
 ) STRICT;
 
+CREATE TABLE source_generation_identities (
+    source_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    file_identity TEXT NOT NULL,
+    PRIMARY KEY (source_id, generation),
+    FOREIGN KEY (source_id, generation)
+        REFERENCES source_generations(source_id, generation)
+) STRICT;
+
 CREATE TABLE source_cursors (
     source_id TEXT NOT NULL,
     generation INTEGER NOT NULL,

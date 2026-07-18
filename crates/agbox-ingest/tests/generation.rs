@@ -9,6 +9,7 @@ use agbox_adapters::RecordSource;
 use agbox_ingest::{
     GenerationError, RecordScanner, ScanOutcome, SourceSnapshot, reconcile_generation,
 };
+use time::OffsetDateTime;
 
 #[test]
 fn moves_keep_source_and_generation_while_truncation_and_replacement_increment() {
@@ -47,6 +48,23 @@ fn generation_increment_never_wraps() {
         reconcile_generation(&previous, &truncated),
         Err(GenerationError::Overflow)
     );
+}
+
+#[test]
+fn same_size_mtime_change_rolls_generation_but_append_does_not() {
+    let previous = SourceSnapshot::fixture("source_a", "unix:11:12", "/root/a.jsonl", 900, 3)
+        .with_mtime(OffsetDateTime::UNIX_EPOCH);
+    let rewritten = SourceSnapshot::fixture("ignored", "unix:11:12", "/root/a.jsonl", 900, 1)
+        .with_mtime(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1));
+    let appended = SourceSnapshot::fixture("ignored", "unix:11:12", "/root/a.jsonl", 901, 1)
+        .with_mtime(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1));
+
+    let rewritten = reconcile_generation(&previous, &rewritten).unwrap();
+    assert_eq!(rewritten.generation, 4);
+    assert!(rewritten.modified);
+    let appended = reconcile_generation(&previous, &appended).unwrap();
+    assert_eq!(appended.generation, 3);
+    assert!(!appended.modified);
 }
 
 #[test]

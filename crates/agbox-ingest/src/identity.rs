@@ -6,6 +6,7 @@ use std::{
 
 use agbox_adapters::DiscoveredSource;
 use rustix::fs::{FileType, Mode, OFlags};
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceSnapshot {
@@ -13,6 +14,7 @@ pub struct SourceSnapshot {
     pub file_identity: String,
     pub path: PathBuf,
     pub size: u64,
+    pub mtime: OffsetDateTime,
     pub generation: u64,
 }
 
@@ -30,8 +32,15 @@ impl SourceSnapshot {
             file_identity,
             path,
             size,
+            mtime: OffsetDateTime::UNIX_EPOCH,
             generation,
         }
+    }
+
+    #[must_use]
+    pub fn with_mtime(mut self, mtime: OffsetDateTime) -> Self {
+        self.mtime = mtime;
+        self
     }
 
     #[cfg(feature = "test-support")]
@@ -62,16 +71,19 @@ impl From<&DiscoveredSource> for SourceSnapshot {
             source.size,
             source.generation,
         )
+        .with_mtime(source.mtime)
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // Public reconciliation facts are independently queryable.
 pub struct SourceGeneration {
     pub source_id: String,
     pub generation: u64,
     pub moved: bool,
     pub replaced: bool,
     pub truncated: bool,
+    pub modified: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -98,7 +110,8 @@ pub fn reconcile_generation(
     let same_path = previous.path == observed.path;
     let replaced = same_path && !same_file;
     let truncated = same_file && observed.size < previous.size;
-    let generation = if replaced || truncated {
+    let modified = same_file && observed.size == previous.size && observed.mtime != previous.mtime;
+    let generation = if replaced || truncated || modified {
         previous
             .generation
             .checked_add(1)
@@ -112,6 +125,7 @@ pub fn reconcile_generation(
         moved: same_file && !same_path,
         replaced,
         truncated,
+        modified,
     })
 }
 
@@ -178,7 +192,11 @@ impl VerifiedSourceOpener {
             .path
             .strip_prefix(&self.canonical_root)
             .map_err(|_| VerifiedOpenError::IdentityChanged)?;
-        self.open_relative(relative, &source.file_identity)
+        self.open_expected(
+            relative,
+            &source.file_identity,
+            Some((source.size, source.mtime)),
+        )
     }
 
     /// Opens a relative source with no-follow checks at every component.
@@ -190,6 +208,15 @@ impl VerifiedSourceOpener {
         &self,
         relative: &Path,
         expected_identity: &str,
+    ) -> Result<File, VerifiedOpenError> {
+        self.open_expected(relative, expected_identity, None)
+    }
+
+    fn open_expected(
+        &self,
+        relative: &Path,
+        expected_identity: &str,
+        expected_snapshot: Option<(u64, OffsetDateTime)>,
     ) -> Result<File, VerifiedOpenError> {
         let components = relative.components().collect::<Vec<_>>();
         if components.is_empty()
@@ -230,13 +257,25 @@ impl VerifiedSourceOpener {
         let stat = rustix::fs::fstat(&file).map_err(|_| VerifiedOpenError::IdentityChanged)?;
         let device = u64::try_from(stat.st_dev).map_err(|_| VerifiedOpenError::IdentityChanged)?;
         let inode = stat.st_ino;
+        let observed_size =
+            u64::try_from(stat.st_size).map_err(|_| VerifiedOpenError::IdentityChanged)?;
+        let observed_mtime = stat_time(&stat).ok_or(VerifiedOpenError::IdentityChanged)?;
         if !FileType::from_raw_mode(stat.st_mode).is_file()
             || unix_identity(device, inode) != expected_identity
+            || expected_snapshot
+                .is_some_and(|(size, mtime)| size != observed_size || mtime != observed_mtime)
         {
             return Err(VerifiedOpenError::IdentityChanged);
         }
         Ok(file)
     }
+}
+
+fn stat_time(stat: &rustix::fs::Stat) -> Option<OffsetDateTime> {
+    i128::from(stat.st_mtime)
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(i128::from(stat.st_mtime_nsec)))
+        .and_then(|value| OffsetDateTime::from_unix_timestamp_nanos(value).ok())
 }
 
 #[must_use]

@@ -1,12 +1,15 @@
 use std::{
-    collections::VecDeque,
-    fmt, fs,
-    os::unix::fs::MetadataExt,
-    path::{Component, Path, PathBuf},
+    collections::{HashSet, VecDeque},
+    ffi::{OsStr, OsString},
+    fmt,
+    fs::File,
+    os::unix::ffi::{OsStrExt, OsStringExt},
+    path::{Path, PathBuf},
 };
 
 use agbox_adapters::{DiscoveredSource, RootSpec, SourceAdapter};
 use agbox_core::Provider;
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -14,25 +17,31 @@ use crate::identity::unix_identity;
 
 pub const DISCOVERY_ENTRIES_PER_YIELD: usize = 256;
 pub const MAX_DISCOVERY_CURSOR_BYTES: usize = 32 * 1024;
-const CURSOR_SAFETY_BYTES: usize = 512;
+const MAX_DISCOVERY_FAULTS: usize = 32;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DiscoveryCursor {
-    pending_relative_entries: VecDeque<PathBuf>,
-    pending_directories: VecDeque<DirectoryResume>,
+    root_device: u64,
+    root_inode: u64,
+    pending_directories: VecDeque<DirectoryCursor>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct DirectoryResume {
-    relative_directory: PathBuf,
-    after_entry: PathBuf,
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct DirectoryCursor {
+    components: Vec<Vec<u8>>,
+    entries_consumed: u64,
+    device: u64,
+    inode: u64,
+    mtime_seconds: i64,
+    mtime_nanoseconds: i64,
+    ctime_seconds: i64,
+    ctime_nanoseconds: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiscoveryFaultClass {
     MetadataUnavailable,
     DirectoryUnavailable,
-    CursorCapacity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,15 +65,17 @@ pub enum DiscoveryError {
     InvalidCursor,
     #[error("discovery provider adapter is unavailable")]
     AdapterUnavailable,
+    #[error("discovery cursor capacity was exceeded")]
+    CursorCapacity,
 }
 
 pub struct DiscoveryWalker {
     provider: Provider,
     adapter: &'static dyn SourceAdapter,
     spec: RootSpec,
-    root_identity: String,
+    root: File,
     cursor: DiscoveryCursor,
-    root_enumerated: bool,
+    active: Option<ActiveDirectory>,
 }
 
 impl fmt::Debug for DiscoveryWalker {
@@ -75,10 +86,6 @@ impl fmt::Debug for DiscoveryWalker {
             .field("class", &self.spec.class)
             .field("recursive", &self.spec.recursive)
             .field(
-                "pending_relative_entries",
-                &self.cursor.pending_relative_entries.len(),
-            )
-            .field(
                 "pending_directories",
                 &self.cursor.pending_directories.len(),
             )
@@ -86,147 +93,266 @@ impl fmt::Debug for DiscoveryWalker {
     }
 }
 
+struct PageEntry {
+    name: Vec<u8>,
+    stat: rustix::fs::Stat,
+}
+
+struct DirectoryPage {
+    entries: Vec<PageEntry>,
+    eof: bool,
+    fault: bool,
+    invalid_cursor: bool,
+    reads: usize,
+}
+
+struct ActiveDirectory {
+    cursor: DirectoryCursor,
+    directory: File,
+    iterator: Dir,
+    recovery_remaining: u64,
+}
+
+enum OpenDirectoryError {
+    Unavailable,
+    InvalidCursor,
+}
+
 impl DiscoveryWalker {
-    /// Binds discovery to one canonical regular directory without opening files.
+    /// Binds discovery to one open canonical root directory descriptor.
     ///
     /// # Errors
     ///
-    /// Returns [`DiscoveryError::RootUnavailable`] for a missing, symlink, or
-    /// non-directory root.
+    /// Returns a bounded error when the root, provider, or initial cursor
+    /// cannot satisfy the no-follow and serialization contracts.
     pub fn new(provider: Provider, mut spec: RootSpec) -> Result<Self, DiscoveryError> {
-        let original = spec.path.clone();
-        let metadata = original
-            .symlink_metadata()
-            .map_err(|_| DiscoveryError::RootUnavailable)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(DiscoveryError::RootUnavailable);
-        }
-        spec.path = original
+        let canonical = spec
+            .path
             .canonicalize()
             .map_err(|_| DiscoveryError::RootUnavailable)?;
-        let canonical_metadata = spec
-            .path
-            .metadata()
-            .map_err(|_| DiscoveryError::RootUnavailable)?;
-        let root_identity = unix_identity(canonical_metadata.dev(), canonical_metadata.ino());
+        let root = rustix::fs::open(
+            &canonical,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|_| DiscoveryError::RootUnavailable)?;
+        let stat = rustix::fs::fstat(&root).map_err(|_| DiscoveryError::RootUnavailable)?;
+        if !FileType::from_raw_mode(stat.st_mode).is_dir() {
+            return Err(DiscoveryError::RootUnavailable);
+        }
+        let (root_device, root_inode) = stat_identity(&stat)?;
+        spec.path = canonical;
         let adapter = agbox_adapters::adapters()
             .iter()
             .copied()
             .find(|adapter| adapter.provider() == provider)
             .ok_or(DiscoveryError::AdapterUnavailable)?;
+        let root_cursor = DirectoryCursor {
+            components: Vec::new(),
+            entries_consumed: 0,
+            device: root_device,
+            inode: root_inode,
+            mtime_seconds: stat.st_mtime,
+            mtime_nanoseconds: stat.st_mtime_nsec,
+            ctime_seconds: stat.st_ctime,
+            ctime_nanoseconds: stat.st_ctime_nsec,
+        };
+        let cursor = DiscoveryCursor {
+            root_device,
+            root_inode,
+            pending_directories: VecDeque::from([root_cursor]),
+        };
+        ensure_cursor_size(&cursor)?;
         Ok(Self {
             provider,
             adapter,
             spec,
-            root_identity,
-            cursor: DiscoveryCursor {
-                pending_relative_entries: VecDeque::new(),
-                pending_directories: VecDeque::new(),
-            },
-            root_enumerated: false,
+            root,
+            cursor,
+            active: None,
         })
     }
 
-    /// Restores a previously serialized relative-only cursor under a fresh
-    /// descriptor-bound root.
+    /// Restores a serialized byte-exact relative cursor against a freshly
+    /// opened root descriptor.
     ///
     /// # Errors
     ///
-    /// Rejects absolute, parent, prefix, oversized, or otherwise invalid state.
+    /// Rejects malformed component bytes, oversized state, or a changed root.
     pub fn from_cursor(
         provider: Provider,
         spec: RootSpec,
         cursor: DiscoveryCursor,
     ) -> Result<Self, DiscoveryError> {
-        if !cursor_is_valid(&cursor) {
+        validate_cursor(&cursor)?;
+        let mut walker = Self::new(provider, spec)?;
+        if walker.cursor.root_device != cursor.root_device
+            || walker.cursor.root_inode != cursor.root_inode
+        {
             return Err(DiscoveryError::InvalidCursor);
         }
-        let mut walker = Self::new(provider, spec)?;
         walker.cursor = cursor;
-        walker.root_enumerated = true;
         Ok(walker)
     }
 
-    /// Visits at most 256 metadata entries and never opens source contents.
+    /// Enumerates no more than 256 actual directory entries.
+    ///
+    /// Entries are sorted only within the bounded OS-cookie page. Concurrent
+    /// directory insertion/rename is best-effort and is reconciled by a later
+    /// root scan; identity-sensitive opens always revalidate the snapshot.
     ///
     /// # Errors
     ///
-    /// Only root/cursor construction errors are terminal. Per-entry failures
-    /// are isolated into bounded path-free faults.
+    /// Returns a cursor-capacity or root-identity error without dropping an
+    /// unaccounted directory entry.
+    #[allow(clippy::too_many_lines)] // The transaction-like cursor update is intentionally co-located.
     pub fn next_batch(&mut self, limit: usize) -> Result<DiscoveryBatch, DiscoveryError> {
         let hard_limit = limit.min(DISCOVERY_ENTRIES_PER_YIELD);
-        let mut faults = Vec::new();
-        if !self.root_enumerated {
-            self.root_enumerated = true;
-            self.enqueue_directory(Path::new(""), None, &mut faults);
-        }
         let mut sources = Vec::new();
+        let mut faults = Vec::new();
         let mut visited_entries = 0;
-        'entries: while visited_entries < hard_limit {
-            let relative = loop {
-                if let Some(relative) = self.cursor.pending_relative_entries.pop_front() {
-                    break relative;
-                }
-                let Some(resume) = self.cursor.pending_directories.pop_front() else {
-                    break 'entries;
+
+        while visited_entries < hard_limit {
+            let Some(directory_cursor) = self.cursor.pending_directories.pop_front() else {
+                break;
+            };
+            if self
+                .active
+                .as_ref()
+                .is_none_or(|active| active.cursor != directory_cursor)
+            {
+                let directory = match self.open_directory(&directory_cursor) {
+                    Ok(directory) => directory,
+                    Err(OpenDirectoryError::Unavailable) => {
+                        bounded_fault(&mut faults, DiscoveryFaultClass::DirectoryUnavailable);
+                        self.cursor.pending_directories.push_front(directory_cursor);
+                        break;
+                    }
+                    Err(OpenDirectoryError::InvalidCursor) => {
+                        return Err(DiscoveryError::InvalidCursor);
+                    }
                 };
-                self.enqueue_directory(
-                    &resume.relative_directory,
-                    Some(&resume.after_entry),
-                    &mut faults,
-                );
-            };
-            visited_entries += 1;
-            if skipped_component(&relative) || !safe_relative(&relative) {
-                continue;
-            }
-            let absolute = self.spec.path.join(&relative);
-            let Ok(metadata) = absolute.symlink_metadata() else {
-                faults.push(DiscoveryFault {
-                    class: DiscoveryFaultClass::MetadataUnavailable,
+                let Ok(iterator) = Dir::read_from(&directory) else {
+                    bounded_fault(&mut faults, DiscoveryFaultClass::DirectoryUnavailable);
+                    self.cursor.pending_directories.push_front(directory_cursor);
+                    break;
+                };
+                self.active = Some(ActiveDirectory {
+                    recovery_remaining: directory_cursor.entries_consumed,
+                    cursor: directory_cursor.clone(),
+                    directory,
+                    iterator,
                 });
-                continue;
+            }
+            let page_start = directory_cursor.clone();
+            let page = {
+                let Some(active) = self.active.as_mut() else {
+                    bounded_fault(&mut faults, DiscoveryFaultClass::DirectoryUnavailable);
+                    break;
+                };
+                read_page(active, hard_limit - visited_entries, &mut faults)
             };
-            let file_type = metadata.file_type();
-            if file_type.is_symlink() {
-                continue;
+            visited_entries = visited_entries.saturating_add(page.reads);
+            if page.invalid_cursor {
+                self.active = None;
+                return Err(DiscoveryError::InvalidCursor);
             }
-            if file_type.is_dir() {
-                if self.spec.recursive {
-                    self.enqueue_directory(&relative, None, &mut faults);
+            if page.fault {
+                let mut rollback = self.cursor.clone();
+                rollback.pending_directories.push_front(page_start);
+                self.cursor = rollback;
+                self.active = None;
+                break;
+            }
+
+            let mut next_cursor = self.cursor.clone();
+            if !page.eof {
+                let active_cursor = self
+                    .active
+                    .as_ref()
+                    .map_or_else(|| directory_cursor.clone(), |active| active.cursor.clone());
+                next_cursor.pending_directories.push_front(active_cursor);
+            }
+
+            let mut child_directories = Vec::new();
+            let mut page_sources = Vec::new();
+            for entry in page.entries {
+                let relative = join_components(&directory_cursor.components, &entry.name);
+                if skipped_components(&relative) {
+                    continue;
                 }
-                continue;
+                let file_type = FileType::from_raw_mode(entry.stat.st_mode);
+                if file_type.is_dir() && self.spec.recursive {
+                    let (device, inode) = stat_identity(&entry.stat)?;
+                    child_directories.push(DirectoryCursor {
+                        components: relative,
+                        entries_consumed: 0,
+                        device,
+                        inode,
+                        mtime_seconds: entry.stat.st_mtime,
+                        mtime_nanoseconds: entry.stat.st_mtime_nsec,
+                        ctime_seconds: entry.stat.st_ctime,
+                        ctime_nanoseconds: entry.stat.st_ctime_nsec,
+                    });
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let relative_path = components_to_path(&relative);
+                if !metadata_only_adapter_match(self.provider, &self.spec, &relative_path) {
+                    continue;
+                }
+                let (device, inode) = stat_identity(&entry.stat)?;
+                let file_identity = unix_identity(device, inode);
+                let mtime = stat_time(&entry.stat).ok_or(DiscoveryError::RootUnavailable)?;
+                let size = u64::try_from(entry.stat.st_size)
+                    .map_err(|_| DiscoveryError::RootUnavailable)?;
+                let session_time =
+                    self.adapter
+                        .trusted_session_time(&self.spec, &relative_path, mtime);
+                page_sources.push(DiscoveredSource {
+                    source_id: stable_source_id(
+                        self.provider,
+                        self.cursor.root_device,
+                        self.cursor.root_inode,
+                        &file_identity,
+                    ),
+                    provider: self.provider,
+                    root: self.spec.path.clone(),
+                    path: self.spec.path.join(&relative_path),
+                    class: self.spec.class,
+                    file_identity,
+                    generation: 1,
+                    size,
+                    mtime,
+                    session_time,
+                });
             }
-            if !file_type.is_file() {
-                continue;
+
+            for child in child_directories {
+                next_cursor.pending_directories.push_back(child);
             }
-            if !self.adapter.matches(&self.spec, &relative) {
-                continue;
+            if ensure_cursor_size(&next_cursor).is_err() {
+                let mut rollback = self.cursor.clone();
+                rollback.pending_directories.push_front(page_start);
+                ensure_cursor_size(&rollback)?;
+                self.cursor = rollback;
+                self.active = None;
+                return Err(DiscoveryError::CursorCapacity);
             }
-            let file_identity = unix_identity(metadata.dev(), metadata.ino());
-            let source_id = stable_source_id(self.provider, &self.root_identity, &file_identity);
-            let mtime = metadata_time(&metadata).unwrap_or(OffsetDateTime::UNIX_EPOCH);
-            let session_time = self
-                .adapter
-                .trusted_session_time(&self.spec, &relative, mtime);
-            sources.push(DiscoveredSource {
-                source_id,
-                provider: self.provider,
-                root: self.spec.path.clone(),
-                path: absolute,
-                class: self.spec.class,
-                file_identity,
-                generation: 1,
-                size: metadata.len(),
-                mtime,
-                // Only the provider adapter's bounded path/metadata policy may
-                // supply a replay date; discovery never parses source content.
-                session_time,
-            });
+            self.cursor = next_cursor;
+            sources.extend(page_sources);
+            if page.eof {
+                self.active = None;
+            }
+            if page.fault {
+                break;
+            }
         }
-        let cursor = (!self.cursor.pending_relative_entries.is_empty()
-            || !self.cursor.pending_directories.is_empty())
-        .then(|| self.cursor.clone());
+
+        let cursor = (!self.cursor.pending_directories.is_empty()).then(|| self.cursor.clone());
         Ok(DiscoveryBatch {
             sources,
             faults,
@@ -235,157 +361,213 @@ impl DiscoveryWalker {
         })
     }
 
-    fn enqueue_directory(
-        &mut self,
-        relative: &Path,
-        after_entry: Option<&Path>,
-        faults: &mut Vec<DiscoveryFault>,
-    ) {
-        let directory = self.spec.path.join(relative);
-        let Ok(read) = fs::read_dir(directory) else {
-            faults.push(DiscoveryFault {
-                class: DiscoveryFaultClass::DirectoryUnavailable,
-            });
-            return;
-        };
-        let mut children = Vec::new();
-        for entry in read {
-            let Ok(entry) = entry else {
-                faults.push(DiscoveryFault {
-                    class: DiscoveryFaultClass::DirectoryUnavailable,
-                });
-                continue;
-            };
-            let child = relative.join(entry.file_name());
-            if safe_relative(&child)
-                && !skipped_component(&child)
-                && after_entry.is_none_or(|after| child.as_path() > after)
-            {
-                children.push(child);
-            }
+    fn open_directory(&self, cursor: &DirectoryCursor) -> Result<File, OpenDirectoryError> {
+        let mut directory = self
+            .root
+            .try_clone()
+            .map_err(|_| OpenDirectoryError::Unavailable)?;
+        for component in &cursor.components {
+            let name = OsStr::from_bytes(component);
+            directory = rustix::fs::openat(
+                &directory,
+                name,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|_| OpenDirectoryError::Unavailable)?;
         }
-        children.sort();
-        let prior_entry_count = self.cursor.pending_relative_entries.len();
-        let previous_after = after_entry.map(Path::to_path_buf);
-        let mut last_enqueued = previous_after.clone();
-        let mut has_more = false;
-        for child in children {
-            self.cursor.pending_relative_entries.push_back(child);
-            if cursor_estimated_bytes(&self.cursor)
-                >= MAX_DISCOVERY_CURSOR_BYTES.saturating_sub(CURSOR_SAFETY_BYTES)
-            {
-                let _ = self.cursor.pending_relative_entries.pop_back();
-                has_more = true;
-                break;
-            }
-            last_enqueued = self.cursor.pending_relative_entries.back().cloned();
+        let stat = rustix::fs::fstat(&directory).map_err(|_| OpenDirectoryError::Unavailable)?;
+        let (device, inode) =
+            stat_identity(&stat).map_err(|_| OpenDirectoryError::InvalidCursor)?;
+        if !FileType::from_raw_mode(stat.st_mode).is_dir()
+            || device != cursor.device
+            || inode != cursor.inode
+            || stat.st_mtime != cursor.mtime_seconds
+            || stat.st_mtime_nsec != cursor.mtime_nanoseconds
+            || stat.st_ctime != cursor.ctime_seconds
+            || stat.st_ctime_nsec != cursor.ctime_nanoseconds
+        {
+            return Err(OpenDirectoryError::InvalidCursor);
         }
-        if has_more {
-            let Some(resume_after) = last_enqueued else {
-                faults.push(DiscoveryFault {
-                    class: DiscoveryFaultClass::CursorCapacity,
-                });
-                return;
-            };
-            self.cursor.pending_directories.push_back(DirectoryResume {
-                relative_directory: relative.to_path_buf(),
-                after_entry: resume_after,
-            });
-            while cursor_estimated_bytes(&self.cursor)
-                >= MAX_DISCOVERY_CURSOR_BYTES.saturating_sub(CURSOR_SAFETY_BYTES)
-                && self.cursor.pending_relative_entries.len() > prior_entry_count
-            {
-                let _ = self.cursor.pending_relative_entries.pop_back();
-                let replacement = if self.cursor.pending_relative_entries.len() > prior_entry_count
-                {
-                    self.cursor.pending_relative_entries.back().cloned()
-                } else {
-                    previous_after.clone()
-                };
-                if let (Some(resume), Some(replacement)) =
-                    (self.cursor.pending_directories.back_mut(), replacement)
-                {
-                    resume.after_entry = replacement;
-                }
-            }
-            if cursor_estimated_bytes(&self.cursor)
-                >= MAX_DISCOVERY_CURSOR_BYTES.saturating_sub(CURSOR_SAFETY_BYTES)
-            {
-                let _ = self.cursor.pending_directories.pop_back();
-                faults.push(DiscoveryFault {
-                    class: DiscoveryFaultClass::CursorCapacity,
-                });
-            }
-        }
+        Ok(directory)
     }
 }
 
-fn safe_relative(path: &Path) -> bool {
-    !path.as_os_str().is_empty()
-        && path
+/// Collapses overlapping-root sightings by provider and filesystem identity,
+/// preferring the most-specific verified root.
+#[must_use]
+pub fn deduplicate_overlapping_sources(
+    mut sources: Vec<DiscoveredSource>,
+) -> Vec<DiscoveredSource> {
+    sources.sort_by(|left, right| {
+        right
+            .root
             .components()
-            .all(|component| matches!(component, Component::Normal(_)))
+            .count()
+            .cmp(&left.root.components().count())
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let mut retained = HashSet::new();
+    sources
+        .retain(|source| retained.insert((source.provider.as_str(), source.file_identity.clone())));
+    sources
 }
 
-fn skipped_component(path: &Path) -> bool {
-    path.components().any(|component| {
-        let Component::Normal(value) = component else {
-            return false;
+fn read_page(
+    active: &mut ActiveDirectory,
+    limit: usize,
+    faults: &mut Vec<DiscoveryFault>,
+) -> DirectoryPage {
+    let mut entries = Vec::new();
+    let mut reads = 0;
+    let mut eof = false;
+    let mut fault = false;
+    let mut invalid_cursor = false;
+    while reads < limit {
+        let Some(result) = active.iterator.next() else {
+            eof = true;
+            invalid_cursor = active.recovery_remaining != 0;
+            break;
         };
-        let value = value.to_string_lossy();
-        ["backup", "backups", "cache", "caches", "tmp", "temp"]
+        let Ok(entry) = result else {
+            bounded_fault(faults, DiscoveryFaultClass::DirectoryUnavailable);
+            fault = true;
+            break;
+        };
+        let name = entry.file_name().to_bytes().to_vec();
+        if matches!(name.as_slice(), b"." | b"..") {
+            continue;
+        }
+        reads += 1;
+        if active.recovery_remaining > 0 {
+            active.recovery_remaining -= 1;
+            continue;
+        }
+        let Some(consumed) = active.cursor.entries_consumed.checked_add(1) else {
+            bounded_fault(faults, DiscoveryFaultClass::DirectoryUnavailable);
+            fault = true;
+            break;
+        };
+        active.cursor.entries_consumed = consumed;
+        let Ok(stat) = rustix::fs::statat(
+            &active.directory,
+            OsStr::from_bytes(&name),
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) else {
+            bounded_fault(faults, DiscoveryFaultClass::MetadataUnavailable);
+            continue;
+        };
+        entries.push(PageEntry { name, stat });
+    }
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    DirectoryPage {
+        entries,
+        eof,
+        fault,
+        invalid_cursor,
+        reads,
+    }
+}
+
+fn validate_cursor(cursor: &DiscoveryCursor) -> Result<(), DiscoveryError> {
+    ensure_cursor_size(cursor)?;
+    if cursor.pending_directories.iter().all(|directory| {
+        directory
+            .components
             .iter()
-            .any(|ignored| value.eq_ignore_ascii_case(ignored))
+            .all(|component| valid_component(component))
+    }) {
+        Ok(())
+    } else {
+        Err(DiscoveryError::InvalidCursor)
+    }
+}
+
+fn ensure_cursor_size(cursor: &DiscoveryCursor) -> Result<(), DiscoveryError> {
+    let encoded = serde_json::to_vec(cursor).map_err(|_| DiscoveryError::InvalidCursor)?;
+    if encoded.len() <= MAX_DISCOVERY_CURSOR_BYTES {
+        Ok(())
+    } else {
+        Err(DiscoveryError::CursorCapacity)
+    }
+}
+
+fn valid_component(component: &[u8]) -> bool {
+    !component.is_empty()
+        && component != b"."
+        && component != b".."
+        && !component.contains(&0)
+        && !component.contains(&b'/')
+}
+
+fn join_components(parent: &[Vec<u8>], name: &[u8]) -> Vec<Vec<u8>> {
+    let mut result = parent.to_vec();
+    result.push(name.to_vec());
+    result
+}
+
+fn components_to_path(components: &[Vec<u8>]) -> PathBuf {
+    components
+        .iter()
+        .fold(PathBuf::new(), |mut path, component| {
+            path.push(OsString::from_vec(component.clone()));
+            path
+        })
+}
+
+fn skipped_components(components: &[Vec<u8>]) -> bool {
+    components.iter().any(|component| {
+        [
+            b"backup".as_slice(),
+            b"backups".as_slice(),
+            b"cache".as_slice(),
+            b"caches".as_slice(),
+            b"tmp".as_slice(),
+            b"temp".as_slice(),
+        ]
+        .iter()
+        .any(|ignored| component.eq_ignore_ascii_case(ignored))
     })
 }
 
-fn cursor_is_valid(cursor: &DiscoveryCursor) -> bool {
-    cursor_estimated_bytes(cursor) < MAX_DISCOVERY_CURSOR_BYTES
-        && cursor
-            .pending_relative_entries
-            .iter()
-            .all(|path| safe_relative(path) && !skipped_component(path))
-        && cursor.pending_directories.iter().all(|resume| {
-            (resume.relative_directory.as_os_str().is_empty()
-                || safe_relative(&resume.relative_directory))
-                && safe_relative(&resume.after_entry)
-                && !skipped_component(&resume.after_entry)
-        })
+fn metadata_only_adapter_match(provider: Provider, root: &RootSpec, relative: &Path) -> bool {
+    root.recursive
+        && (provider != Provider::Claude || root.class == agbox_adapters::RootClass::Active)
+        && relative
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
 }
 
-fn cursor_estimated_bytes(cursor: &DiscoveryCursor) -> usize {
-    let entries = cursor
-        .pending_relative_entries
-        .iter()
-        .try_fold(64_usize, |total, path| {
-            total.checked_add(path.as_os_str().as_encoded_bytes().len() + 8)
-        })
-        .unwrap_or(usize::MAX);
-    cursor
-        .pending_directories
-        .iter()
-        .try_fold(entries, |total, resume| {
-            total
-                .checked_add(
-                    resume
-                        .relative_directory
-                        .as_os_str()
-                        .as_encoded_bytes()
-                        .len()
-                        + 8,
-                )
-                .and_then(|value| {
-                    value.checked_add(resume.after_entry.as_os_str().as_encoded_bytes().len() + 8)
-                })
-        })
-        .unwrap_or(usize::MAX)
+fn bounded_fault(faults: &mut Vec<DiscoveryFault>, class: DiscoveryFaultClass) {
+    if faults.len() < MAX_DISCOVERY_FAULTS {
+        faults.push(DiscoveryFault { class });
+    }
 }
 
-fn stable_source_id(provider: Provider, root_identity: &str, file_identity: &str) -> String {
+fn stat_identity(stat: &rustix::fs::Stat) -> Result<(u64, u64), DiscoveryError> {
+    let device = u64::try_from(stat.st_dev).map_err(|_| DiscoveryError::RootUnavailable)?;
+    Ok((device, stat.st_ino))
+}
+
+fn stat_time(stat: &rustix::fs::Stat) -> Option<OffsetDateTime> {
+    i128::from(stat.st_mtime)
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(i128::from(stat.st_mtime_nsec)))
+        .and_then(|value| OffsetDateTime::from_unix_timestamp_nanos(value).ok())
+}
+
+fn stable_source_id(
+    provider: Provider,
+    root_device: u64,
+    root_inode: u64,
+    file_identity: &str,
+) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"agbox.source.fs-identity.v1");
     hash_part(&mut hasher, provider.as_str().as_bytes());
-    hash_part(&mut hasher, root_identity.as_bytes());
+    hash_part(&mut hasher, &root_device.to_le_bytes());
+    hash_part(&mut hasher, &root_inode.to_le_bytes());
     hash_part(&mut hasher, file_identity.as_bytes());
     format!("source_{}", &hasher.finalize().to_hex()[..32])
 }
@@ -395,11 +577,31 @@ fn hash_part(hasher: &mut blake3::Hasher, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
-fn metadata_time(metadata: &fs::Metadata) -> Option<OffsetDateTime> {
-    let seconds = i128::from(metadata.mtime());
-    let nanos = i128::from(metadata.mtime_nsec());
-    seconds
-        .checked_mul(1_000_000_000)
-        .and_then(|value| value.checked_add(nanos))
-        .and_then(|value| OffsetDateTime::from_unix_timestamp_nanos(value).ok())
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{DirectoryCursor, DiscoveryCursor, MAX_DISCOVERY_CURSOR_BYTES};
+    use std::collections::VecDeque;
+
+    #[test]
+    fn cursor_serialization_round_trips_arbitrary_component_bytes_exactly() {
+        let cursor = DiscoveryCursor {
+            root_device: 1,
+            root_inode: 2,
+            pending_directories: VecDeque::from([DirectoryCursor {
+                components: vec![vec![b'd', b'i', b'r', 0xff, 0x80]],
+                entries_consumed: 17,
+                device: 3,
+                inode: 4,
+                mtime_seconds: 5,
+                mtime_nanoseconds: 6,
+                ctime_seconds: 7,
+                ctime_nanoseconds: 8,
+            }]),
+        };
+        let encoded = serde_json::to_vec(&cursor).unwrap();
+        assert!(encoded.len() <= MAX_DISCOVERY_CURSOR_BYTES);
+        let decoded: DiscoveryCursor = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), encoded);
+    }
 }

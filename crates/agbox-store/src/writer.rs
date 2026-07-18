@@ -37,7 +37,7 @@ impl fmt::Debug for SourceRegistration {
         formatter
             .debug_struct("SourceRegistration")
             .field("project_id", &self.project_id)
-            .field("source_id", &self.source_id)
+            .field("source_id_bytes", &self.source_id.len())
             .field("provider", &self.provider)
             .field("generation", &self.generation)
             .field("size_bytes", &self.size_bytes)
@@ -631,9 +631,9 @@ pub(crate) fn run_writer(
 
 fn validate_registration(registration: &SourceRegistration) -> Result<(), StoreError> {
     if !bounded_identifier(registration.project_id.as_str())
-        || !bounded_identifier(&registration.source_id)
-        || !bounded_metadata(&registration.repository_identity)
-        || !bounded_metadata(&registration.file_identity)
+        || !valid_source_id(&registration.source_id)
+        || !valid_repository_identity(&registration.repository_identity)
+        || !valid_file_identity(&registration.file_identity)
         || !matches!(registration.root_class.as_str(), "active" | "archive")
         || registration.generation == 0
         || registration.generation > i64::MAX as u64
@@ -653,6 +653,36 @@ fn validate_registration(registration: &SourceRegistration) -> Result<(), StoreE
         let _ = format_timestamp(session_time)?;
     }
     Ok(())
+}
+
+fn valid_source_id(value: &str) -> bool {
+    value.len() == 39
+        && value.strip_prefix("source_").is_some_and(|digest| {
+            digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+}
+
+fn valid_repository_identity(value: &str) -> bool {
+    value
+        .strip_prefix("repo-fs-v1:")
+        .and_then(|suffix| suffix.split_once(':'))
+        .is_some_and(|(device, inode)| canonical_u64(device) && canonical_u64(inode))
+}
+
+fn valid_file_identity(value: &str) -> bool {
+    value
+        .strip_prefix("unix:")
+        .and_then(|suffix| suffix.split_once(':'))
+        .is_some_and(|(device, inode)| canonical_u64(device) && canonical_u64(inode))
+}
+
+fn canonical_u64(value: &str) -> bool {
+    !value.is_empty()
+        && (value == "0" || !value.starts_with('0'))
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u64>().is_ok()
 }
 
 fn register_source(
@@ -691,6 +721,30 @@ fn register_source(
         .map(format_timestamp)
         .transpose()?;
 
+    insert_source_registration(
+        &transaction,
+        registration,
+        &encrypted_root,
+        &encrypted_source,
+        &mtime,
+        session_time.as_deref(),
+    )?;
+    transaction.commit()?;
+    Ok(SourceRegistrationReceipt {
+        source_id: registration.source_id.clone(),
+        generation: registration.generation,
+        initial_cursor: registration.initial_cursor,
+    })
+}
+
+fn insert_source_registration(
+    transaction: &Transaction<'_>,
+    registration: &SourceRegistration,
+    encrypted_root: &[u8],
+    encrypted_source: &[u8],
+    mtime: &str,
+    session_time: Option<&str>,
+) -> Result<(), StoreError> {
     transaction.execute(
         "INSERT INTO projects(
              project_id, repository_identity, encrypted_root_path, created_at, updated_at
@@ -740,6 +794,17 @@ fn register_source(
             session_time,
         ],
     )?;
+    transaction.execute(
+        "INSERT INTO source_generation_identities(
+             source_id, generation, file_identity
+         ) VALUES (?1, ?2, ?3)
+         ON CONFLICT(source_id, generation) DO NOTHING",
+        params![
+            registration.source_id,
+            to_i64(registration.generation)?,
+            registration.file_identity,
+        ],
+    )?;
     let registration_digest = registration_digest(registration)?;
     transaction.execute(
         "INSERT INTO source_cursors(
@@ -755,12 +820,7 @@ fn register_source(
             registration_digest,
         ],
     )?;
-    transaction.commit()?;
-    Ok(SourceRegistrationReceipt {
-        source_id: registration.source_id.clone(),
-        generation: registration.generation,
-        initial_cursor: registration.initial_cursor,
-    })
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -828,7 +888,10 @@ fn validate_registration_associations(
     }
     let file_owner: Option<String> = transaction
         .query_row(
-            "SELECT source_id FROM sources WHERE file_identity = ?1 LIMIT 1",
+            "SELECT source_id
+             FROM source_generation_identities
+             WHERE file_identity = ?1
+             LIMIT 1",
             [registration.file_identity.as_str()],
             |row| row.get(0),
         )
@@ -843,15 +906,25 @@ fn validate_registration_associations(
     if source_exists && maximum.is_none() {
         return Err(StoreError::ImmutableConflict);
     }
-    let existing: Option<(i64, String, Option<String>, i64)> = transaction
+    let existing: Option<(i64, String, Option<String>, i64, String)> = transaction
         .query_row(
             "SELECT source_generations.size_bytes, source_generations.mtime,
-                    source_generations.session_time, source_cursors.cursor_offset
+                    source_generations.session_time, source_cursors.cursor_offset,
+                    source_generation_identities.file_identity
              FROM source_generations
              INNER JOIN source_cursors USING (source_id, generation)
+             INNER JOIN source_generation_identities USING (source_id, generation)
              WHERE source_id = ?1 AND generation = ?2",
             params![registration.source_id, generation],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?;
     let expected_mtime = format_timestamp(registration.mtime)?;
@@ -859,11 +932,12 @@ fn validate_registration_associations(
         .session_time
         .map(format_timestamp)
         .transpose()?;
-    if let Some((size, mtime, session_time, cursor)) = existing {
+    if let Some((size, mtime, session_time, cursor, file_identity)) = existing {
         if size != to_i64(registration.size_bytes)?
             || mtime != expected_mtime
             || session_time != expected_session
             || cursor != to_i64(registration.initial_cursor)?
+            || file_identity != registration.file_identity
         {
             return Err(StoreError::ImmutableConflict);
         }

@@ -27,13 +27,14 @@ impl HistoryPolicy {
         now: OffsetDateTime,
         file_size: u64,
     ) -> HistoryDecision {
+        let Some(oldest) = now.checked_sub(time::Duration::days(HISTORY_DAYS)) else {
+            return HistoryDecision::BaselineAt(file_size);
+        };
+        let Some(latest) = now.checked_add(time::Duration::days(FUTURE_SKEW_DAYS)) else {
+            return HistoryDecision::BaselineAt(file_size);
+        };
         match session_time {
-            Some(value)
-                if value >= now - time::Duration::days(HISTORY_DAYS)
-                    && value <= now + time::Duration::days(FUTURE_SKEW_DAYS) =>
-            {
-                HistoryDecision::ReplayFrom(0)
-            }
+            Some(value) if value >= oldest && value <= latest => HistoryDecision::ReplayFrom(0),
             _ => HistoryDecision::BaselineAt(file_size),
         }
     }

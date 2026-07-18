@@ -3595,6 +3595,19 @@ The walker:
 - sorts entries within one directory for deterministic tests;
 - yields its cursor before serializing more than 32 KiB.
 
+**Implementation amendment (macOS-safe resumability):** directory streams are
+stateful while a walker remains alive, so normal yields retain the open
+directory stream and do not reread already visited entries. A serialized
+cursor stores only a relative component list, a consumed-entry count, and the
+directory's device/inode/mtime/ctime snapshot—never an absolute root or OS
+directory cookie. On restore, the directory is reopened with safe
+descriptor-relative `rustix` calls, the snapshot must match exactly, and the
+walker replays the consumed count in at-most-256-entry work batches before it
+can emit more sources. Any device/inode/mtime/ctime change invalidates the
+cursor. Sorting is deliberately limited to each bounded page; a global sort
+would require unbounded materialization. This requires neither `unsafe` code
+nor direct `libc` calls.
+
 - [ ] **Step 4: Implement verified open and generation reconciliation**
 
 On Unix, walk from an already-open canonical root directory and open each component with safe `rustix::fs::openat`; use `OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW` for the file, then compare `st_dev` and `st_ino` with the discovered identity. Reject any symlink component, identity change, or root escape. Do not add direct `libc` calls or relax workspace `unsafe_code = "forbid"`.

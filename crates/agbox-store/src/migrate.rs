@@ -10,7 +10,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 
-use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
 use crate::{
     StoreError,
@@ -18,6 +18,20 @@ use crate::{
 };
 
 const INITIAL: &str = include_str!("schema/0001_initial.sql");
+const MIGRATION_2: &str = "
+CREATE TABLE source_generation_identities (
+    source_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    file_identity TEXT NOT NULL,
+    PRIMARY KEY (source_id, generation),
+    FOREIGN KEY (source_id, generation)
+        REFERENCES source_generations(source_id, generation)
+) STRICT;
+INSERT INTO source_generation_identities(source_id, generation, file_identity)
+SELECT source_generations.source_id, source_generations.generation, sources.file_identity
+FROM source_generations
+INNER JOIN sources USING (source_id);
+";
 const REQUIRED_V1_TABLES: &[&str] = &[
     "schema_migrations",
     "projects",
@@ -71,8 +85,7 @@ pub(crate) fn open_writer(path: &Path) -> Result<OpenedWriter, StoreError> {
 
     let database_path = canonical_parent.join(name);
     let version = if database_exists {
-        validate_existing_database(&database_path)?;
-        1
+        validate_existing_database(&database_path)?
     } else {
         ensure_owner_file(&directory, name)?;
         0
@@ -101,15 +114,32 @@ pub(crate) fn open_writer(path: &Path) -> Result<OpenedWriter, StoreError> {
     if version == 0 {
         let transaction = connection.transaction()?;
         transaction.execute_batch(INITIAL)?;
-        transaction.pragma_update(None, "user_version", 1)?;
+        transaction.pragma_update(None, "user_version", 2)?;
         transaction.execute(
             "INSERT INTO schema_migrations(version, applied_at)
              VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
             [],
         )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at)
+             VALUES (2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            [],
+        )?;
         transaction.commit()?;
         checkpoint_schema_contract(&connection)?;
-        validate_v1_schema(&connection)?;
+        validate_v2_schema(&connection)?;
+    } else if version == 1 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(MIGRATION_2)?;
+        transaction.pragma_update(None, "user_version", 2)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at)
+             VALUES (2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            [],
+        )?;
+        transaction.commit()?;
+        checkpoint_schema_contract(&connection)?;
+        validate_v2_schema(&connection)?;
     }
 
     validate_owner_file(&directory, name)?;
@@ -122,7 +152,7 @@ pub(crate) fn open_writer(path: &Path) -> Result<OpenedWriter, StoreError> {
     })
 }
 
-fn validate_existing_database(path: &Path) -> Result<(), StoreError> {
+fn validate_existing_database(path: &Path) -> Result<i64, StoreError> {
     // Schema DDL, migration markers, and user_version are checkpointed into
     // the main database before a newly initialized writer is returned.
     // Runtime WAL traffic is DML-only, so immutable mode can validate the
@@ -137,7 +167,8 @@ fn validate_existing_database(path: &Path) -> Result<(), StoreError> {
     )?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
-        1 => validate_v1_schema(&connection),
+        1 => validate_v1_schema(&connection).map(|()| 1),
+        2 => validate_v2_schema(&connection).map(|()| 2),
         0 => Err(StoreError::IncompatibleSchema),
         unsupported => Err(StoreError::UnsupportedSchema(unsupported)),
     }
@@ -193,6 +224,62 @@ fn validate_v1_schema(connection: &Connection) -> Result<(), StoreError> {
         Ok(true) => Ok(()),
         Ok(false) | Err(_) => Err(StoreError::IncompatibleSchema),
     }
+}
+
+fn validate_v2_schema(connection: &Connection) -> Result<(), StoreError> {
+    validate_v1_schema(connection)?;
+    match v2_schema_is_compatible(connection) {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(StoreError::IncompatibleSchema),
+    }
+}
+
+fn v2_schema_is_compatible(connection: &Connection) -> rusqlite::Result<bool> {
+    let marker_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 2)",
+        [],
+        |row| row.get(0),
+    )?;
+    if !marker_exists {
+        return Ok(false);
+    }
+    let table_kind: Option<String> = connection
+        .query_row(
+            "SELECT type FROM sqlite_schema WHERE name = 'source_generation_identities'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if table_kind.as_deref() != Some("table") {
+        return Ok(false);
+    }
+    let mut statement = connection.prepare("PRAGMA table_info(source_generation_identities)")?;
+    let columns: Vec<ColumnShape> = statement
+        .query_map([], |row| {
+            Ok(ColumnShape {
+                position: row.get(0)?,
+                name: row.get(1)?,
+                declared_type: row.get(2)?,
+                not_null: row.get::<_, i64>(3)? == 1,
+                primary_key_position: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let expected = [
+        (0, "source_id", "TEXT", true, 1),
+        (1, "generation", "INTEGER", true, 2),
+        (2, "file_identity", "TEXT", true, 0),
+    ];
+    Ok(columns.len() == expected.len()
+        && columns.iter().zip(expected).all(
+            |(column, (position, name, declared_type, not_null, primary_key_position))| {
+                column.position == position
+                    && column.name == name
+                    && column.declared_type.eq_ignore_ascii_case(declared_type)
+                    && column.not_null == not_null
+                    && column.primary_key_position == primary_key_position
+            },
+        ))
 }
 
 fn v1_schema_is_compatible(connection: &Connection) -> rusqlite::Result<bool> {

@@ -16,7 +16,7 @@ use agbox_adapters::{RootClass, RootSpec};
 use agbox_core::Provider;
 use agbox_ingest::{
     DISCOVERY_ENTRIES_PER_YIELD, DiscoveryWalker, HistoryDecision, HistoryPolicy, ProjectResolver,
-    VerifiedOpenError, VerifiedSourceOpener,
+    VerifiedOpenError, VerifiedSourceOpener, deduplicate_overlapping_sources,
 };
 use agbox_store::{CryptoError, KeyProvider, MemoryKeyProvider, SourceRegistration, StoreRuntime};
 use rusqlite::Connection;
@@ -81,6 +81,16 @@ fn history_is_exactly_ninety_days_and_rejects_untrusted_dates() {
         attempted_override.decide(Some(now - time::Duration::days(60)), now, 400),
         HistoryDecision::ReplayFrom(0)
     );
+    let minimum = OffsetDateTime::from_unix_timestamp(-377_705_116_800).unwrap();
+    let maximum = OffsetDateTime::from_unix_timestamp(253_402_300_799).unwrap();
+    assert_eq!(
+        policy.decide(Some(minimum), minimum, 400),
+        HistoryDecision::BaselineAt(400)
+    );
+    assert_eq!(
+        policy.decide(Some(maximum), maximum, 400),
+        HistoryDecision::BaselineAt(400)
+    );
 }
 
 #[test]
@@ -109,25 +119,54 @@ fn discovery_yields_at_256_and_resumes_deterministically_without_opening_content
     assert_eq!(second.sources.len(), 44);
     assert!(second.cursor.is_none());
 
-    let names = first
+    let first_names = first
         .sources
         .iter()
-        .chain(&second.sources)
         .map(|source| source.path.file_name().unwrap().to_owned())
         .collect::<Vec<_>>();
-    let mut sorted = names.clone();
-    sorted.sort();
-    assert_eq!(names, sorted);
+    let second_names = second
+        .sources
+        .iter()
+        .map(|source| source.path.file_name().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert!(first_names.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert!(second_names.windows(2).all(|pair| pair[0] <= pair[1]));
+    let mut names = first_names;
+    names.extend(second_names);
+    names.sort();
+    let expected = (0..300)
+        .map(|index| std::ffi::OsString::from(format!("{index:03}.jsonl")))
+        .collect::<Vec<_>>();
+    assert_eq!(names, expected);
 
-    let resumed = DiscoveryWalker::from_cursor(
+    let mut resumed = DiscoveryWalker::from_cursor(
         Provider::Codex,
         root_spec(temp.path()),
         first.cursor.unwrap(),
     )
-    .unwrap()
-    .next_batch(256)
     .unwrap();
-    assert_eq!(resumed.sources.len(), 44);
+    let recovery = resumed.next_batch(256).unwrap();
+    assert!(recovery.sources.is_empty());
+    assert_eq!(recovery.visited_entries, 256);
+    assert!(recovery.cursor.is_some());
+    let resumed_tail = resumed.next_batch(256).unwrap();
+    assert_eq!(resumed_tail.sources.len(), 44);
+    assert!(resumed_tail.visited_entries <= 256);
+
+    let mut restarted_recovery = DiscoveryWalker::from_cursor(
+        Provider::Codex,
+        root_spec(temp.path()),
+        recovery.cursor.unwrap(),
+    )
+    .unwrap();
+    let repeated_recovery = restarted_recovery.next_batch(128).unwrap();
+    assert!(repeated_recovery.sources.is_empty());
+    assert_eq!(repeated_recovery.visited_entries, 128);
+    let continued_recovery = restarted_recovery.next_batch(128).unwrap();
+    assert!(continued_recovery.sources.is_empty());
+    assert_eq!(continued_recovery.visited_entries, 128);
+    let restarted_tail = restarted_recovery.next_batch(256).unwrap();
+    assert_eq!(restarted_tail.sources.len(), 44);
 }
 
 #[test]
@@ -141,8 +180,26 @@ fn worst_case_256_long_entries_finish_with_a_bounded_cursor() {
     let batch = walker.next_batch(256).unwrap();
     assert_eq!(batch.visited_entries, 256);
     assert_eq!(batch.sources.len(), 256);
-    assert!(batch.cursor.is_none());
+    assert!(batch.cursor.is_some());
     assert!(batch.faults.is_empty());
+    let terminal = walker.next_batch(256).unwrap();
+    assert_eq!(terminal.visited_entries, 0);
+    assert!(terminal.cursor.is_none());
+}
+
+#[test]
+fn overlapping_roots_collapse_by_verified_file_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let nested = temp.path().join("nested");
+    fs::create_dir(&nested).unwrap();
+    fs::write(nested.join("session.jsonl"), b"record").unwrap();
+    let mut broad = DiscoveryWalker::new(Provider::Codex, root_spec(temp.path())).unwrap();
+    let mut narrow = DiscoveryWalker::new(Provider::Codex, root_spec(&nested)).unwrap();
+    let broad_sources = broad.next_batch(256).unwrap().sources;
+    let narrow_sources = narrow.next_batch(256).unwrap().sources;
+    let collapsed = deduplicate_overlapping_sources([broad_sources, narrow_sources].concat());
+    assert_eq!(collapsed.len(), 1);
+    assert_eq!(collapsed[0].root, nested.canonicalize().unwrap());
 }
 
 #[test]
@@ -204,7 +261,12 @@ fn discovery_isolates_metadata_disappearance_without_exposing_names() {
     let mut walker = DiscoveryWalker::new(Provider::Codex, root_spec(temp.path())).unwrap();
     let first = walker.next_batch(1).unwrap();
     assert_eq!(first.sources.len(), 1);
-    fs::remove_file(temp.path().join("z_SECRET_ATTACKER_NAME.jsonl")).unwrap();
+    let remaining = if first.sources[0].path.ends_with("a.jsonl") {
+        "z_SECRET_ATTACKER_NAME.jsonl"
+    } else {
+        "a.jsonl"
+    };
+    fs::remove_file(temp.path().join(remaining)).unwrap();
     let second = walker.next_batch(1).unwrap();
     assert_eq!(second.sources.len(), 0);
     assert_eq!(second.faults.len(), 1);
@@ -235,6 +297,11 @@ fn verified_open_rejects_symlink_components_and_replacement_races() {
         .iter()
         .find(|source| source.path.ends_with("real/source.jsonl"))
         .unwrap();
+    fs::write(real.join("source.jsonl"), b"original plus append").unwrap();
+    assert_eq!(
+        opener.open(source).unwrap_err(),
+        VerifiedOpenError::IdentityChanged
+    );
     fs::rename(real.join("source.jsonl"), real.join("old.jsonl")).unwrap();
     fs::write(real.join("source.jsonl"), b"replacement").unwrap();
     assert_eq!(
@@ -260,6 +327,29 @@ fn project_resolution_requires_real_git_and_domain_separates_identity() {
     assert!(resolver.resolve(temp.path()).is_err());
 }
 
+#[test]
+fn project_resolution_requires_a_valid_contained_gitdir_marker() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository = temp.path().join("repo");
+    let nested = repository.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    let resolver = ProjectResolver::new(temp.path()).unwrap();
+
+    fs::write(repository.join(".git"), b"").unwrap();
+    assert!(resolver.resolve(&nested).is_err());
+    fs::write(repository.join(".git"), b"gitdir: ../outside\nextra").unwrap();
+    assert!(resolver.resolve(&nested).is_err());
+    fs::write(repository.join(".git"), b"gitdir: ../../escape").unwrap();
+    assert!(resolver.resolve(&nested).is_err());
+
+    fs::create_dir(repository.join("actual-gitdir")).unwrap();
+    fs::write(repository.join(".git"), b"gitdir: actual-gitdir\n").unwrap();
+    assert_eq!(
+        resolver.resolve(&nested).unwrap().root,
+        repository.canonicalize().unwrap()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn project_resolution_rejects_symlink_escape() {
@@ -269,6 +359,22 @@ fn project_resolution_rejects_symlink_escape() {
     std::os::unix::fs::symlink(outside.path(), allowed.path().join("escape")).unwrap();
     let resolver = ProjectResolver::new(allowed.path()).unwrap();
     assert!(resolver.resolve(allowed.path().join("escape")).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn project_resolution_rejects_a_component_swapped_to_a_symlink_after_binding() {
+    let allowed = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let repository = allowed.path().join("repo");
+    fs::create_dir_all(repository.join("nested")).unwrap();
+    fs::create_dir(repository.join(".git")).unwrap();
+    fs::create_dir(outside.path().join(".git")).unwrap();
+    let resolver = ProjectResolver::new(allowed.path()).unwrap();
+
+    fs::rename(&repository, allowed.path().join("old-repo")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &repository).unwrap();
+    assert!(resolver.resolve(repository.join("nested")).is_err());
 }
 
 #[tokio::test]
@@ -308,7 +414,7 @@ async fn registration_is_atomic_idempotent_encrypted_and_exact() {
         project_id: agbox_core::ProjectId::for_test("project_registration"),
         repository_identity: "repo-fs-v1:11:12".to_owned(),
         project_root: Zeroizing::new(project_root.clone()),
-        source_id: "source_registration".to_owned(),
+        source_id: "source_11111111111111111111111111111111".to_owned(),
         provider: Provider::Codex,
         root_class: "active".to_owned(),
         source_path: Zeroizing::new(source_path.clone()),
@@ -322,6 +428,7 @@ async fn registration_is_atomic_idempotent_encrypted_and_exact() {
     let debug = format!("{registration:?}");
     assert!(!debug.contains("AGBOX_PROJECT_ROOT_SECRET"));
     assert!(!debug.contains("AGBOX_SOURCE_PATH_SECRET"));
+    assert!(!debug.contains("source_11111111111111111111111111111111"));
 
     runtime
         .writer()
@@ -341,7 +448,7 @@ async fn registration_is_atomic_idempotent_encrypted_and_exact() {
             "SELECT size_bytes, cursor_offset
              FROM source_generations
              INNER JOIN source_cursors USING (source_id, generation)
-             WHERE source_id = 'source_registration' AND generation = 1",
+             WHERE source_id = 'source_11111111111111111111111111111111' AND generation = 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -392,7 +499,7 @@ async fn registration_conflict_rolls_back_without_partial_generation() {
         project_id: agbox_core::ProjectId::for_test("project_registration"),
         repository_identity: "repo-fs-v1:21:22".to_owned(),
         project_root: Zeroizing::new(b"/project".to_vec()),
-        source_id: "source_registration".to_owned(),
+        source_id: "source_11111111111111111111111111111111".to_owned(),
         provider: Provider::Claude,
         root_class: "active".to_owned(),
         source_path: Zeroizing::new(b"/project/source.jsonl".to_vec()),
@@ -409,19 +516,58 @@ async fn registration_conflict_rolls_back_without_partial_generation() {
         .await
         .unwrap();
     let mut conflict = base.clone();
-    conflict.file_identity = "unix:21:DIFFERENT".to_owned();
+    conflict.file_identity = "unix:21:30".to_owned();
     assert!(runtime.writer().register_source(conflict).await.is_err());
 
     let mut second = base.clone();
     second.generation = 2;
     second.size_bytes = 55;
-    second.file_identity = "unix:21:DIFFERENT".to_owned();
+    second.file_identity = "unix:21:30".to_owned();
     second.source_path = Zeroizing::new(b"/project/moved-source.jsonl".to_vec());
     runtime
         .writer()
         .register_source(second.clone())
         .await
         .unwrap();
+
+    let mut historical_identity_reuse = base.clone();
+    historical_identity_reuse.source_id = "source_33333333333333333333333333333333".to_owned();
+    historical_identity_reuse.source_path = Zeroizing::new(b"/project/other-source.jsonl".to_vec());
+    assert!(
+        runtime
+            .writer()
+            .register_source(historical_identity_reuse)
+            .await
+            .is_err()
+    );
+
+    let mut invalid_source_id = base.clone();
+    invalid_source_id.source_id = "source_ABCDEF".to_owned();
+    assert!(
+        runtime
+            .writer()
+            .register_source(invalid_source_id)
+            .await
+            .is_err()
+    );
+    let mut invalid_repository_identity = base.clone();
+    invalid_repository_identity.repository_identity = "repo-fs-v1:01:22".to_owned();
+    assert!(
+        runtime
+            .writer()
+            .register_source(invalid_repository_identity)
+            .await
+            .is_err()
+    );
+    let mut invalid_file_identity = base.clone();
+    invalid_file_identity.file_identity = "unix:21:029".to_owned();
+    assert!(
+        runtime
+            .writer()
+            .register_source(invalid_file_identity)
+            .await
+            .is_err()
+    );
 
     assert!(
         runtime
@@ -460,13 +606,13 @@ async fn registration_conflict_rolls_back_without_partial_generation() {
     );
     let maximum_width = SourceRegistration {
         project_id: agbox_core::ProjectId::parse_wire(&"p".repeat(128)).unwrap(),
-        repository_identity: "r".repeat(128),
+        repository_identity: "repo-fs-v1:23:24".to_owned(),
         project_root: Zeroizing::new(b"/maximum/project".to_vec()),
-        source_id: "s".repeat(128),
+        source_id: "source_22222222222222222222222222222222".to_owned(),
         provider: Provider::Codex,
         root_class: "archive".to_owned(),
         source_path: Zeroizing::new(b"/maximum/project/source.jsonl".to_vec()),
-        file_identity: "f".repeat(128),
+        file_identity: "unix:23:25".to_owned(),
         generation: 1,
         size_bytes: 0,
         mtime: OffsetDateTime::UNIX_EPOCH,
@@ -483,7 +629,8 @@ async fn registration_conflict_rolls_back_without_partial_generation() {
     let connection = Connection::open(&database).unwrap();
     let count: i64 = connection
         .query_row(
-            "SELECT count(*) FROM source_generations WHERE source_id = 'source_registration'",
+            "SELECT count(*) FROM source_generations
+             WHERE source_id = 'source_11111111111111111111111111111111'",
             [],
             |row| row.get(0),
         )
@@ -491,10 +638,11 @@ async fn registration_conflict_rolls_back_without_partial_generation() {
     assert_eq!(count, 2);
     let current_identity: String = connection
         .query_row(
-            "SELECT file_identity FROM sources WHERE source_id = 'source_registration'",
+            "SELECT file_identity FROM sources
+             WHERE source_id = 'source_11111111111111111111111111111111'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(current_identity, "unix:21:DIFFERENT");
+    assert_eq!(current_identity, "unix:21:30");
 }

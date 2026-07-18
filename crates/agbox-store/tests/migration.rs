@@ -41,12 +41,13 @@ fn creates_v2_schema_without_touching_legacy_db() {
     std::fs::write(&legacy, b"legacy sentinel").unwrap();
 
     let store = Store::open_new(home.path().join("state.db")).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 1);
+    assert_eq!(store.schema_version().unwrap(), 2);
     assert_eq!(store.journal_mode().unwrap(), "wal");
     assert_eq!(std::fs::read(&legacy).unwrap(), b"legacy sentinel");
     for table in [
         "sources",
         "source_generations",
+        "source_generation_identities",
         "source_cursors",
         "source_observations",
         "activity_events",
@@ -93,7 +94,7 @@ fn creates_v2_schema_without_touching_legacy_db() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        1
+        2
     );
     let manifest_column: (String, i64) = connection
         .query_row(
@@ -108,7 +109,35 @@ fn creates_v2_schema_without_touching_legacy_db() {
     drop(connection);
     drop(store);
     let reopened = Store::open_new(home.path().join("state.db")).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 1);
+    assert_eq!(reopened.schema_version().unwrap(), 2);
+}
+
+#[test]
+fn migrates_v1_generation_identities_before_opening_writer() {
+    let home = tempfile::tempdir().unwrap();
+    set_mode(home.path(), 0o700);
+    let database = home.path().join("state.db");
+    let store = Store::open_new(&database).unwrap();
+    drop(store);
+
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE source_generation_identities;
+             DELETE FROM schema_migrations WHERE version = 2;
+             PRAGMA user_version = 1;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+    drop(connection);
+
+    let migrated = Store::open_new(&database).unwrap();
+    assert_eq!(migrated.schema_version().unwrap(), 2);
+    assert!(
+        migrated
+            .table_exists("source_generation_identities")
+            .unwrap()
+    );
 }
 
 #[test]
@@ -129,14 +158,14 @@ fn rejects_an_unsupported_schema_version_without_migrating_it() {
     set_mode(home.path(), 0o700);
     let database = home.path().join("state.db");
     let connection = Connection::open(&database).unwrap();
-    connection.pragma_update(None, "user_version", 2).unwrap();
+    connection.pragma_update(None, "user_version", 3).unwrap();
     drop(connection);
     set_mode(&database, 0o600);
 
     let error = Store::open_new(&database).unwrap_err();
 
-    assert!(matches!(error, StoreError::UnsupportedSchema(2)));
-    assert_eq!(read_user_version(&database), 2);
+    assert!(matches!(error, StoreError::UnsupportedSchema(3)));
+    assert_eq!(read_user_version(&database), 3);
     assert!(!home.path().join("state.db-wal").exists());
     assert!(!home.path().join("state.db-shm").exists());
 }
@@ -148,11 +177,11 @@ fn reopens_a_database_whose_canonical_path_needs_uri_percent_encoding() {
     let database = home.path().join("state ?#%.db");
 
     let store = Store::open_new(&database).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 1);
+    assert_eq!(store.schema_version().unwrap(), 2);
     drop(store);
 
     let reopened = Store::open_new(&database).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 1);
+    assert_eq!(reopened.schema_version().unwrap(), 2);
 }
 
 #[test]
