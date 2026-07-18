@@ -90,7 +90,7 @@ fn reducer_observes_artifacts_and_structured_verification_without_agent_claims()
             EventPayload::ActionFinished {
                 native_action_id: "cargo-test".into(),
                 outcome: ActionOutcome::Succeeded,
-                output: None,
+                output: Some(content("ok", DisclosureClass::ToolResult, true)),
             },
         ),
         event(
@@ -214,4 +214,78 @@ fn reducer_rejects_unordered_and_oversized_slices() {
         DeterministicReducer.reduce(&oversized).unwrap_err(),
         ReduceError::TooManyEvents
     );
+}
+
+#[test]
+fn human_actor_requires_human_intent_disclosure_for_instruction_facts() {
+    let events = committed(vec![event(
+        1,
+        Actor::Human,
+        EventPayload::MessageCreated {
+            content: content(
+                "agent-classified text",
+                DisclosureClass::AgentStatement,
+                true,
+            ),
+        },
+    )]);
+
+    let mutation = DeterministicReducer.reduce(&events).unwrap();
+    assert!(!mutation.facts.iter().any(|fact| matches!(
+        fact,
+        ReducedFact::HumanObjective { .. } | ReducedFact::HumanConstraint { .. }
+    )));
+}
+
+#[test]
+fn action_finish_requires_tool_actor_and_tool_result_disclosure_for_verification() {
+    let request = event(
+        1,
+        Actor::Agent,
+        EventPayload::ActionRequested {
+            native_action_id: "authority".into(),
+            tool_name: "shell".into(),
+            input: content("cargo test", DisclosureClass::ObservedState, true),
+        },
+    );
+    let agent_finish = committed(vec![
+        request.clone(),
+        event(
+            2,
+            Actor::Agent,
+            EventPayload::ActionFinished {
+                native_action_id: "authority".into(),
+                outcome: ActionOutcome::Succeeded,
+                output: None,
+            },
+        ),
+    ]);
+    let wrong_disclosure = committed(vec![
+        request,
+        event(
+            3,
+            Actor::Tool,
+            EventPayload::ActionFinished {
+                native_action_id: "authority".into(),
+                outcome: ActionOutcome::Succeeded,
+                output: Some(content("claim", DisclosureClass::AgentStatement, true)),
+            },
+        ),
+    ]);
+
+    for events in [&agent_finish, &wrong_disclosure] {
+        let mutation = DeterministicReducer.reduce(events).unwrap();
+        assert!(
+            !mutation
+                .facts
+                .iter()
+                .any(|fact| matches!(fact, ReducedFact::Verification { .. }))
+        );
+        assert!(
+            mutation
+                .facts
+                .iter()
+                .any(|fact| matches!(fact, ReducedFact::ActionFinishedObserved { .. }))
+        );
+    }
 }

@@ -1,7 +1,8 @@
 use std::{collections::BTreeMap, fmt};
 
 use agbox_core::{
-    ActionOutcome, ActivityEventV1, Actor, EventId, EventPayload, ProjectId, Provider, SessionId,
+    ActionOutcome, ActivityEventV1, Actor, DisclosureClass, EventId, EventPayload, ProjectId,
+    Provider, SessionId,
 };
 use time::OffsetDateTime;
 
@@ -36,7 +37,9 @@ pub enum ReducedFact {
     SessionContext {
         project_id: ProjectId,
         session_id: SessionId,
+        provider: Provider,
         branch_hash: Option<String>,
+        observed_at: OffsetDateTime,
         evidence: EventId,
     },
     Artifact {
@@ -204,7 +207,9 @@ impl DeterministicReducer {
                     mutation.facts.push(ReducedFact::SessionContext {
                         project_id,
                         session_id,
+                        provider: event.source().provider(),
                         branch_hash: branch_hash.clone(),
+                        observed_at,
                         evidence,
                     });
                 }
@@ -246,10 +251,14 @@ impl DeterministicReducer {
                 EventPayload::ActionFinished {
                     native_action_id,
                     outcome,
-                    ..
+                    output,
                 } => {
                     let key = action_key(event, native_action_id);
-                    if let Some(command) = requests.get(&key) {
+                    let authorized_result = event.actor() == Actor::Tool
+                        && output.as_ref().is_none_or(|content| {
+                            content.disclosure_class() == DisclosureClass::ToolResult
+                        });
+                    if authorized_result && let Some(command) = requests.get(&key) {
                         mutation.facts.push(ReducedFact::Verification {
                             project_id,
                             session_id,
@@ -271,7 +280,10 @@ impl DeterministicReducer {
                         });
                     }
                 }
-                EventPayload::MessageCreated { content } if event.actor() == Actor::Human => {
+                EventPayload::MessageCreated { content }
+                    if event.actor() == Actor::Human
+                        && content.disclosure_class() == DisclosureClass::HumanIntent =>
+                {
                     let redacted_text = nonempty(content.redacted_excerpt());
                     let fact = if redacted_text.as_deref().is_some_and(is_constraint) {
                         ReducedFact::HumanConstraint {

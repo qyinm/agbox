@@ -237,3 +237,120 @@ async fn event_pages_use_local_sequence_and_enforce_row_and_byte_caps() {
         .unwrap();
     assert_eq!(byte_limited.len(), 1);
 }
+
+#[tokio::test]
+async fn production_graph_page_boundary_resumes_after_restart_and_drains_multiple_pages() {
+    let mut records = vec![
+        r#"{"ordinal":0,"type":"session_meta","payload":{"id":"codex-page","cwd":"/fixture/project","history_mode":"paginated"}}"#
+            .to_owned(),
+    ];
+    records.extend((1..=1_000).map(|ordinal| {
+        format!(
+            r#"{{"ordinal":{ordinal},"type":"event_msg","payload":{{"type":"user_message","message":"message-{ordinal}"}}}}"#
+        )
+    }));
+    records.push(
+        r#"{"ordinal":1001,"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call-page"}}"#
+            .to_owned(),
+    );
+    records.push(
+        r#"{"ordinal":1002,"type":"event_msg","payload":{"type":"item_completed","item":{"type":"command_execution","call_id":"call-page","status":"completed","output":"done"}}}"#
+            .to_owned(),
+    );
+    let fixture = FixtureRuntime::records(records).await;
+    fixture.drain().await.unwrap();
+    let event_count = fixture.read_store().event_count().await.unwrap();
+    assert!(event_count > u64::try_from(MAX_EVENT_PAGE_ROWS).unwrap());
+
+    let first_runtime = agbox_ingest::IngestionCoordinator::new(
+        fixture.read_store().clone(),
+        fixture.writer().clone(),
+        1,
+    );
+    let first = first_runtime.reduce_next_graph_page().await.unwrap();
+    assert!(first.applied);
+    assert_eq!(first.scanned_events, MAX_EVENT_PAGE_ROWS);
+    drop(first_runtime);
+
+    let restarted_runtime = agbox_ingest::IngestionCoordinator::new(
+        fixture.read_store().clone(),
+        fixture.writer().clone(),
+        1,
+    );
+    let second = restarted_runtime.reduce_next_graph_page().await.unwrap();
+    assert!(second.applied);
+    assert!(second.scanned_events > 0);
+    let counts = fixture.read_store().graph_counts_for_test().await.unwrap();
+    assert_eq!(counts.actions, 1);
+    assert_eq!(counts.verifications, 1);
+    let watermark = fixture
+        .read_store()
+        .reducer_watermark(agbox_ingest::GRAPH_REDUCER_NAME)
+        .await
+        .unwrap();
+    assert_eq!(watermark.through_event_seq, event_count);
+    assert!(watermark.through_event_id.is_some());
+
+    let idle = restarted_runtime.reduce_next_graph_page().await.unwrap();
+    assert!(!idle.applied);
+    assert_eq!(idle.scanned_events, 0);
+    assert_eq!(idle.through_event_seq, event_count);
+}
+
+#[tokio::test]
+async fn session_context_on_an_earlier_page_is_applied_to_a_later_run() {
+    let fixture = FixtureRuntime::codex_records(2).await;
+    fixture.drain().await.unwrap();
+    let events = fixture
+        .read_store()
+        .events_after(0, 2, MAX_EVENT_PAGE_BYTES)
+        .await
+        .unwrap();
+    let first = &events[0];
+    let second = &events[1];
+    let context = GraphMutation {
+        facts: vec![ReducedFact::SessionContext {
+            project_id: first.event.project_id().clone(),
+            session_id: first.event.session_id().clone(),
+            provider: Provider::Codex,
+            branch_hash: Some("b3:branch-main".into()),
+            observed_at: first.event.observed_at(),
+            evidence: first.event.event_id().clone(),
+        }],
+        expected_event_seq: 0,
+        through_event_seq: Some(first.event_seq),
+        through_event_id: Some(first.event.event_id().clone()),
+    };
+    fixture
+        .writer()
+        .apply_graph(graph_write_batch(context).unwrap())
+        .await
+        .unwrap();
+
+    let run = GraphMutation {
+        facts: vec![ReducedFact::AgentRunStarted {
+            project_id: second.event.project_id().clone(),
+            session_id: second.event.session_id().clone(),
+            provider: Provider::Codex,
+            native_agent_id: "later-run".into(),
+            observed_at: second.event.observed_at(),
+            evidence: second.event.event_id().clone(),
+        }],
+        expected_event_seq: first.event_seq,
+        through_event_seq: Some(second.event_seq),
+        through_event_id: Some(second.event.event_id().clone()),
+    };
+    let batch = graph_write_batch(run).unwrap();
+    let run_id = batch.runs[0].run_id.clone();
+    fixture.writer().apply_graph(batch).await.unwrap();
+
+    assert_eq!(
+        fixture
+            .read_store()
+            .agent_run_branch_for_test(run_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("b3:branch-main")
+    );
+}

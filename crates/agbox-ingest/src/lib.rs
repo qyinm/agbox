@@ -402,7 +402,7 @@ pub mod test_support {
     }
 }
 pub use coordinator::{
-    CoordinatorSource, IngestError, IngestionCoordinator, IngestionRuntime, ProcessReport,
-    RetryClass, RetryClock, RetryPolicy, SourceHealth, TokioRetryClock, WorkLease,
-    graph_write_batch, reducer_events_after,
+    CoordinatorSource, GRAPH_REDUCER_NAME, GraphPageReport, IngestError, IngestionCoordinator,
+    IngestionRuntime, ProcessReport, RetryClass, RetryClock, RetryPolicy, SourceHealth,
+    TokioRetryClock, WorkLease, graph_write_batch, reducer_events_after,
 };

@@ -31,9 +31,12 @@ pub struct GraphRunRow {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct GraphSessionContextRow {
+    pub context_run_id: String,
     pub project_id: ProjectId,
     pub session_id: SessionId,
+    pub provider: Provider,
     pub branch_hash: Option<String>,
+    pub observed_at: OffsetDateTime,
     pub evidence_event_id: EventId,
 }
 
@@ -176,13 +179,15 @@ impl GraphWriteBatch {
         }
         for row in &self.contexts {
             validate_graph_identity(&row.project_id, &row.session_id, &row.evidence_event_id)?;
-            if row
-                .branch_hash
-                .as_ref()
-                .is_some_and(|value| !bounded_metadata(value))
+            if !bounded_identifier(&row.context_run_id)
+                || row
+                    .branch_hash
+                    .as_ref()
+                    .is_some_and(|value| !bounded_metadata(value))
             {
                 return Err(StoreError::InvalidBatch);
             }
+            let _ = format_timestamp(row.observed_at)?;
         }
         for row in &self.actions {
             validate_graph_identity(&row.project_id, &row.session_id, &row.request_event_id)?;
@@ -1366,22 +1371,13 @@ fn apply_graph(
     verify_watermark_event(&transaction, batch.next_event_seq, &batch.next_event_id)?;
     verify_graph_batch_audit(&transaction, batch, replayed)?;
 
+    for row in &batch.contexts {
+        verify_graph_event(&transaction, &row.project_id, &row.evidence_event_id)?;
+        apply_graph_context(&transaction, row)?;
+    }
     for row in &batch.runs {
         verify_graph_event(&transaction, &row.project_id, &row.evidence_event_id)?;
         apply_graph_run(&transaction, row)?;
-    }
-    for row in &batch.contexts {
-        verify_graph_event(&transaction, &row.project_id, &row.evidence_event_id)?;
-        transaction.execute(
-            "UPDATE agent_runs
-             SET branch_hash = ?1
-             WHERE project_id = ?2 AND native_session_id = ?3",
-            params![
-                row.branch_hash,
-                row.project_id.as_str(),
-                row.session_id.as_str()
-            ],
-        )?;
     }
     for row in &batch.actions {
         verify_graph_event(&transaction, &row.project_id, &row.request_event_id)?;
@@ -1496,6 +1492,19 @@ fn verify_graph_event(
 
 fn apply_graph_run(transaction: &Transaction<'_>, row: &GraphRunRow) -> Result<(), StoreError> {
     let observed_at = format_timestamp(row.observed_at)?;
+    let branch_hash: Option<String> = transaction
+        .query_row(
+            "SELECT branch_hash
+             FROM agent_runs
+             WHERE project_id = ?1 AND native_session_id = ?2
+               AND run_id LIKE 'context_%'
+             ORDER BY started_at DESC, run_id
+             LIMIT 1",
+            params![row.project_id.as_str(), row.session_id.as_str()],
+            |record| record.get(0),
+        )
+        .optional()?
+        .flatten();
     let status = if row.finished {
         if row.succeeded == Some(true) {
             "succeeded"
@@ -1509,12 +1518,13 @@ fn apply_graph_run(transaction: &Transaction<'_>, row: &GraphRunRow) -> Result<(
         "INSERT OR IGNORE INTO agent_runs(
              run_id, project_id, provider, native_session_id, branch_hash,
              started_at, finished_at, status
-         ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             row.run_id,
             row.project_id.as_str(),
             row.provider.as_str(),
             row.session_id.as_str(),
+            branch_hash,
             observed_at,
             row.finished.then_some(observed_at.as_str()),
             status
@@ -1559,6 +1569,63 @@ fn apply_graph_run(transaction: &Transaction<'_>, row: &GraphRunRow) -> Result<(
             }
         }
     }
+    Ok(())
+}
+
+fn apply_graph_context(
+    transaction: &Transaction<'_>,
+    row: &GraphSessionContextRow,
+) -> Result<(), StoreError> {
+    let observed_at = format_timestamp(row.observed_at)?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO agent_runs(
+             run_id, project_id, provider, native_session_id, branch_hash,
+             started_at, finished_at, status
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'observed')",
+        params![
+            row.context_run_id,
+            row.project_id.as_str(),
+            row.provider.as_str(),
+            row.session_id.as_str(),
+            row.branch_hash,
+            observed_at
+        ],
+    )?;
+    let immutable_matches: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM agent_runs
+             WHERE run_id = ?1 AND project_id = ?2 AND provider = ?3
+               AND native_session_id = ?4 AND status = 'observed'
+         )",
+        params![
+            row.context_run_id,
+            row.project_id.as_str(),
+            row.provider.as_str(),
+            row.session_id.as_str()
+        ],
+        |record| record.get(0),
+    )?;
+    if !immutable_matches {
+        return Err(StoreError::ImmutableConflict);
+    }
+    transaction.execute(
+        "UPDATE agent_runs
+         SET branch_hash = ?1, started_at = ?2
+         WHERE run_id = ?3",
+        params![row.branch_hash, observed_at, row.context_run_id],
+    )?;
+    transaction.execute(
+        "UPDATE agent_runs
+         SET branch_hash = ?1
+         WHERE project_id = ?2 AND native_session_id = ?3
+           AND run_id <> ?4",
+        params![
+            row.branch_hash,
+            row.project_id.as_str(),
+            row.session_id.as_str(),
+            row.context_run_id
+        ],
+    )?;
     Ok(())
 }
 
@@ -2802,9 +2869,11 @@ fn graph_semantic_bytes(batch: &GraphWriteBatch) -> Result<usize, StoreError> {
         add_len(&mut total, 3)?;
     }
     for row in &batch.contexts {
+        add_len(&mut total, row.context_run_id.len())?;
         add_len(&mut total, row.project_id.as_str().len())?;
         add_len(&mut total, row.session_id.as_str().len())?;
         add_len(&mut total, row.evidence_event_id.as_str().len())?;
+        add_len(&mut total, format_timestamp(row.observed_at)?.len())?;
         if let Some(branch_hash) = &row.branch_hash {
             add_len(&mut total, branch_hash.len())?;
         }

@@ -16,7 +16,8 @@ pub use evidence::{EvidenceContext, EvidenceError, EvidenceOwnerRef, EvidenceVau
 #[cfg(feature = "test-support")]
 pub use read::GraphCounts;
 pub use read::{
-    MAX_EVENT_PAGE_BYTES, MAX_EVENT_PAGE_ROWS, READ_POOL_SIZE, ReadPool, ReadStore, StoredEvent,
+    MAX_EVENT_PAGE_BYTES, MAX_EVENT_PAGE_ROWS, READ_POOL_SIZE, ReadPool, ReadStore,
+    ReducerWatermark, StoredEvent,
 };
 pub use writer::{
     CommitReceipt, CommitSubmission, ContentRefWrite, CursorState, EvidenceLink, EvidenceOwner,

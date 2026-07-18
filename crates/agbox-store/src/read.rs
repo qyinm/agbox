@@ -26,6 +26,12 @@ pub struct StoredEvent {
     pub event: ActivityEventV1,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReducerWatermark {
+    pub through_event_seq: u64,
+    pub through_event_id: Option<EventId>,
+}
+
 #[cfg(feature = "test-support")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GraphCounts {
@@ -258,6 +264,57 @@ impl ReadStore {
             .await
     }
 
+    /// Returns the durable local watermark for one named reducer.
+    ///
+    /// A reducer with no committed graph batch starts at sequence zero with no
+    /// event ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, read-pool, database, or stored-ID error.
+    pub async fn reducer_watermark(
+        &self,
+        reducer_name: impl Into<String>,
+    ) -> Result<ReducerWatermark, StoreError> {
+        let reducer_name = reducer_name.into();
+        if reducer_name.is_empty()
+            || reducer_name.len() > 128
+            || !reducer_name.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(StoreError::InvalidBatch);
+        }
+        self.pool
+            .execute(move |connection| {
+                let row: Option<(i64, String)> = connection
+                    .query_row(
+                        "SELECT through_event_seq, through_event_id
+                         FROM reducer_watermarks
+                         WHERE reducer_name = ?1",
+                        [reducer_name],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                row.map_or_else(
+                    || {
+                        Ok(ReducerWatermark {
+                            through_event_seq: 0,
+                            through_event_id: None,
+                        })
+                    },
+                    |(sequence, event_id)| {
+                        Ok(ReducerWatermark {
+                            through_event_seq: u64::try_from(sequence)
+                                .map_err(|_| StoreError::InvalidBatch)?,
+                            through_event_id: Some(
+                                EventId::parse_wire(&event_id).ok_or(StoreError::InvalidBatch)?,
+                            ),
+                        })
+                    },
+                )
+            })
+            .await
+    }
+
     /// Returns the number of quarantined records for one source generation.
     ///
     /// # Errors
@@ -366,6 +423,31 @@ impl ReadStore {
             })
             .await
     }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn agent_run_branch_for_test(
+        &self,
+        run_id: impl Into<String>,
+    ) -> Result<Option<String>, StoreError> {
+        let run_id = run_id.into();
+        if run_id.is_empty() || run_id.len() > 128 {
+            return Err(StoreError::InvalidBatch);
+        }
+        self.pool
+            .execute(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT branch_hash FROM agent_runs WHERE run_id = ?1",
+                        [run_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(StoreError::from)
+                    .map(Option::flatten)
+            })
+            .await
+    }
 }
 
 fn decode_event_row(row: &rusqlite::Row<'_>) -> Result<ActivityEventV1, StoreError> {
@@ -458,7 +540,13 @@ mod tests {
         time::Duration,
     };
 
-    use super::{Checkout, READ_POOL_SIZE, ReadPool};
+    use agbox_core::{
+        ActivityEventV1, EventId, SemanticKey, SourceIdentity, SourceRef, SourceRefDraft,
+    };
+    use rusqlite::params;
+    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+    use super::{Checkout, MAX_EVENT_PAGE_BYTES, READ_POOL_SIZE, ReadPool, ReadStore};
 
     #[test]
     fn checkout_returns_connection_after_worker_panic() {
@@ -558,5 +646,114 @@ mod tests {
         assert!(matches!(error, crate::StoreError::Sqlite(_)));
         assert_eq!(pool.inner.connections.lock().unwrap().len(), READ_POOL_SIZE);
         assert_eq!(pool.inner.available.available_permits(), READ_POOL_SIZE);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn four_mib_event_page_stops_before_overflow_and_continues() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let database = directory.path().join("state.db");
+        let store = crate::Store::open_new(&database).unwrap();
+        store
+            .writer
+            .execute(
+                "INSERT INTO projects(
+                     project_id, repository_identity, encrypted_root_path,
+                     created_at, updated_at
+                 ) VALUES (
+                     'project_fixture', 'repo-fs-v1:1:1', X'00',
+                     '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'
+                 )",
+                [],
+            )
+            .unwrap();
+        let large_metadata = "f".repeat(agbox_core::limits::MAX_INLINE_BYTES);
+        for ordinal in 1_u32..=12 {
+            let mut draft = ActivityEventV1::fixture_message_draft();
+            let identity = SourceIdentity {
+                provider: draft.source.provider(),
+                source_id: "src_fixture".into(),
+                generation: 1,
+                byte_offset: u64::from(ordinal),
+                record_hash: format!("b3:large-{ordinal}"),
+            };
+            draft.event_id = EventId::from_source(&identity, ordinal);
+            draft.semantic_key = SemanticKey::from_native(
+                draft.source.provider(),
+                draft.source.native_session_id(),
+                "four-mib-page",
+                &ordinal.to_string(),
+            );
+            draft.source = SourceRef::new(SourceRefDraft {
+                provider: draft.source.provider(),
+                format: large_metadata.clone(),
+                native_session_id: large_metadata.clone(),
+                native_record_type: large_metadata.clone(),
+                native_record_id: Some(large_metadata.clone()),
+                source_generation: 1,
+                byte_offset: u64::from(ordinal),
+                ordinal: Some(u64::from(ordinal)),
+                record_hash: large_metadata.clone(),
+                decoder_version: large_metadata.clone(),
+            })
+            .unwrap();
+            draft.occurred_at = OffsetDateTime::UNIX_EPOCH;
+            draft.observed_at = OffsetDateTime::UNIX_EPOCH;
+            let event = ActivityEventV1::new(draft).unwrap();
+            store
+                .writer
+                .execute(
+                    "INSERT INTO activity_events(
+                         event_id, semantic_key, schema_version, occurred_at,
+                         observed_at, project_id, session_id, turn_id, actor,
+                         correlation_id, causation_id, source_json, payload_json,
+                         privacy
+                     ) VALUES (
+                         ?1, ?2, 1, ?3, ?3, ?4, ?5, ?6, 'agent',
+                         NULL, NULL, ?7, ?8, 'derived_local'
+                     )",
+                    params![
+                        event.event_id().as_str(),
+                        event.semantic_key().as_str(),
+                        event.occurred_at().format(&Rfc3339).unwrap(),
+                        event.project_id().as_str(),
+                        event.session_id().as_str(),
+                        event.turn_id(),
+                        serde_json::to_string(event.source()).unwrap(),
+                        serde_json::to_string(event.payload()).unwrap(),
+                    ],
+                )
+                .unwrap();
+        }
+        let read = ReadStore::new(ReadPool::open(&database, READ_POOL_SIZE).unwrap());
+
+        let first = read
+            .events_after(0, usize::MAX, MAX_EVENT_PAGE_BYTES)
+            .await
+            .unwrap();
+        assert!(!first.is_empty());
+        assert!(first.len() < 12);
+        let first_bytes = first
+            .iter()
+            .map(|row| serde_json::to_vec(&row.event).unwrap().len() + size_of::<u64>())
+            .sum::<usize>();
+        assert!(first_bytes <= MAX_EVENT_PAGE_BYTES);
+        let second = read
+            .events_after(
+                first.last().unwrap().event_seq,
+                usize::MAX,
+                MAX_EVENT_PAGE_BYTES,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.len() + second.len(), 12);
+        assert!(second[0].event_seq > first.last().unwrap().event_seq);
     }
 }

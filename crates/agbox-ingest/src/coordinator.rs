@@ -23,7 +23,9 @@ use agbox_store::{
     IngestionChunk, IngestionFault, MAX_BATCH_BYTES, MAX_BATCH_RECORDS, ReadStore,
     SchemaFingerprintUpdate, StoreError, WriterHandle, stable_content_ref_id,
 };
-use agbox_workgraph::{CommittedEvent, GraphMutation, ReducedFact};
+use agbox_workgraph::{
+    CommittedEvent, DeterministicReducer, GraphMutation, ReduceError, ReducedFact,
+};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Notify;
 
@@ -31,6 +33,9 @@ use crate::{
     DECODER_WORKERS, KeyedQueue, QueueError, QueueItem, RecordScanner, ScanOutcome, SourceKey,
     VerifiedOpenError, VerifiedSourceOpener, WatcherError, WatcherRuntime, WorkPriority,
 };
+
+pub const GRAPH_REDUCER_NAME: &str = "deterministic-facts-v1";
+const GRAPH_REDUCER_CONFLICT_RETRIES: usize = 3;
 
 /// Immutable source facts needed to decode one registered generation.
 #[derive(Clone)]
@@ -93,6 +98,8 @@ pub enum IngestError {
     InjectedRetry(RetryClass),
     #[error("graph mutation is invalid")]
     InvalidGraphMutation,
+    #[error("graph reduction failed")]
+    Reduce(#[from] ReduceError),
 }
 
 impl fmt::Debug for IngestError {
@@ -111,6 +118,7 @@ impl fmt::Debug for IngestError {
             Self::WatcherStopped => "WatcherStopped",
             Self::InjectedRetry(_) => "InjectedRetry",
             Self::InvalidGraphMutation => "InvalidGraphMutation",
+            Self::Reduce(_) => "Reduce",
         })
     }
 }
@@ -133,7 +141,7 @@ pub fn graph_write_batch(mutation: GraphMutation) -> Result<GraphWriteBatch, Ing
         .through_event_id
         .ok_or(IngestError::InvalidGraphMutation)?;
     let mut batch = GraphWriteBatch {
-        reducer_name: "deterministic-facts-v1".to_owned(),
+        reducer_name: GRAPH_REDUCER_NAME.to_owned(),
         expected_event_seq: mutation.expected_event_seq,
         next_event_seq,
         next_event_id,
@@ -199,12 +207,20 @@ pub fn graph_write_batch(mutation: GraphMutation) -> Result<GraphWriteBatch, Ing
             ReducedFact::SessionContext {
                 project_id,
                 session_id,
+                provider,
                 branch_hash,
+                observed_at,
                 evidence,
             } => batch.contexts.push(GraphSessionContextRow {
+                context_run_id: stable_graph_id(
+                    "context",
+                    &[project_id.as_str(), session_id.as_str()],
+                ),
                 project_id,
                 session_id,
+                provider,
                 branch_hash,
+                observed_at,
                 evidence_event_id: evidence,
             }),
             ReducedFact::Artifact {
@@ -321,6 +337,16 @@ fn stable_graph_id(prefix: &str, parts: &[&str]) -> String {
         hasher.update(part.as_bytes());
     }
     format!("{prefix}_{}", &hasher.finalize().to_hex()[..24])
+}
+
+/// Outcome of one bounded production graph-reducer page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraphPageReport {
+    pub through_event_seq: u64,
+    pub scanned_events: usize,
+    pub reduced_facts: usize,
+    pub applied: bool,
+    pub replayed: bool,
 }
 
 impl From<VerifiedOpenError> for IngestError {
@@ -535,6 +561,58 @@ impl IngestionCoordinator {
             retry_policy,
             clock,
         }
+    }
+
+    /// Reduces and atomically applies the next durable activity-event page.
+    ///
+    /// This is deliberately separate from source cursor commits: a graph
+    /// failure cannot strand an ingestion cursor. The durable reducer
+    /// watermark makes restart safe, and bounded conflict retries converge
+    /// concurrent callers on the current local watermark.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded read, reduction, translation, writer, or watermark
+    /// error. No graph rows or watermark are partially committed.
+    pub async fn reduce_next_graph_page(&self) -> Result<GraphPageReport, IngestError> {
+        for attempt in 0..GRAPH_REDUCER_CONFLICT_RETRIES {
+            let watermark = self.read.reducer_watermark(GRAPH_REDUCER_NAME).await?;
+            let events = reducer_events_after(
+                &self.read,
+                watermark.through_event_seq,
+                agbox_store::MAX_EVENT_PAGE_ROWS,
+                agbox_store::MAX_EVENT_PAGE_BYTES,
+            )
+            .await?;
+            if events.is_empty() {
+                return Ok(GraphPageReport {
+                    through_event_seq: watermark.through_event_seq,
+                    scanned_events: 0,
+                    reduced_facts: 0,
+                    applied: false,
+                    replayed: false,
+                });
+            }
+            let scanned_events = events.len();
+            let mutation = DeterministicReducer.reduce(&events)?;
+            let reduced_facts = mutation.facts.len();
+            let batch = graph_write_batch(mutation)?;
+            match self.writer.apply_graph(batch).await {
+                Ok(receipt) => {
+                    return Ok(GraphPageReport {
+                        through_event_seq: receipt.through_event_seq,
+                        scanned_events,
+                        reduced_facts,
+                        applied: true,
+                        replayed: receipt.replayed,
+                    });
+                }
+                Err(StoreError::ReducerWatermarkConflict)
+                    if attempt + 1 < GRAPH_REDUCER_CONFLICT_RETRIES => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(IngestError::Store(StoreError::ReducerWatermarkConflict))
     }
 
     /// Registers immutable decode facts for an already store-registered source.
