@@ -7,6 +7,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use agbox_core::Provider;
@@ -328,6 +329,66 @@ async fn two_spool_instances_drain_each_entry_only_after_one_commit() {
     assert_eq!(drained, 8);
     assert_eq!(commits.load(Ordering::Relaxed), 8);
     assert!(first.entry_paths().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn same_spool_enqueue_waits_for_the_drain_commit_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let spool = Arc::new(spool(&directory, HookSpoolLimits::default()));
+    spool.enqueue(&fixture(1)).unwrap();
+
+    let (commit_started_tx, commit_started_rx) = tokio::sync::oneshot::channel();
+    let (release_commit_tx, release_commit_rx) = tokio::sync::oneshot::channel();
+    let draining = {
+        let spool = Arc::clone(&spool);
+        tokio::spawn(async move {
+            let mut commit_started_tx = Some(commit_started_tx);
+            let mut release_commit_rx = Some(release_commit_rx);
+            spool
+                .drain(move |_| {
+                    let commit_started_tx = commit_started_tx.take().unwrap();
+                    let release_commit_rx = release_commit_rx.take().unwrap();
+                    async move {
+                        commit_started_tx.send(()).unwrap();
+                        release_commit_rx.await.unwrap();
+                        Ok::<(), ()>(())
+                    }
+                })
+                .await
+        })
+    };
+    commit_started_rx.await.unwrap();
+
+    let enqueueing = {
+        let spool = Arc::clone(&spool);
+        tokio::task::spawn_blocking(move || spool.enqueue(&fixture(2)))
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !enqueueing.is_finished(),
+        "enqueue acquired the drain's open-file-description lock"
+    );
+
+    release_commit_tx.send(()).unwrap();
+    assert_eq!(draining.await.unwrap().unwrap(), 1);
+    enqueueing.await.unwrap().unwrap();
+    assert_eq!(spool.entry_paths().unwrap().len(), 1);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let committed = Arc::clone(&observed);
+    assert_eq!(
+        spool
+            .drain(move |signal| {
+                let committed = Arc::clone(&committed);
+                async move {
+                    committed.lock().unwrap().push(signal.target_size());
+                    Ok::<(), ()>(())
+                }
+            })
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(*observed.lock().unwrap(), vec![2]);
 }
 
 #[tokio::test]

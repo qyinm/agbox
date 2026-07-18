@@ -328,7 +328,6 @@ impl fmt::Debug for SpoolError {
 pub struct HookSpool {
     directory_path: PathBuf,
     directory: File,
-    lock_file: File,
     key: Zeroizing<[u8; 32]>,
     limits: HookSpoolLimits,
     sequence: AtomicU64,
@@ -371,12 +370,10 @@ impl HookSpool {
     ) -> Result<Self, SpoolError> {
         validate_limits(limits)?;
         let (directory_path, directory) = prepare_directory(directory.as_ref())?;
-        let lock_file = open_lock_file(&directory)?;
         let key = keys.master_key()?;
         let spool = Self {
             directory_path,
             directory,
-            lock_file,
             key,
             limits,
             sequence: AtomicU64::new(0),
@@ -625,15 +622,17 @@ impl HookSpool {
     }
 
     fn lock_sync(&self) -> Result<OwnedSpoolLock, SpoolError> {
-        let lock = self.lock_file.try_clone()?;
-        OwnedSpoolLock::acquire(lock)
+        OwnedSpoolLock::acquire(open_lock_file(&self.directory)?)
     }
 
     async fn lock_async(&self) -> Result<OwnedSpoolLock, SpoolError> {
-        let lock = self.lock_file.try_clone()?;
-        tokio::task::spawn_blocking(move || OwnedSpoolLock::acquire(lock))
-            .await
-            .map_err(|_| SpoolError::InvalidEntry)?
+        let directory = self.directory.try_clone()?;
+        tokio::task::spawn_blocking(move || {
+            let lock = open_lock_file(&directory)?;
+            OwnedSpoolLock::acquire(lock)
+        })
+        .await
+        .map_err(|_| SpoolError::InvalidEntry)?
     }
 }
 
