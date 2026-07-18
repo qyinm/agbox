@@ -286,7 +286,17 @@ pub fn graph_write_batch(mutation: GraphMutation) -> Result<GraphWriteBatch, Ing
                 finish_event_id: evidence,
                 observed_at,
             }),
-            ReducedFact::Verification {
+            ReducedFact::EligibleVerificationObserved {
+                project_id,
+                session_id,
+                native_action_id,
+                succeeded,
+                basis,
+                observed_at,
+                evidence,
+                ..
+            }
+            | ReducedFact::Verification {
                 project_id,
                 session_id,
                 native_action_id,

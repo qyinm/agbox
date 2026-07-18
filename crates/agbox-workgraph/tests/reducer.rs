@@ -132,7 +132,7 @@ fn reducer_observes_artifacts_and_structured_verification_without_agent_claims()
 }
 
 #[test]
-fn unmatched_finish_is_observed_but_not_promoted_to_verification() {
+fn authority_eligible_unmatched_finish_preserves_cross_page_join_eligibility() {
     let events = committed(vec![event(
         1,
         Actor::Tool,
@@ -146,7 +146,10 @@ fn unmatched_finish_is_observed_but_not_promoted_to_verification() {
     let mutation = DeterministicReducer.reduce(&events).unwrap();
     assert!(matches!(
         mutation.facts.as_slice(),
-        [ReducedFact::ActionFinishedObserved { .. }]
+        [ReducedFact::EligibleVerificationObserved {
+            basis: "structured_tool_result",
+            ..
+        }]
     ));
 }
 

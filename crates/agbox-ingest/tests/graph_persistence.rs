@@ -289,17 +289,17 @@ async fn production_graph_page_boundary_resumes_after_restart_and_drains_multipl
         r#"{"ordinal":0,"type":"session_meta","payload":{"id":"codex-page","cwd":"/fixture/project","history_mode":"paginated"}}"#
             .to_owned(),
     ];
-    records.extend((1..=1_000).map(|ordinal| {
+    records.extend((1..=998).map(|ordinal| {
         format!(
             r#"{{"ordinal":{ordinal},"type":"event_msg","payload":{{"type":"user_message","message":"message-{ordinal}"}}}}"#
         )
     }));
     records.push(
-        r#"{"ordinal":1001,"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call-page"}}"#
+        r#"{"ordinal":999,"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call-page"}}"#
             .to_owned(),
     );
     records.push(
-        r#"{"ordinal":1002,"type":"event_msg","payload":{"type":"item_completed","item":{"type":"command_execution","call_id":"call-page","status":"completed","output":"done"}}}"#
+        r#"{"ordinal":1000,"type":"event_msg","payload":{"type":"item_completed","item":{"type":"command_execution","call_id":"call-page","status":"completed","output":"done"}}}"#
             .to_owned(),
     );
     let fixture = FixtureRuntime::records(records).await;
@@ -315,6 +315,9 @@ async fn production_graph_page_boundary_resumes_after_restart_and_drains_multipl
     let first = first_runtime.reduce_next_graph_page().await.unwrap();
     assert!(first.applied);
     assert_eq!(first.scanned_events, MAX_EVENT_PAGE_ROWS);
+    let first_counts = fixture.read_store().graph_counts_for_test().await.unwrap();
+    assert_eq!(first_counts.actions, 1);
+    assert_eq!(first_counts.verifications, 0);
     drop(first_runtime);
 
     let restarted_runtime = agbox_ingest::IngestionCoordinator::new(

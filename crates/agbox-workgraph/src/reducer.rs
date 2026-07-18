@@ -69,6 +69,15 @@ pub enum ReducedFact {
         observed_at: OffsetDateTime,
         evidence: EventId,
     },
+    EligibleVerificationObserved {
+        project_id: ProjectId,
+        session_id: SessionId,
+        native_action_id: String,
+        succeeded: bool,
+        basis: &'static str,
+        observed_at: OffsetDateTime,
+        evidence: EventId,
+    },
     Verification {
         project_id: ProjectId,
         session_id: SessionId,
@@ -118,6 +127,7 @@ impl ReducedFact {
             Self::Artifact { .. } => "artifact",
             Self::ActionRequested { .. } => "action_requested",
             Self::ActionFinishedObserved { .. } => "action_finished_observed",
+            Self::EligibleVerificationObserved { .. } => "eligible_verification_observed",
             Self::Verification { .. } => "verification",
             Self::HumanObjective { .. } => "human_objective",
             Self::HumanConstraint { .. } => "human_constraint",
@@ -133,6 +143,7 @@ impl ReducedFact {
             | Self::Artifact { evidence, .. }
             | Self::ActionRequested { evidence, .. }
             | Self::ActionFinishedObserved { evidence, .. }
+            | Self::EligibleVerificationObserved { evidence, .. }
             | Self::Verification { evidence, .. }
             | Self::HumanObjective { evidence, .. }
             | Self::HumanConstraint { evidence, .. }
@@ -258,17 +269,31 @@ impl DeterministicReducer {
                         && output.as_ref().is_none_or(|content| {
                             content.disclosure_class() == DisclosureClass::ToolResult
                         });
-                    if authorized_result && let Some(command) = requests.get(&key) {
-                        mutation.facts.push(ReducedFact::Verification {
-                            project_id,
-                            session_id,
-                            native_action_id: native_action_id.clone(),
-                            command: command.clone(),
-                            succeeded: succeeded(*outcome),
-                            basis: "structured_tool_result",
-                            observed_at,
-                            evidence,
-                        });
+                    if authorized_result {
+                        if let Some(command) = requests.get(&key) {
+                            mutation.facts.push(ReducedFact::Verification {
+                                project_id,
+                                session_id,
+                                native_action_id: native_action_id.clone(),
+                                command: command.clone(),
+                                succeeded: succeeded(*outcome),
+                                basis: "structured_tool_result",
+                                observed_at,
+                                evidence,
+                            });
+                        } else {
+                            mutation
+                                .facts
+                                .push(ReducedFact::EligibleVerificationObserved {
+                                    project_id,
+                                    session_id,
+                                    native_action_id: native_action_id.clone(),
+                                    succeeded: succeeded(*outcome),
+                                    basis: "structured_tool_result",
+                                    observed_at,
+                                    evidence,
+                                });
+                        }
                     } else {
                         mutation.facts.push(ReducedFact::ActionFinishedObserved {
                             project_id,
