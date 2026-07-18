@@ -3620,6 +3620,15 @@ and quarantine treatment so later work remains schedulable. A v1 database with
 more than one generation for a source is rejected atomically rather than
 inventing unknown historical file identities.
 
+**Second adversarial review amendment:** retain a bounded stack of live
+directory streams for uninterrupted DFS, so a parent is never reopened merely
+to enter and return from its child. Serialized cursors delta-encode component
+prefixes across the DFS stack, keeping their encoding linear in depth; count
+replay is solely restoration behavior. Each descriptor validation reopens the
+recorded component name from its retained parent and compares identities, in
+addition to checking `..` reachability. Identity-only opens are test-support
+only; production opens require the complete discovered snapshot.
+
 - [ ] **Step 4: Implement verified open and generation reconciliation**
 
 On Unix, walk from an already-open canonical root directory and open each component with safe `rustix::fs::openat`; use `OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW` for the file, then compare `st_dev` and `st_ino` with the discovered identity. Reject any symlink component, identity change, or root escape. Do not add direct `libc` calls or relax workspace `unsafe_code = "forbid"`.

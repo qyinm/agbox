@@ -76,10 +76,20 @@ impl ProjectResolver {
         if !metadata.is_dir() {
             return Err(ProjectError::Unavailable);
         }
+        let supplied = rustix::fs::open(
+            &supplied_root,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|_| ProjectError::Unavailable)?;
         let canonical_root = supplied_root
             .canonicalize()
             .map_err(|_| ProjectError::Unavailable)?;
         let root = open_absolute_directory(&canonical_root)?;
+        if !same_identity(&supplied, &root)? {
+            return Err(ProjectError::Unavailable);
+        }
         let stat = rustix::fs::fstat(&root).map_err(|_| ProjectError::Unavailable)?;
         if !FileType::from_raw_mode(stat.st_mode).is_dir() {
             return Err(ProjectError::Unavailable);
@@ -284,6 +294,7 @@ impl ProjectResolver {
         if !FileType::from_raw_mode(target_stat.st_mode).is_dir() {
             return Err(ProjectError::NotRepository);
         }
+        self.verify_repository_return(&target_components, &target)?;
         Ok(MarkerResult::Valid)
     }
 

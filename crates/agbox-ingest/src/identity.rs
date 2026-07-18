@@ -255,6 +255,7 @@ impl VerifiedSourceOpener {
     /// # Errors
     ///
     /// Returns a path-independent identity error for malformed or changed input.
+    #[cfg(feature = "test-support")]
     pub fn open_relative(
         &self,
         relative: &Path,
@@ -286,6 +287,7 @@ impl VerifiedSourceOpener {
                 .try_clone()
                 .map_err(|_| VerifiedOpenError::IdentityChanged)?,
         ];
+        let mut names = Vec::new();
         for component in &components[..components.len() - 1] {
             let Component::Normal(name) = component else {
                 return Err(VerifiedOpenError::IdentityChanged);
@@ -298,13 +300,14 @@ impl VerifiedSourceOpener {
             )
             .map(File::from)
             .map_err(|_| VerifiedOpenError::IdentityChanged)?;
+            names.push(name.to_os_string());
             chain.push(
                 directory
                     .try_clone()
                     .map_err(|_| VerifiedOpenError::IdentityChanged)?,
             );
         }
-        self.verify_chain(&chain)?;
+        self.verify_chain(&chain, &names)?;
         let Component::Normal(file_name) = components[components.len() - 1] else {
             return Err(VerifiedOpenError::IdentityChanged);
         };
@@ -316,7 +319,7 @@ impl VerifiedSourceOpener {
         )
         .map(File::from)
         .map_err(|_| VerifiedOpenError::IdentityChanged)?;
-        self.verify_chain(&chain)?;
+        self.verify_chain(&chain, &names)?;
         let stat = rustix::fs::fstat(&file).map_err(|_| VerifiedOpenError::IdentityChanged)?;
         let device = u64::try_from(stat.st_dev).map_err(|_| VerifiedOpenError::IdentityChanged)?;
         let inode = stat.st_ino;
@@ -337,12 +340,16 @@ impl VerifiedSourceOpener {
         Ok(file)
     }
 
-    fn verify_chain(&self, chain: &[File]) -> Result<(), VerifiedOpenError> {
+    fn verify_chain(
+        &self,
+        chain: &[File],
+        names: &[std::ffi::OsString],
+    ) -> Result<(), VerifiedOpenError> {
         let rebound_root = open_absolute_directory(&self.canonical_root)?;
         if !same_identity(&self.root, &rebound_root)? || !same_identity(&chain[0], &self.root)? {
             return Err(VerifiedOpenError::IdentityChanged);
         }
-        for pair in chain.windows(2) {
+        for (index, pair) in chain.windows(2).enumerate() {
             let parent = &pair[0];
             let child = &pair[1];
             let observed_parent = rustix::fs::openat(
@@ -354,6 +361,17 @@ impl VerifiedSourceOpener {
             .map(File::from)
             .map_err(|_| VerifiedOpenError::IdentityChanged)?;
             if !same_identity(parent, &observed_parent)? {
+                return Err(VerifiedOpenError::IdentityChanged);
+            }
+            let rebound_child = rustix::fs::openat(
+                parent,
+                &names[index],
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|_| VerifiedOpenError::IdentityChanged)?;
+            if !same_identity(child, &rebound_child)? {
                 return Err(VerifiedOpenError::IdentityChanged);
             }
         }

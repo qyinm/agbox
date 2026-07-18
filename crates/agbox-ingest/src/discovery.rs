@@ -20,11 +20,119 @@ pub const MAX_DISCOVERY_CURSOR_BYTES: usize = 32 * 1024;
 const MAX_DISCOVERY_FAULTS: usize = 32;
 const MAX_DIRECTORY_RETRIES: u8 = 3;
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone)]
 pub struct DiscoveryCursor {
     root_device: u64,
     root_inode: u64,
     pending_directories: VecDeque<DirectoryCursor>,
+}
+
+impl Serialize for DiscoveryCursor {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            root_device: u64,
+            root_inode: u64,
+            pending_directories: Vec<WireDirectory<'a>>,
+        }
+        #[derive(Serialize)]
+        struct WireDirectory<'a> {
+            up: usize,
+            suffix: &'a [Vec<u8>],
+            entries_consumed: u64,
+            device: u64,
+            inode: u64,
+            mtime_seconds: i64,
+            mtime_nanoseconds: i64,
+            ctime_seconds: i64,
+            ctime_nanoseconds: i64,
+            retry_attempts: u8,
+        }
+        let mut previous: &[Vec<u8>] = &[];
+        let mut directories = Vec::with_capacity(self.pending_directories.len());
+        for directory in &self.pending_directories {
+            let common = previous
+                .iter()
+                .zip(&directory.components)
+                .take_while(|(a, b)| a == b)
+                .count();
+            directories.push(WireDirectory {
+                up: previous.len() - common,
+                suffix: &directory.components[common..],
+                entries_consumed: directory.entries_consumed,
+                device: directory.device,
+                inode: directory.inode,
+                mtime_seconds: directory.mtime_seconds,
+                mtime_nanoseconds: directory.mtime_nanoseconds,
+                ctime_seconds: directory.ctime_seconds,
+                ctime_nanoseconds: directory.ctime_nanoseconds,
+                retry_attempts: directory.retry_attempts,
+            });
+            previous = &directory.components;
+        }
+        Wire {
+            root_device: self.root_device,
+            root_inode: self.root_inode,
+            pending_directories: directories,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DiscoveryCursor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            root_device: u64,
+            root_inode: u64,
+            pending_directories: Vec<WireDirectory>,
+        }
+        #[derive(Deserialize)]
+        struct WireDirectory {
+            up: usize,
+            suffix: Vec<Vec<u8>>,
+            entries_consumed: u64,
+            device: u64,
+            inode: u64,
+            mtime_seconds: i64,
+            mtime_nanoseconds: i64,
+            ctime_seconds: i64,
+            ctime_nanoseconds: i64,
+            retry_attempts: u8,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let mut previous = Vec::new();
+        let mut pending_directories = VecDeque::new();
+        for directory in wire.pending_directories {
+            if directory.up > previous.len() {
+                return Err(serde::de::Error::custom("invalid discovery cursor delta"));
+            }
+            previous.truncate(previous.len() - directory.up);
+            previous.extend(directory.suffix);
+            pending_directories.push_back(DirectoryCursor {
+                components: previous.clone(),
+                entries_consumed: directory.entries_consumed,
+                device: directory.device,
+                inode: directory.inode,
+                mtime_seconds: directory.mtime_seconds,
+                mtime_nanoseconds: directory.mtime_nanoseconds,
+                ctime_seconds: directory.ctime_seconds,
+                ctime_nanoseconds: directory.ctime_nanoseconds,
+                retry_attempts: directory.retry_attempts,
+            });
+        }
+        Ok(Self {
+            root_device: wire.root_device,
+            root_inode: wire.root_inode,
+            pending_directories,
+        })
+    }
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -86,7 +194,7 @@ pub struct DiscoveryWalker {
     spec: RootSpec,
     root: File,
     cursor: DiscoveryCursor,
-    active: Option<ActiveDirectory>,
+    active: Vec<ActiveDirectory>,
 }
 
 impl fmt::Debug for DiscoveryWalker {
@@ -182,7 +290,7 @@ impl DiscoveryWalker {
             spec,
             root,
             cursor,
-            active: None,
+            active: Vec::new(),
         })
     }
 
@@ -233,7 +341,7 @@ impl DiscoveryWalker {
             operations += 1;
             if self
                 .active
-                .as_ref()
+                .last()
                 .is_none_or(|active| active.cursor != directory_cursor)
             {
                 let directory = match self.open_directory(&directory_cursor) {
@@ -241,7 +349,7 @@ impl DiscoveryWalker {
                     Err(OpenDirectoryError::Unavailable) => {
                         bounded_fault(&mut faults, DiscoveryFaultClass::DirectoryUnavailable);
                         retry_or_quarantine(&mut self.cursor, &mut directory_cursor);
-                        self.active = None;
+                        self.active.clear();
                         continue;
                     }
                     Err(OpenDirectoryError::InvalidCursor) => {
@@ -251,10 +359,10 @@ impl DiscoveryWalker {
                 let Ok(iterator) = Dir::read_from(&directory) else {
                     bounded_fault(&mut faults, DiscoveryFaultClass::DirectoryUnavailable);
                     retry_or_quarantine(&mut self.cursor, &mut directory_cursor);
-                    self.active = None;
+                    self.active.clear();
                     continue;
                 };
-                self.active = Some(ActiveDirectory {
+                self.active.push(ActiveDirectory {
                     recovery_remaining: directory_cursor.entries_consumed,
                     cursor: directory_cursor.clone(),
                     directory,
@@ -263,7 +371,7 @@ impl DiscoveryWalker {
             }
             let mut page_start = directory_cursor.clone();
             let page = {
-                let Some(active) = self.active.as_mut() else {
+                let Some(active) = self.active.last_mut() else {
                     bounded_fault(&mut faults, DiscoveryFaultClass::DirectoryUnavailable);
                     break;
                 };
@@ -271,12 +379,12 @@ impl DiscoveryWalker {
             };
             visited_entries = visited_entries.saturating_add(page.reads);
             if page.invalid_cursor {
-                self.active = None;
+                self.active.clear();
                 return Err(DiscoveryError::InvalidCursor);
             }
             if page.fault {
                 retry_or_quarantine(&mut self.cursor, &mut page_start);
-                self.active = None;
+                self.active.clear();
                 continue;
             }
 
@@ -284,7 +392,7 @@ impl DiscoveryWalker {
             if !page.eof {
                 let active_cursor = self
                     .active
-                    .as_ref()
+                    .last()
                     .map_or_else(|| directory_cursor.clone(), |active| active.cursor.clone());
                 next_cursor.pending_directories.push_front(active_cursor);
             }
@@ -356,13 +464,13 @@ impl DiscoveryWalker {
                 rollback.pending_directories.push_front(page_start);
                 ensure_cursor_size(&rollback)?;
                 self.cursor = rollback;
-                self.active = None;
+                let _ = self.active.pop();
                 return Err(DiscoveryError::CursorCapacity);
             }
             self.cursor = next_cursor;
             sources.extend(page_sources);
             if page.eof {
-                self.active = None;
+                let _ = self.active.pop();
             }
             if page.fault {
                 break;
@@ -383,8 +491,12 @@ impl DiscoveryWalker {
             .root
             .try_clone()
             .map_err(|_| OpenDirectoryError::Unavailable)?;
+        let mut links = Vec::new();
         for component in &cursor.components {
             let name = OsStr::from_bytes(component);
+            let parent = directory
+                .try_clone()
+                .map_err(|_| OpenDirectoryError::Unavailable)?;
             directory = rustix::fs::openat(
                 &directory,
                 name,
@@ -393,6 +505,13 @@ impl DiscoveryWalker {
             )
             .map(File::from)
             .map_err(|_| OpenDirectoryError::Unavailable)?;
+            links.push((
+                parent,
+                component.clone(),
+                directory
+                    .try_clone()
+                    .map_err(|_| OpenDirectoryError::Unavailable)?,
+            ));
         }
         let stat = rustix::fs::fstat(&directory).map_err(|_| OpenDirectoryError::Unavailable)?;
         let (device, inode) =
@@ -407,8 +526,27 @@ impl DiscoveryWalker {
         {
             return Err(OpenDirectoryError::InvalidCursor);
         }
+        for (parent, name, expected) in links {
+            let rebound = rustix::fs::openat(
+                &parent,
+                OsStr::from_bytes(&name),
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|_| OpenDirectoryError::Unavailable)?;
+            if !same_file_identity(&expected, &rebound)? {
+                return Err(OpenDirectoryError::InvalidCursor);
+            }
+        }
         Ok(directory)
     }
+}
+
+fn same_file_identity(left: &File, right: &File) -> Result<bool, OpenDirectoryError> {
+    let left = rustix::fs::fstat(left).map_err(|_| OpenDirectoryError::Unavailable)?;
+    let right = rustix::fs::fstat(right).map_err(|_| OpenDirectoryError::Unavailable)?;
+    Ok(left.st_dev == right.st_dev && left.st_ino == right.st_ino)
 }
 
 /// Collapses overlapping-root sightings by provider and filesystem identity,
