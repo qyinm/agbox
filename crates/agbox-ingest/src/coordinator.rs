@@ -17,8 +17,8 @@ use agbox_adapters::{
     SourceAdapter,
 };
 use agbox_core::{
-    ContentRef, EventPayload, PrivacyLabel, ProjectId, Provider, SourceObservation, WorkId,
-    WorkStatus,
+    Authority, ContentRef, DisclosureClass, EventPayload, PrivacyLabel, ProjectId, Provider,
+    SourceObservation, WorkId, WorkStatus,
 };
 use agbox_store::{
     ContentRefWrite, CursorState, EvidenceLink, EvidenceOwner, EvidenceWrite,
@@ -29,10 +29,11 @@ use agbox_store::{
     WriterHandle, stable_content_ref_id,
 };
 use agbox_workgraph::{
-    CommittedEvent, ContractBuildError, CorrelationDecision, CorrelationInput, CorrelationOutcome,
-    Correlator, DeterministicReducer, ExtractionInput, GraphMutation, ProvisionalContract,
-    ProvisionalContractBuilder, ReduceError, ReducedFact, SemanticError, SemanticExtractor,
-    SemanticPolicy, WorkCandidate, filter_proposals, refine_provisional_contract_at,
+    AuthorityEvidence, CommittedEvent, ContractBuildError, CorrelationDecision, CorrelationInput,
+    CorrelationOutcome, Correlator, DeterministicReducer, ExtractionInput, GraphMutation,
+    ProvisionalContract, ProvisionalContractBuilder, ReduceError, ReducedFact, SemanticError,
+    SemanticExtractor, SemanticPolicy, WorkCandidate, filter_proposals,
+    refine_provisional_contract_at_with_policy,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Notify;
@@ -1018,7 +1019,7 @@ impl IngestionCoordinator {
     /// Returns [`IngestError::InvalidGraphMutation`] for mismatched project,
     /// work, policy, or watermark inputs, or a store error when the run cannot
     /// be recorded atomically.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn publish_semantic(
         &self,
         project_id: ProjectId,
@@ -1033,9 +1034,53 @@ impl IngestionCoordinator {
         if previous.project_id != project_id || previous.work_id != work_id {
             return Err(IngestError::InvalidGraphMutation);
         }
+        let stored_previous = self
+            .writer
+            .latest_work_contract(project_id.clone(), work_id.clone())
+            .await?
+            .map(|encoded| {
+                serde_json::from_str::<ProvisionalContract>(&encoded)
+                    .map_err(|_| IngestError::InvalidStoredContract)
+            })
+            .transpose()?
+            .ok_or(IngestError::InvalidGraphMutation)?;
+        if stored_previous != previous {
+            return Err(IngestError::InvalidGraphMutation);
+        }
+        input.validate_project(&project_id, &work_id)?;
         if !policy.project_matches(&project_id) {
             return Err(IngestError::InvalidGraphMutation);
         }
+        let evidence_ids = policy.evidence_ids();
+        let stored_evidence = self
+            .writer
+            .load_semantic_evidence(project_id.clone(), evidence_ids)
+            .await?;
+        if stored_evidence.len() != policy.evidence_count() {
+            return Err(IngestError::InvalidGraphMutation);
+        }
+        let authoritative_policy = SemanticPolicy::for_project(
+            project_id.clone(),
+            stored_evidence
+                .into_iter()
+                .map(|evidence| {
+                    let authority = Self::authority_for_disclosure(evidence.disclosure_class)
+                        .ok_or(IngestError::InvalidGraphMutation)?;
+                    if evidence.privacy == PrivacyLabel::RestrictedLocal {
+                        return Err(IngestError::InvalidGraphMutation);
+                    }
+                    let event_id = evidence.event_id.ok_or(IngestError::InvalidGraphMutation)?;
+                    Ok(AuthorityEvidence::from_store(
+                        evidence.project_id,
+                        evidence.evidence_id,
+                        Some(event_id),
+                        authority,
+                        evidence.disclosure_class,
+                        evidence.redacted_excerpt,
+                    ))
+                })
+                .collect::<Result<Vec<_>, IngestError>>()?,
+        );
         if input_event_watermark.is_empty() || input_event_watermark.len() > 128 {
             return Err(IngestError::InvalidGraphMutation);
         }
@@ -1049,13 +1094,14 @@ impl IngestionCoordinator {
         let result = extractor
             .extract(input)
             .await
-            .and_then(|proposals| filter_proposals(policy, proposals))
+            .and_then(|proposals| filter_proposals(&authoritative_policy, proposals))
             .and_then(|proposals| {
-                refine_provisional_contract_at(
+                refine_provisional_contract_at_with_policy(
                     &previous,
                     &proposals,
                     extractor_version.clone(),
                     observed_at,
+                    Some(&authoritative_policy),
                 )
             });
         match result {
@@ -1070,6 +1116,8 @@ impl IngestionCoordinator {
                         work_id,
                         extractor_version,
                         input_event_watermark,
+                        parent_revision: previous.revision,
+                        parent_material_content_hash: previous.material_content_hash.clone(),
                         status: "succeeded".into(),
                         bounded_error: None,
                         observed_at,
@@ -1092,6 +1140,8 @@ impl IngestionCoordinator {
                         work_id,
                         extractor_version,
                         input_event_watermark,
+                        parent_revision: previous.revision,
+                        parent_material_content_hash: previous.material_content_hash.clone(),
                         status: "failed".into(),
                         bounded_error: Some(bounded_error),
                         observed_at,
@@ -1104,6 +1154,19 @@ impl IngestionCoordinator {
                     failed: true,
                 })
             }
+        }
+    }
+
+    fn authority_for_disclosure(disclosure: DisclosureClass) -> Option<Authority> {
+        match disclosure {
+            DisclosureClass::HumanIntent => Some(Authority::HumanIntent),
+            DisclosureClass::AgentStatement => Some(Authority::AgentStatement),
+            DisclosureClass::ObservedState => Some(Authority::ObservedState),
+            DisclosureClass::ToolResult => Some(Authority::ToolResult),
+            DisclosureClass::DerivedText => Some(Authority::ModelInference),
+            DisclosureClass::Reasoning
+            | DisclosureClass::SystemInstruction
+            | DisclosureClass::DeveloperInstruction => None,
         }
     }
 

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use agbox_core::{Authority, DisclosureClass, EvidenceId, ProjectId};
+use agbox_core::{Authority, DisclosureClass, EventId, EvidenceId, ProjectId};
 
 use crate::semantic::{ProposedAssertion, ProposedAssertions, SemanticError};
 
@@ -14,6 +14,7 @@ use crate::semantic::{ProposedAssertion, ProposedAssertions, SemanticError};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorityEvidence {
     pub evidence_id: EvidenceId,
+    pub event_id: Option<EventId>,
     pub project_id: Option<ProjectId>,
     pub authority: Authority,
     pub disclosure_class: DisclosureClass,
@@ -30,6 +31,7 @@ impl AuthorityEvidence {
     ) -> Self {
         Self {
             evidence_id,
+            event_id: None,
             project_id: None,
             authority,
             disclosure_class,
@@ -47,6 +49,26 @@ impl AuthorityEvidence {
     ) -> Self {
         Self {
             evidence_id,
+            event_id: None,
+            project_id: Some(project_id),
+            authority,
+            disclosure_class,
+            excerpt: excerpt.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_store(
+        project_id: ProjectId,
+        evidence_id: EvidenceId,
+        event_id: Option<EventId>,
+        authority: Authority,
+        disclosure_class: DisclosureClass,
+        excerpt: impl Into<String>,
+    ) -> Self {
+        Self {
+            evidence_id,
+            event_id,
             project_id: Some(project_id),
             authority,
             disclosure_class,
@@ -96,6 +118,28 @@ impl SemanticPolicy {
     #[must_use]
     pub fn project_matches(&self, project_id: &ProjectId) -> bool {
         self.project_id.as_ref() == Some(project_id)
+    }
+
+    #[must_use]
+    pub fn evidence_ids(&self) -> Vec<EvidenceId> {
+        self.evidence.keys().cloned().collect()
+    }
+
+    #[must_use]
+    pub fn evidence_count(&self) -> usize {
+        self.evidence.len()
+    }
+
+    pub(crate) fn event_ids_for(&self, proposal: &ProposedAssertion) -> Vec<EventId> {
+        proposal
+            .evidence_refs
+            .iter()
+            .filter_map(|id| {
+                self.evidence
+                    .get(id)
+                    .and_then(|evidence| evidence.event_id.clone())
+            })
+            .collect()
     }
 
     /// Filters proposals into authority-safe assertions.

@@ -24,10 +24,10 @@ pub use writer::{
     EvidenceWrite, ExtractorApplyReceipt, ExtractorWriteBatch, GraphActionRow, GraphApplyReceipt,
     GraphArtifactRow, GraphFinishRow, GraphObservedFinishRow, GraphRunRow, GraphSessionContextRow,
     GraphWriteBatch, IngestionChunk, IngestionFault, MAX_BATCH_BYTES, MAX_BATCH_RECORDS,
-    MAX_GRAPH_FACTS, SchemaFingerprintUpdate, SourceRegistration, SourceRegistrationReceipt,
-    StoredWorkCandidate, WRITER_QUEUE_CAPACITY, WorkApplyReceipt, WorkCandidatePage,
-    WorkCandidateQuery, WorkContractRow, WorkEdgeRow, WorkWriteBatch, WriterHandle,
-    stable_content_ref_id,
+    MAX_GRAPH_FACTS, SchemaFingerprintUpdate, SemanticEvidenceRow, SourceRegistration,
+    SourceRegistrationReceipt, StoredWorkCandidate, WRITER_QUEUE_CAPACITY, WorkApplyReceipt,
+    WorkCandidatePage, WorkCandidateQuery, WorkContractRow, WorkEdgeRow, WorkWriteBatch,
+    WriterHandle, stable_content_ref_id,
 };
 
 #[derive(thiserror::Error)]

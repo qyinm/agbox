@@ -4,11 +4,11 @@
 //! loopback URL.  This module never executes a proposed action and never
 //! sends source paths, reasoning, or unrestricted tool output over HTTP.
 
-use std::net::IpAddr;
 use std::time::Duration;
+use std::{collections::BTreeSet, net::IpAddr};
 
 use agbox_core::{
-    Authority, DisclosureClass, EventId, EvidenceId, PrivacyLabel, RedactionPolicy,
+    Authority, DisclosureClass, EvidenceId, PrivacyLabel, ProjectId, RedactionPolicy,
     WorkContractRevision,
 };
 use futures::StreamExt;
@@ -46,6 +46,10 @@ pub enum SemanticError {
     TooManyAssertions,
     #[error("semantic assertion is invalid")]
     InvalidProposal,
+    #[error("semantic response contains no authority-safe assertions")]
+    NoAssertions,
+    #[error("semantic response produces no material contract change")]
+    NoOp,
     #[error("semantic input exceeds its byte bound")]
     InputTooLarge,
     #[error("semantic input serialization failed")]
@@ -93,6 +97,7 @@ impl EndpointPolicy {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct BoundedFact {
+    pub project_id: ProjectId,
     pub evidence_id: EvidenceId,
     pub authority: Authority,
     pub disclosure_class: DisclosureClass,
@@ -102,6 +107,7 @@ pub struct BoundedFact {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct BoundedEvidence {
+    pub project_id: ProjectId,
     pub evidence_id: EvidenceId,
     pub authority: Authority,
     pub disclosure_class: DisclosureClass,
@@ -111,8 +117,11 @@ pub struct BoundedEvidence {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct BoundedArtifact {
+    pub project_id: ProjectId,
     pub artifact_id: String,
     pub state: String,
+    pub privacy: PrivacyLabel,
+    pub disclosure_class: DisclosureClass,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -138,6 +147,17 @@ impl ExtractionInput {
         mut evidence_excerpts: Vec<BoundedEvidence>,
         mut artifact_state: Vec<BoundedArtifact>,
     ) -> Result<Self, SemanticError> {
+        let project_id = previous_contract.project_id().clone();
+        if new_facts.iter().any(|fact| fact.project_id != project_id)
+            || evidence_excerpts
+                .iter()
+                .any(|evidence| evidence.project_id != project_id)
+            || artifact_state
+                .iter()
+                .any(|artifact| artifact.project_id != project_id)
+        {
+            return Err(SemanticError::InvalidProposal);
+        }
         new_facts.reverse();
         new_facts.retain(|fact| {
             fact.privacy != PrivacyLabel::RestrictedLocal
@@ -155,6 +175,12 @@ impl ExtractionInput {
                 && evidence.disclosure_class != DisclosureClass::DeveloperInstruction
                 && evidence.privacy != PrivacyLabel::RestrictedLocal
                 && !contains_absolute_path(&evidence.excerpt)
+        });
+        artifact_state.retain(|artifact| {
+            artifact.privacy != PrivacyLabel::RestrictedLocal
+                && artifact.disclosure_class.is_transferable()
+                && !contains_absolute_path(&artifact.artifact_id)
+                && !contains_absolute_path(&artifact.state)
         });
         let mut input = Self {
             previous_contract,
@@ -192,12 +218,57 @@ impl ExtractionInput {
         }
         Ok(input)
     }
+
+    /// Verifies that a caller-constructed input remains bound to one project.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SemanticError::InvalidProposal`] when any input projection or
+    /// its previous contract belongs to another project or work item.
+    pub fn validate_project(
+        &self,
+        project_id: &ProjectId,
+        work_id: &agbox_core::WorkId,
+    ) -> Result<(), SemanticError> {
+        if self.previous_contract.project_id() != project_id
+            || self.previous_contract.work_id() != work_id
+            || self
+                .new_facts
+                .iter()
+                .any(|fact| &fact.project_id != project_id)
+            || self
+                .evidence_excerpts
+                .iter()
+                .any(|evidence| &evidence.project_id != project_id)
+            || self
+                .artifact_state
+                .iter()
+                .any(|artifact| &artifact.project_id != project_id)
+        {
+            return Err(SemanticError::InvalidProposal);
+        }
+        Ok(())
+    }
 }
 
 fn contains_absolute_path(value: &str) -> bool {
-    value.starts_with('/')
-        || value.starts_with("~/")
-        || value.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+    let windows_drive_path = value.as_bytes().windows(3).any(|bytes| {
+        bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/')
+    });
+    windows_drive_path
+        || value
+            .split(|character: char| {
+                character.is_ascii_whitespace()
+                    || matches!(
+                        character,
+                        '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '=' | ':'
+                    )
+            })
+            .any(|token| {
+                token.starts_with('/')
+                    || token.starts_with("~/")
+                    || token.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+            })
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -353,10 +424,8 @@ pub fn filter_proposals(
     policy.validate(proposals)
 }
 
-/// Applies authority-filtered, summary-only refinement to a provisional
-/// contract. Instruction fields remain unchanged unless the local policy has
-/// already proven an exact human-intent match. The returned value is pure and
-/// still requires store validation before publication.
+/// Applies authority-filtered refinement to a provisional contract. Every
+/// accepted field is redacted again and must carry valid event provenance.
 ///
 /// # Errors
 ///
@@ -367,7 +436,13 @@ pub fn refine_provisional_contract(
     proposals: &ProposedAssertions,
     extractor_version: impl Into<String>,
 ) -> Result<ProvisionalContract, SemanticError> {
-    refine_provisional_contract_at(previous, proposals, extractor_version, previous.created_at)
+    refine_provisional_contract_at_with_policy(
+        previous,
+        proposals,
+        extractor_version,
+        previous.created_at,
+        None,
+    )
 }
 
 /// As [`refine_provisional_contract`] but stamps the new immutable revision
@@ -384,55 +459,125 @@ pub fn refine_provisional_contract_at(
     extractor_version: impl Into<String>,
     observed_at: time::OffsetDateTime,
 ) -> Result<ProvisionalContract, SemanticError> {
+    refine_provisional_contract_at_with_policy(
+        previous,
+        proposals,
+        extractor_version,
+        observed_at,
+        None,
+    )
+}
+
+/// Refines a contract while using the policy's immutable evidence-to-event
+/// mapping for provenance.
+///
+/// # Errors
+///
+/// Returns an error for empty, unproven, unsupported, or non-material
+/// proposals, as well as bounded redaction or serialization failures.
+pub fn refine_provisional_contract_at_with_policy(
+    previous: &ProvisionalContract,
+    proposals: &ProposedAssertions,
+    extractor_version: impl Into<String>,
+    observed_at: time::OffsetDateTime,
+    policy: Option<&SemanticPolicy>,
+) -> Result<ProvisionalContract, SemanticError> {
     proposals.validate_shape()?;
+    if proposals.assertions.is_empty() {
+        return Err(SemanticError::NoAssertions);
+    }
     let mut refined = previous.clone();
+    let redaction = RedactionPolicy::new()?;
+    for assertion in &proposals.assertions {
+        let field = canonical_field(&assertion.field).ok_or(SemanticError::InvalidProposal)?;
+        let redacted = redaction.redact(&assertion.value, None, DisclosureClass::DerivedText)?;
+        let events = policy
+            .ok_or(SemanticError::InvalidProposal)?
+            .event_ids_for(assertion);
+        if events.is_empty() {
+            return Err(SemanticError::InvalidProposal);
+        }
+        let mut all_evidence = refined
+            .evidence_refs
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        all_evidence.extend(events.iter().cloned());
+        if all_evidence.len() > agbox_core::limits::MAX_CONTRACT_EVIDENCE_REFS {
+            return Err(SemanticError::InvalidProposal);
+        }
+        refined.evidence_refs = all_evidence.into_iter().collect();
+        refined.field_evidence.insert(field, events);
+        match field {
+            ContractField::Objective => refined.objective = Some(redacted.value().to_owned()),
+            ContractField::Summary => redacted.value().clone_into(&mut refined.summary),
+            ContractField::Constraints => refined.constraints = vec![redacted.value().to_owned()],
+            ContractField::CompletionCriteria => {
+                refined.completion_criteria = vec![redacted.value().to_owned()];
+            }
+            ContractField::NextActions => refined.next_actions = vec![redacted.value().to_owned()],
+            ContractField::Blockers => refined.blockers = vec![redacted.value().to_owned()],
+            ContractField::Verification => refined.verification = vec![redacted.value().to_owned()],
+            ContractField::Status | ContractField::CompletedSteps | ContractField::Artifacts => {
+                return Err(SemanticError::InvalidProposal);
+            }
+        }
+    }
+    if material_content(&refined) == material_content(previous) {
+        return Err(SemanticError::NoOp);
+    }
     refined.revision = previous
         .revision
         .checked_add(1)
         .ok_or(SemanticError::InvalidProposal)?;
     refined.extractor_version = extractor_version.into();
     refined.created_at = observed_at;
-    if let Some(summary) = proposals
-        .assertions
-        .iter()
-        .find(|assertion| assertion.field.trim().eq_ignore_ascii_case("summary"))
-    {
-        let redaction = RedactionPolicy::new()?;
-        let redacted = redaction.redact(&summary.value, None, DisclosureClass::DerivedText)?;
-        redacted.value().clone_into(&mut refined.summary);
-        let evidence: Vec<EventId> = summary
-            .evidence_refs
-            .iter()
-            .filter_map(|evidence_id| EventId::parse_wire(evidence_id.as_str()))
-            .filter(|event_id| refined.evidence_refs.contains(event_id))
-            .collect();
-        let evidence = if evidence.is_empty() {
-            refined.evidence_refs.first().cloned().into_iter().collect()
-        } else {
-            evidence
-        };
-        refined
-            .field_evidence
-            .insert(ContractField::Summary, evidence);
-    }
-    let digest = blake3::hash(
-        serde_json::to_string(&(
-            &refined.objective,
-            refined.status,
-            &refined.summary,
-            &refined.completed_steps,
-            &refined.next_actions,
-            &refined.blockers,
-            &refined.constraints,
-            &refined.completion_criteria,
-            &refined.artifacts,
-            &refined.verification,
-        ))?
-        .as_bytes(),
-    );
+    let digest = blake3::hash(serde_json::to_string(&material_content(&refined))?.as_bytes());
     refined.material_content_hash = format!("b3:semantic-{}", digest.to_hex());
     refined.fact_set_digest = format!("{}:semantic-{}", previous.fact_set_digest, digest.to_hex());
     Ok(refined)
+}
+
+fn canonical_field(field: &str) -> Option<ContractField> {
+    match field.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "objective" => Some(ContractField::Objective),
+        "constraint" | "constraints" => Some(ContractField::Constraints),
+        "completion_criteria" | "completion_criterion" => Some(ContractField::CompletionCriteria),
+        "summary" => Some(ContractField::Summary),
+        "next_action" | "next_actions" => Some(ContractField::NextActions),
+        "blocker" | "blockers" => Some(ContractField::Blockers),
+        "verification" => Some(ContractField::Verification),
+        _ => None,
+    }
+}
+
+#[derive(PartialEq, Serialize)]
+struct MaterialContent<'a> {
+    objective: &'a Option<String>,
+    status: agbox_core::WorkStatus,
+    summary: &'a String,
+    completed_steps: &'a Vec<String>,
+    next_actions: &'a Vec<String>,
+    blockers: &'a Vec<String>,
+    constraints: &'a Vec<String>,
+    completion_criteria: &'a Vec<String>,
+    artifacts: &'a Vec<String>,
+    verification: &'a Vec<String>,
+}
+
+fn material_content(contract: &ProvisionalContract) -> MaterialContent<'_> {
+    MaterialContent {
+        objective: &contract.objective,
+        status: contract.status,
+        summary: &contract.summary,
+        completed_steps: &contract.completed_steps,
+        next_actions: &contract.next_actions,
+        blockers: &contract.blockers,
+        constraints: &contract.constraints,
+        completion_criteria: &contract.completion_criteria,
+        artifacts: &contract.artifacts,
+        verification: &contract.verification,
+    }
 }
 
 // Keep schemars in the dependency graph and make a machine-readable schema
@@ -451,4 +596,78 @@ struct ProposedAssertionSchema {
 #[allow(dead_code)]
 fn response_schema() -> schemars::Schema {
     schemars::schema_for!(ProposedAssertionSchema)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use agbox_core::{ContractId, EvidenceId, WorkContractRevisionDraft, WorkStatus};
+    use time::macros::datetime;
+
+    use super::*;
+
+    fn previous_contract(project_id: ProjectId) -> WorkContractRevision {
+        let redaction = RedactionPolicy::new().unwrap();
+        WorkContractRevision::new(WorkContractRevisionDraft {
+            contract_id: ContractId::parse_wire("contract-egress").unwrap(),
+            work_id: agbox_core::WorkId::parse_wire("work-egress").unwrap(),
+            revision: 1,
+            project_id,
+            objective: None,
+            status: WorkStatus::Active,
+            summary: redaction
+                .redact("safe summary", None, DisclosureClass::DerivedText)
+                .unwrap(),
+            completed_steps: Vec::new(),
+            next_actions: Vec::new(),
+            blockers: Vec::new(),
+            constraints: Vec::new(),
+            completion_criteria: Vec::new(),
+            artifacts: Vec::new(),
+            verification: Vec::new(),
+            source_runs: Vec::new(),
+            evidence_refs: vec![EvidenceId::parse_wire("evidence-egress").unwrap()],
+            confidence_basis_points: 9_000,
+            created_at: datetime!(2026-07-19 12:00 UTC),
+            extractor_version: "deterministic-v1".into(),
+            disclosure_class: DisclosureClass::DerivedText,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn bounded_input_filters_embedded_and_artifact_absolute_paths() {
+        let project_id = ProjectId::parse_wire("project-egress").unwrap();
+        let input = ExtractionInput::bounded(
+            previous_contract(project_id.clone()),
+            vec![BoundedFact {
+                project_id: project_id.clone(),
+                evidence_id: EvidenceId::parse_wire("fact-egress").unwrap(),
+                authority: Authority::AgentStatement,
+                disclosure_class: DisclosureClass::AgentStatement,
+                privacy: PrivacyLabel::PrivateLocal,
+                text: Some("changed /Users/alice/private.rs".into()),
+            }],
+            vec![BoundedEvidence {
+                project_id: project_id.clone(),
+                evidence_id: EvidenceId::parse_wire("evidence-egress").unwrap(),
+                authority: Authority::AgentStatement,
+                disclosure_class: DisclosureClass::AgentStatement,
+                privacy: PrivacyLabel::PrivateLocal,
+                excerpt: "diagnostic C:\\Users\\alice\\secret".into(),
+            }],
+            vec![BoundedArtifact {
+                project_id,
+                artifact_id: "artifact-1".into(),
+                state: "modified /private/tmp/secret.txt".into(),
+                privacy: PrivacyLabel::PrivateLocal,
+                disclosure_class: DisclosureClass::AgentStatement,
+            }],
+        )
+        .unwrap();
+        assert!(input.new_facts.is_empty());
+        assert!(input.evidence_excerpts.is_empty());
+        assert!(input.artifact_state.is_empty());
+    }
 }

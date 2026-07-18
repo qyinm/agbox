@@ -1,9 +1,10 @@
 #![allow(clippy::unwrap_used)]
 
-use agbox_core::{Authority, DisclosureClass, EventId};
+use agbox_core::{Authority, DisclosureClass, EventId, EvidenceId, ProjectId};
 use agbox_workgraph::{
     AuthorityEvidence, EndpointPolicy, ProposedAssertion, ProposedAssertions,
-    ProvisionalContractBuilder, SemanticPolicy, refine_provisional_contract,
+    ProvisionalContractBuilder, SemanticError, SemanticPolicy, refine_provisional_contract,
+    refine_provisional_contract_at_with_policy,
 };
 
 #[test]
@@ -41,31 +42,47 @@ fn summary_refinement_retains_the_evidence_that_authorized_it() {
     let previous = ProvisionalContractBuilder::new("deterministic-v1")
         .build(None, &facts)
         .unwrap();
-    let evidence_id = EventId::parse_wire("evt-summary").unwrap();
-    let policy = SemanticPolicy::with_evidence([AuthorityEvidence::new(
-        agbox_core::EvidenceId::for_test("evt-summary"),
-        Authority::ModelInference,
-        DisclosureClass::DerivedText,
-        "Parser implementation is in progress",
-    )]);
+    let event_id = EventId::parse_wire("evt-summary").unwrap();
+    let evidence_id = EvidenceId::for_test("evidence-summary-distinct");
+    let policy = SemanticPolicy::for_project(
+        ProjectId::for_test("project-a"),
+        [AuthorityEvidence::from_store(
+            ProjectId::for_test("project-a"),
+            evidence_id.clone(),
+            Some(event_id.clone()),
+            Authority::ModelInference,
+            DisclosureClass::DerivedText,
+            "Parser implementation is ready for verification",
+        )],
+    );
     let proposals = policy
         .validate(ProposedAssertions {
             assertions: vec![ProposedAssertion {
                 field: "summary".into(),
-                value: "Parser implementation is in progress".into(),
+                value: "Parser implementation is ready for verification".into(),
                 authority: Authority::ModelInference,
-                evidence_refs: vec![agbox_core::EvidenceId::for_test("evt-summary")],
+                evidence_refs: vec![evidence_id],
                 confidence_basis_points: 9_000,
             }],
         })
         .unwrap();
-    let refined = refine_provisional_contract(&previous, &proposals, "semantic-v1").unwrap();
-    assert_eq!(refined.summary, "Parser implementation is in progress");
+    let refined = refine_provisional_contract_at_with_policy(
+        &previous,
+        &proposals,
+        "semantic-v1",
+        previous.created_at,
+        Some(&policy),
+    )
+    .unwrap();
+    assert_eq!(
+        refined.summary,
+        "Parser implementation is ready for verification"
+    );
     assert_eq!(
         refined
             .field_evidence
             .get(&agbox_workgraph::ContractField::Summary),
-        Some(&vec![evidence_id])
+        Some(&vec![event_id])
     );
 }
 
@@ -76,13 +93,18 @@ fn summary_refinement_redacts_credentials_before_persistence() {
     let previous = ProvisionalContractBuilder::new("deterministic-v1")
         .build(None, &facts)
         .unwrap();
-    let evidence_id = agbox_core::EvidenceId::for_test("evt-summary");
-    let policy = SemanticPolicy::with_evidence([AuthorityEvidence::new(
-        evidence_id.clone(),
-        Authority::ModelInference,
-        DisclosureClass::DerivedText,
-        "safe summary",
-    )]);
+    let evidence_id = EvidenceId::for_test("evt-summary");
+    let policy = SemanticPolicy::for_project(
+        ProjectId::for_test("project-a"),
+        [AuthorityEvidence::from_store(
+            ProjectId::for_test("project-a"),
+            evidence_id.clone(),
+            Some(EventId::parse_wire("evt-summary").unwrap()),
+            Authority::ModelInference,
+            DisclosureClass::DerivedText,
+            "safe summary",
+        )],
+    );
     let proposals = policy
         .validate(ProposedAssertions {
             assertions: vec![ProposedAssertion {
@@ -94,6 +116,77 @@ fn summary_refinement_redacts_credentials_before_persistence() {
             }],
         })
         .unwrap();
-    let refined = refine_provisional_contract(&previous, &proposals, "semantic-v1").unwrap();
+    let refined = refine_provisional_contract_at_with_policy(
+        &previous,
+        &proposals,
+        "semantic-v1",
+        previous.created_at,
+        Some(&policy),
+    )
+    .unwrap();
     assert_eq!(refined.summary, "Authorization: [REDACTED_SECRET]");
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn empty_or_unsupported_proposals_cannot_create_a_refined_revision() {
+    let facts = agbox_workgraph::test_support::facts_for_active_parser_work();
+    let previous = ProvisionalContractBuilder::new("deterministic-v1")
+        .build(None, &facts)
+        .unwrap();
+    let empty = ProposedAssertions {
+        assertions: Vec::new(),
+    };
+    assert!(matches!(
+        refine_provisional_contract(&previous, &empty, "semantic-v1"),
+        Err(SemanticError::NoAssertions)
+    ));
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn accepted_non_summary_field_is_applied_with_store_provenance() {
+    let facts = agbox_workgraph::test_support::facts_for_active_parser_work();
+    let previous = ProvisionalContractBuilder::new("deterministic-v1")
+        .build(None, &facts)
+        .unwrap();
+    let evidence_id = EvidenceId::for_test("evidence-objective-distinct");
+    let event_id = EventId::parse_wire("evt-objective").unwrap();
+    let policy = SemanticPolicy::for_project(
+        ProjectId::for_test("project-a"),
+        [AuthorityEvidence::from_store(
+            ProjectId::for_test("project-a"),
+            evidence_id.clone(),
+            Some(event_id.clone()),
+            Authority::HumanIntent,
+            DisclosureClass::HumanIntent,
+            "Ship the parser",
+        )],
+    );
+    let proposals = policy
+        .validate(ProposedAssertions {
+            assertions: vec![ProposedAssertion {
+                field: "objective".into(),
+                value: "Ship the parser".into(),
+                authority: Authority::ModelInference,
+                evidence_refs: vec![evidence_id],
+                confidence_basis_points: 9_000,
+            }],
+        })
+        .unwrap();
+    let refined = refine_provisional_contract_at_with_policy(
+        &previous,
+        &proposals,
+        "semantic-v1",
+        previous.created_at,
+        Some(&policy),
+    )
+    .unwrap();
+    assert_eq!(refined.objective.as_deref(), Some("Ship the parser"));
+    assert_eq!(
+        refined
+            .field_evidence
+            .get(&agbox_workgraph::ContractField::Objective),
+        Some(&vec![event_id])
+    );
 }

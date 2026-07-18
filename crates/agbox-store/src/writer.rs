@@ -386,10 +386,30 @@ pub struct ExtractorWriteBatch {
     pub work_id: WorkId,
     pub extractor_version: String,
     pub input_event_watermark: String,
+    /// The exact immutable contract from which this run may derive a new
+    /// revision. This prevents a caller from publishing a revision that was
+    /// prepared from an invented or stale parent.
+    pub parent_revision: u64,
+    pub parent_material_content_hash: String,
     pub status: String,
     pub bounded_error: Option<String>,
     pub observed_at: OffsetDateTime,
     pub refined_contract: Option<WorkContractRow>,
+}
+
+/// Immutable evidence metadata needed to construct an authority policy.
+///
+/// This intentionally contains only the redacted excerpt and provenance, not
+/// the evidence blob. A `None` event owner is valid store data but cannot
+/// establish contract-field provenance for semantic refinement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SemanticEvidenceRow {
+    pub evidence_id: EvidenceId,
+    pub project_id: ProjectId,
+    pub event_id: Option<EventId>,
+    pub privacy: PrivacyLabel,
+    pub disclosure_class: DisclosureClass,
+    pub redacted_excerpt: String,
 }
 
 type ExistingExtractorRun = (
@@ -414,6 +434,11 @@ impl fmt::Debug for ExtractorWriteBatch {
                 "input_event_watermark_bytes",
                 &self.input_event_watermark.len(),
             )
+            .field("parent_revision", &self.parent_revision)
+            .field(
+                "parent_material_content_hash_bytes",
+                &self.parent_material_content_hash.len(),
+            )
             .field("status", &self.status)
             .field(
                 "bounded_error_bytes",
@@ -437,6 +462,8 @@ impl ExtractorWriteBatch {
             || !bounded_identifier(self.work_id.as_str())
             || !bounded_metadata(&self.extractor_version)
             || !bounded_metadata(&self.input_event_watermark)
+            || self.parent_revision == 0
+            || !bounded_metadata(&self.parent_material_content_hash)
             || !matches!(self.status.as_str(), "succeeded" | "failed")
             || self
                 .bounded_error
@@ -1251,6 +1278,11 @@ pub(crate) enum WriteCommand {
         work_id: WorkId,
         reply: oneshot::Sender<Result<Option<String>, StoreError>>,
     },
+    LoadSemanticEvidence {
+        project_id: ProjectId,
+        evidence_ids: Vec<EvidenceId>,
+        reply: oneshot::Sender<Result<Vec<SemanticEvidenceRow>, StoreError>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -1470,6 +1502,38 @@ impl WriterHandle {
         receive.await.map_err(|_| StoreError::WriterStopped)?
     }
 
+    /// Loads bounded same-project immutable evidence metadata for semantic
+    /// authority checks. The evidence plaintext never leaves the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, writer, or database errors. Missing IDs are
+    /// represented by absent rows so the coordinator can fail closed.
+    pub async fn load_semantic_evidence(
+        &self,
+        project_id: ProjectId,
+        evidence_ids: Vec<EvidenceId>,
+    ) -> Result<Vec<SemanticEvidenceRow>, StoreError> {
+        if !bounded_identifier(project_id.as_str())
+            || evidence_ids.len() > agbox_core::limits::MAX_CONTRACT_EVIDENCE_REFS
+            || evidence_ids
+                .iter()
+                .any(|evidence_id| !bounded_identifier(evidence_id.as_str()))
+        {
+            return Err(StoreError::InvalidBatch);
+        }
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(WriteCommand::LoadSemanticEvidence {
+                project_id,
+                evidence_ids,
+                reply,
+            })
+            .await
+            .map_err(|_| StoreError::WriterStopped)?;
+        receive.await.map_err(|_| StoreError::WriterStopped)?
+    }
+
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     #[must_use]
@@ -1536,6 +1600,14 @@ pub(crate) fn run_writer(
                 reply,
             } => {
                 let result = latest_work_contract(&connection, &project_id, &work_id);
+                let _ = reply.send(result);
+            }
+            WriteCommand::LoadSemanticEvidence {
+                project_id,
+                evidence_ids,
+                reply,
+            } => {
+                let result = load_semantic_evidence(&connection, &project_id, &evidence_ids);
                 let _ = reply.send(result);
             }
             WriteCommand::Shutdown { reply } => {
@@ -2250,6 +2322,7 @@ fn apply_extractor(
             revision_inserted: false,
         });
     }
+    validate_extractor_parent(&transaction, batch)?;
     transaction.execute(
         "INSERT INTO extractor_runs(
              extractor_run_id, work_id, extractor_version, input_event_watermark,
@@ -2279,6 +2352,14 @@ fn apply_extractor(
     )?;
     let mut revision_inserted = false;
     if let Some(contract) = &batch.refined_contract {
+        if contract.revision
+            != batch
+                .parent_revision
+                .checked_add(1)
+                .ok_or(StoreError::InvalidBatch)?
+        {
+            return Err(StoreError::ImmutableConflict);
+        }
         let stored: Option<String> = transaction
             .query_row(
                 "SELECT contract_json FROM work_contract_revisions
@@ -2343,6 +2424,32 @@ fn apply_extractor(
         replayed: false,
         revision_inserted,
     })
+}
+
+fn validate_extractor_parent(
+    transaction: &Transaction<'_>,
+    batch: &ExtractorWriteBatch,
+) -> Result<(), StoreError> {
+    let stored: Option<String> = transaction
+        .query_row(
+            "SELECT contract_json FROM work_contract_revisions
+             WHERE work_id = ?1
+             ORDER BY revision DESC
+             LIMIT 1",
+            [batch.work_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let stored = stored.ok_or(StoreError::InvalidReference)?;
+    let parent: ContractProjectionDto = serde_json::from_str(&stored)?;
+    if parent.project_id != batch.project_id
+        || parent.work_id != batch.work_id
+        || parent.revision != batch.parent_revision
+        || parent.material_content_hash != batch.parent_material_content_hash
+    {
+        return Err(StoreError::ImmutableConflict);
+    }
+    Ok(())
 }
 
 fn extractor_audit_id(run_id: &str) -> String {
@@ -2582,6 +2689,69 @@ fn latest_work_contract(
         )
         .optional()
         .map_err(StoreError::from)
+}
+
+fn load_semantic_evidence(
+    connection: &rusqlite::Connection,
+    project_id: &ProjectId,
+    evidence_ids: &[EvidenceId],
+) -> Result<Vec<SemanticEvidenceRow>, StoreError> {
+    if evidence_ids.len() > agbox_core::limits::MAX_CONTRACT_EVIDENCE_REFS {
+        return Err(StoreError::InvalidBatch);
+    }
+    let mut rows = Vec::with_capacity(evidence_ids.len());
+    for evidence_id in evidence_ids {
+        let row: Option<(String, String, String, String, String, String, String)> = connection
+            .query_row(
+                "SELECT evidence_id, project_id, owner_kind, owner_id, privacy,
+                        disclosure_class, redacted_excerpt
+                 FROM evidence_objects
+                 WHERE evidence_id = ?1 AND project_id = ?2 AND retired_at IS NULL",
+                params![evidence_id.as_str(), project_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            stored_id,
+            stored_project,
+            owner_kind,
+            owner_id,
+            privacy,
+            disclosure_class,
+            excerpt,
+        )) = row
+        else {
+            continue;
+        };
+        let evidence_id = EvidenceId::parse_wire(&stored_id).ok_or(StoreError::InvalidReference)?;
+        let project_id =
+            ProjectId::parse_wire(&stored_project).ok_or(StoreError::InvalidReference)?;
+        let event_id = match owner_kind.as_str() {
+            "event" => Some(EventId::parse_wire(&owner_id).ok_or(StoreError::InvalidReference)?),
+            "work" => None,
+            _ => return Err(StoreError::InvalidReference),
+        };
+        rows.push(SemanticEvidenceRow {
+            evidence_id,
+            project_id,
+            event_id,
+            privacy: parse_privacy_label(&privacy).ok_or(StoreError::InvalidReference)?,
+            disclosure_class: parse_disclosure_class(&disclosure_class)
+                .ok_or(StoreError::InvalidReference)?,
+            redacted_excerpt: excerpt,
+        });
+    }
+    Ok(rows)
 }
 
 fn verify_work_batch_audit(
@@ -4271,6 +4441,16 @@ fn privacy(value: PrivacyLabel) -> &'static str {
     }
 }
 
+fn parse_privacy_label(value: &str) -> Option<PrivacyLabel> {
+    match value {
+        "restricted_local" => Some(PrivacyLabel::RestrictedLocal),
+        "private_local" => Some(PrivacyLabel::PrivateLocal),
+        "derived_local" => Some(PrivacyLabel::DerivedLocal),
+        "sync_eligible" => Some(PrivacyLabel::SyncEligible),
+        _ => None,
+    }
+}
+
 fn disclosure(value: DisclosureClass) -> &'static str {
     match value {
         DisclosureClass::HumanIntent => "human_intent",
@@ -4281,6 +4461,20 @@ fn disclosure(value: DisclosureClass) -> &'static str {
         DisclosureClass::SystemInstruction => "system_instruction",
         DisclosureClass::DeveloperInstruction => "developer_instruction",
         DisclosureClass::DerivedText => "derived_text",
+    }
+}
+
+fn parse_disclosure_class(value: &str) -> Option<DisclosureClass> {
+    match value {
+        "human_intent" => Some(DisclosureClass::HumanIntent),
+        "agent_statement" => Some(DisclosureClass::AgentStatement),
+        "observed_state" => Some(DisclosureClass::ObservedState),
+        "tool_result" => Some(DisclosureClass::ToolResult),
+        "reasoning" => Some(DisclosureClass::Reasoning),
+        "system_instruction" => Some(DisclosureClass::SystemInstruction),
+        "developer_instruction" => Some(DisclosureClass::DeveloperInstruction),
+        "derived_text" => Some(DisclosureClass::DerivedText),
+        _ => None,
     }
 }
 
