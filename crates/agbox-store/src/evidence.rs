@@ -1,4 +1,11 @@
-use std::{ffi::OsString, fs::File, io::Write, path::PathBuf, sync::Arc};
+use std::{
+    ffi::OsString,
+    fs::File,
+    io::Write,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use agbox_core::{EventId, EvidenceId, ProjectId, WorkId, limits::MAX_INLINE_BYTES};
 use zeroize::Zeroizing;
@@ -236,6 +243,36 @@ impl EvidenceVault {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Lists at most 256 old, regular owner files with safe evidence IDs. The
+    /// writer must still verify that no metadata row exists immediately before
+    /// removing each candidate.
+    pub(crate) fn orphan_candidates(
+        &self,
+        now: SystemTime,
+    ) -> Result<Vec<EvidenceId>, EvidenceError> {
+        ensure_owner_directory(&self.root)?;
+        let mut candidates = Vec::new();
+        for entry in std::fs::read_dir(&self.root)?.take(256) {
+            let entry = entry?;
+            let name = entry.file_name();
+            let text = name.to_string_lossy();
+            let Some(raw) = text.strip_suffix(".agbx") else {
+                continue;
+            };
+            let Some(id) = EvidenceId::parse_wire(raw) else {
+                continue;
+            };
+            validate_owner_file(&self.root_directory, &name)?;
+            let age = now
+                .duration_since(entry.metadata()?.modified()?)
+                .unwrap_or(Duration::ZERO);
+            if age >= Duration::from_secs(24 * 60 * 60) {
+                candidates.push(id);
+            }
+        }
+        Ok(candidates)
     }
 }
 
