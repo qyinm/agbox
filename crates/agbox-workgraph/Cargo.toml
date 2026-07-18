@@ -1,5 +1,5 @@
 [package]
-name = "agbox-store"
+name = "agbox-workgraph"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,22 +10,13 @@ test-support = ["agbox-core/test-support"]
 
 [dependencies]
 agbox-core.workspace = true
-blake3.workspace = true
-chacha20poly1305.workspace = true
-keyring.workspace = true
-rusqlite.workspace = true
-rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio.workspace = true
-uuid.workspace = true
-zeroize.workspace = true
 
 [dev-dependencies]
 agbox-core = { workspace = true, features = ["test-support"] }
-tempfile.workspace = true
 
 [lints]
 workspace = true

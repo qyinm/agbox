@@ -2,9 +2,10 @@ use std::{collections::HashSet, fmt, sync::Arc};
 
 use agbox_core::{
     ActivityEventV1, ContentRef, DisclosureClass, EventId, EvidenceId, PrivacyLabel, ProjectId,
-    Provider, SourceObservation, WorkId,
+    Provider, SessionId, SourceObservation, WorkId,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::Serialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
@@ -14,6 +15,229 @@ use crate::{EvidenceContext, EvidenceOwnerRef, EvidenceVault, StoreError};
 pub const MAX_BATCH_BYTES: usize = agbox_core::limits::MAX_BATCH_SEMANTIC_BYTES;
 pub const MAX_BATCH_RECORDS: usize = agbox_core::limits::MAX_BATCH_RECORDS;
 pub const WRITER_QUEUE_CAPACITY: usize = 32;
+pub const MAX_GRAPH_FACTS: usize = agbox_core::limits::MAX_BATCH_RECORDS;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GraphRunRow {
+    pub run_id: String,
+    pub project_id: ProjectId,
+    pub provider: Provider,
+    pub session_id: SessionId,
+    pub observed_at: OffsetDateTime,
+    pub finished: bool,
+    pub succeeded: Option<bool>,
+    pub evidence_event_id: EventId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GraphSessionContextRow {
+    pub project_id: ProjectId,
+    pub session_id: SessionId,
+    pub branch_hash: Option<String>,
+    pub evidence_event_id: EventId,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize)]
+pub struct GraphActionRow {
+    pub project_id: ProjectId,
+    pub session_id: SessionId,
+    pub native_action_id: String,
+    pub request_event_id: EventId,
+    pub tool_name: String,
+    pub input_hash: String,
+    pub redacted_command: Option<String>,
+}
+
+impl fmt::Debug for GraphActionRow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GraphActionRow")
+            .field("project_id", &self.project_id)
+            .field("session_id", &self.session_id)
+            .field("native_action_id", &self.native_action_id)
+            .field("request_event_id", &self.request_event_id)
+            .field("tool_name", &self.tool_name)
+            .field("input_hash", &self.input_hash)
+            .field(
+                "redacted_command_bytes",
+                &self.redacted_command.as_ref().map_or(0, String::len),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize)]
+pub struct GraphArtifactRow {
+    pub artifact_id: String,
+    pub work_id: WorkId,
+    pub project_id: ProjectId,
+    pub path_hash: String,
+    pub project_relative_path: Option<String>,
+    pub content_hash: Option<String>,
+    pub operation: String,
+    pub observed_at: OffsetDateTime,
+    pub evidence_event_id: EventId,
+}
+
+impl fmt::Debug for GraphArtifactRow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GraphArtifactRow")
+            .field("artifact_id", &self.artifact_id)
+            .field("work_id", &self.work_id)
+            .field("project_id", &self.project_id)
+            .field("path_hash", &self.path_hash)
+            .field(
+                "project_relative_path_bytes",
+                &self.project_relative_path.as_ref().map_or(0, String::len),
+            )
+            .field("content_hash", &self.content_hash)
+            .field("operation", &self.operation)
+            .field("observed_at", &self.observed_at)
+            .field("evidence_event_id", &self.evidence_event_id)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GraphFinishRow {
+    pub verification_id: String,
+    pub project_id: ProjectId,
+    pub session_id: SessionId,
+    pub native_action_id: String,
+    pub succeeded: bool,
+    pub basis: String,
+    pub finish_event_id: EventId,
+    pub observed_at: OffsetDateTime,
+}
+
+#[derive(Clone, Serialize)]
+pub struct GraphWriteBatch {
+    pub reducer_name: String,
+    pub expected_event_seq: u64,
+    pub next_event_seq: u64,
+    pub next_event_id: EventId,
+    pub runs: Vec<GraphRunRow>,
+    pub contexts: Vec<GraphSessionContextRow>,
+    pub actions: Vec<GraphActionRow>,
+    pub artifacts: Vec<GraphArtifactRow>,
+    pub finishes: Vec<GraphFinishRow>,
+}
+
+impl fmt::Debug for GraphWriteBatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GraphWriteBatch")
+            .field("reducer_name", &self.reducer_name)
+            .field("expected_event_seq", &self.expected_event_seq)
+            .field("next_event_seq", &self.next_event_seq)
+            .field("runs", &self.runs.len())
+            .field("contexts", &self.contexts.len())
+            .field("actions", &self.actions.len())
+            .field("artifacts", &self.artifacts.len())
+            .field("finishes", &self.finishes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl GraphWriteBatch {
+    /// Revalidates graph cardinality, watermark, identifiers, and retained
+    /// semantic byte bounds before writer submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidBatch`] when any bound or normalized value
+    /// is invalid.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        let fact_count = self
+            .runs
+            .len()
+            .checked_add(self.contexts.len())
+            .and_then(|value| value.checked_add(self.actions.len()))
+            .and_then(|value| value.checked_add(self.artifacts.len()))
+            .and_then(|value| value.checked_add(self.finishes.len()))
+            .ok_or(StoreError::InvalidBatch)?;
+        if fact_count > MAX_GRAPH_FACTS
+            || !bounded_identifier(&self.reducer_name)
+            || self.next_event_seq == 0
+            || self.next_event_seq < self.expected_event_seq
+            || self.next_event_seq > i64::MAX as u64
+            || self.expected_event_seq > i64::MAX as u64
+            || !bounded_identifier(self.next_event_id.as_str())
+        {
+            return Err(StoreError::InvalidBatch);
+        }
+        for row in &self.runs {
+            validate_graph_identity(&row.project_id, &row.session_id, &row.evidence_event_id)?;
+            if !bounded_identifier(&row.run_id) || row.finished != row.succeeded.is_some() {
+                return Err(StoreError::InvalidBatch);
+            }
+            let _ = format_timestamp(row.observed_at)?;
+        }
+        for row in &self.contexts {
+            validate_graph_identity(&row.project_id, &row.session_id, &row.evidence_event_id)?;
+            if row
+                .branch_hash
+                .as_ref()
+                .is_some_and(|value| !bounded_metadata(value))
+            {
+                return Err(StoreError::InvalidBatch);
+            }
+        }
+        for row in &self.actions {
+            validate_graph_identity(&row.project_id, &row.session_id, &row.request_event_id)?;
+            if !bounded_identifier(&row.native_action_id)
+                || !bounded_metadata(&row.tool_name)
+                || !bounded_metadata(&row.input_hash)
+                || row
+                    .redacted_command
+                    .as_ref()
+                    .is_some_and(|value| value.len() > agbox_core::limits::MAX_PREVIEW_BYTES)
+            {
+                return Err(StoreError::InvalidBatch);
+            }
+        }
+        for row in &self.artifacts {
+            validate_graph_event_identity(&row.project_id, &row.evidence_event_id)?;
+            if !bounded_identifier(&row.artifact_id)
+                || !bounded_identifier(row.work_id.as_str())
+                || !bounded_metadata(&row.path_hash)
+                || !bounded_metadata(&row.operation)
+                || row
+                    .content_hash
+                    .as_ref()
+                    .is_some_and(|value| !bounded_metadata(value))
+                || row
+                    .project_relative_path
+                    .as_ref()
+                    .is_some_and(|value| value.len() > agbox_core::limits::MAX_PREVIEW_BYTES)
+            {
+                return Err(StoreError::InvalidBatch);
+            }
+            let _ = format_timestamp(row.observed_at)?;
+        }
+        for row in &self.finishes {
+            validate_graph_identity(&row.project_id, &row.session_id, &row.finish_event_id)?;
+            if !bounded_identifier(&row.verification_id)
+                || !bounded_identifier(&row.native_action_id)
+                || !bounded_metadata(&row.basis)
+            {
+                return Err(StoreError::InvalidBatch);
+            }
+            let _ = format_timestamp(row.observed_at)?;
+        }
+        if graph_semantic_bytes(self)? > MAX_BATCH_BYTES {
+            return Err(StoreError::InvalidBatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraphApplyReceipt {
+    pub through_event_seq: u64,
+    pub replayed: bool,
+}
 
 #[derive(Clone)]
 pub struct SourceRegistration {
@@ -533,6 +757,10 @@ pub(crate) enum WriteCommand {
         chunk: Box<IngestionChunk>,
         reply: oneshot::Sender<Result<CommitReceipt, StoreError>>,
     },
+    ApplyGraph {
+        batch: Box<GraphWriteBatch>,
+        reply: oneshot::Sender<Result<GraphApplyReceipt, StoreError>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -637,6 +865,29 @@ impl WriterHandle {
         Ok(CommitSubmission { receive })
     }
 
+    /// Atomically applies one store-owned graph batch and advances its reducer
+    /// watermark in the same immediate transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, immutable-row, watermark, writer, or database
+    /// errors without partially applying the graph batch.
+    pub async fn apply_graph(
+        &self,
+        batch: GraphWriteBatch,
+    ) -> Result<GraphApplyReceipt, StoreError> {
+        batch.validate()?;
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(WriteCommand::ApplyGraph {
+                batch: Box::new(batch),
+                reply,
+            })
+            .await
+            .map_err(|_| StoreError::WriterStopped)?;
+        receive.await.map_err(|_| StoreError::WriterStopped)?
+    }
+
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     #[must_use]
@@ -679,6 +930,10 @@ pub(crate) fn run_writer(
             }
             WriteCommand::Commit { chunk, reply } => {
                 let result = commit(&mut connection, &vault, &chunk);
+                let _ = reply.send(result);
+            }
+            WriteCommand::ApplyGraph { batch, reply } => {
+                let result = apply_graph(&mut connection, &vault, &batch);
                 let _ = reply.send(result);
             }
             WriteCommand::Shutdown { reply } => {
@@ -1054,6 +1309,481 @@ fn registration_digest(registration: &SourceRegistration) -> Result<String, Stor
         hasher.update(part);
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn apply_graph(
+    connection: &mut rusqlite::Connection,
+    vault: &EvidenceVault,
+    batch: &GraphWriteBatch,
+) -> Result<GraphApplyReceipt, StoreError> {
+    batch.validate()?;
+    let sealed_paths = batch
+        .artifacts
+        .iter()
+        .map(|row| {
+            let aad = registration_aad(
+                b"agbox.db.graph-artifact-path.v1",
+                &[
+                    row.project_id.as_str().as_bytes(),
+                    row.artifact_id.as_bytes(),
+                    row.path_hash.as_bytes(),
+                ],
+            )?;
+            let plaintext = row
+                .project_relative_path
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes();
+            Ok::<_, StoreError>((
+                row.artifact_id.as_str(),
+                vault.seal_database_field(&aad, plaintext)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: Option<(i64, String)> = transaction
+        .query_row(
+            "SELECT through_event_seq, through_event_id
+             FROM reducer_watermarks
+             WHERE reducer_name = ?1",
+            [batch.reducer_name.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let current_seq = current
+        .as_ref()
+        .map(|(sequence, _)| u64::try_from(*sequence).map_err(|_| StoreError::InvalidBatch))
+        .transpose()?
+        .unwrap_or(0);
+    let replayed = current.as_ref().is_some_and(|(sequence, event_id)| {
+        u64::try_from(*sequence).ok() == Some(batch.next_event_seq)
+            && event_id == batch.next_event_id.as_str()
+    });
+    if !replayed && current_seq != batch.expected_event_seq {
+        return Err(StoreError::ReducerWatermarkConflict);
+    }
+    verify_watermark_event(&transaction, batch.next_event_seq, &batch.next_event_id)?;
+    verify_graph_batch_audit(&transaction, batch, replayed)?;
+
+    for row in &batch.runs {
+        verify_graph_event(&transaction, &row.project_id, &row.evidence_event_id)?;
+        apply_graph_run(&transaction, row)?;
+    }
+    for row in &batch.contexts {
+        verify_graph_event(&transaction, &row.project_id, &row.evidence_event_id)?;
+        transaction.execute(
+            "UPDATE agent_runs
+             SET branch_hash = ?1
+             WHERE project_id = ?2 AND native_session_id = ?3",
+            params![
+                row.branch_hash,
+                row.project_id.as_str(),
+                row.session_id.as_str()
+            ],
+        )?;
+    }
+    for row in &batch.actions {
+        verify_graph_event(&transaction, &row.project_id, &row.request_event_id)?;
+        insert_graph_action(&transaction, row)?;
+    }
+    for (row, (_, encrypted_path)) in batch.artifacts.iter().zip(&sealed_paths) {
+        verify_graph_event(&transaction, &row.project_id, &row.evidence_event_id)?;
+        insert_graph_artifact(&transaction, row, encrypted_path)?;
+    }
+    for row in &batch.finishes {
+        verify_graph_event(&transaction, &row.project_id, &row.finish_event_id)?;
+        apply_graph_finish(&transaction, row)?;
+    }
+    transaction.execute(
+        "INSERT INTO reducer_watermarks(
+             reducer_name, through_event_seq, through_event_id, updated_at
+         ) VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         ON CONFLICT(reducer_name) DO UPDATE SET
+             through_event_seq = excluded.through_event_seq,
+             through_event_id = excluded.through_event_id,
+             updated_at = excluded.updated_at",
+        params![
+            batch.reducer_name,
+            to_i64(batch.next_event_seq)?,
+            batch.next_event_id.as_str()
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(GraphApplyReceipt {
+        through_event_seq: batch.next_event_seq,
+        replayed,
+    })
+}
+
+fn verify_graph_batch_audit(
+    transaction: &Transaction<'_>,
+    batch: &GraphWriteBatch,
+    replayed: bool,
+) -> Result<(), StoreError> {
+    let encoded = serde_json::to_vec(batch)?;
+    let digest = blake3::hash(&encoded).to_hex().to_string();
+    let mut identity = blake3::Hasher::new();
+    identity.update(b"agbox.graph.batch-audit.v1");
+    identity.update(batch.reducer_name.as_bytes());
+    identity.update(&batch.next_event_seq.to_le_bytes());
+    identity.update(batch.next_event_id.as_str().as_bytes());
+    let audit_id = format!("audit_graph_{}", &identity.finalize().to_hex()[..24]);
+    let detail = format!(r#"{{"batch_digest":"{digest}"}}"#);
+
+    if replayed {
+        let stored: Option<String> = transaction
+            .query_row(
+                "SELECT detail_json FROM audit_events WHERE audit_id = ?1",
+                [audit_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if stored.as_deref() != Some(detail.as_str()) {
+            return Err(StoreError::ReducerWatermarkConflict);
+        }
+        return Ok(());
+    }
+
+    let changed = transaction.execute(
+        "INSERT OR IGNORE INTO audit_events(
+             audit_id, kind, project_id, work_id, actor, detail_json, created_at
+         ) VALUES (?1, 'graph.reducer_batch', NULL, NULL, 'system', ?2,
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        params![audit_id, detail],
+    )?;
+    if changed == 0 {
+        return Err(StoreError::ReducerWatermarkConflict);
+    }
+    Ok(())
+}
+
+fn verify_watermark_event(
+    transaction: &Transaction<'_>,
+    event_seq: u64,
+    event_id: &EventId,
+) -> Result<(), StoreError> {
+    let stored: Option<String> = transaction
+        .query_row(
+            "SELECT event_id FROM activity_events WHERE event_seq = ?1",
+            [to_i64(event_seq)?],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if stored.as_deref() != Some(event_id.as_str()) {
+        return Err(StoreError::InvalidReference);
+    }
+    Ok(())
+}
+
+fn verify_graph_event(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    event_id: &EventId,
+) -> Result<(), StoreError> {
+    let stored: Option<String> = transaction
+        .query_row(
+            "SELECT project_id FROM activity_events WHERE event_id = ?1",
+            [event_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if stored.as_deref() != Some(project_id.as_str()) {
+        return Err(StoreError::InvalidReference);
+    }
+    Ok(())
+}
+
+fn apply_graph_run(transaction: &Transaction<'_>, row: &GraphRunRow) -> Result<(), StoreError> {
+    let observed_at = format_timestamp(row.observed_at)?;
+    let status = if row.finished {
+        if row.succeeded == Some(true) {
+            "succeeded"
+        } else {
+            "failed"
+        }
+    } else {
+        "running"
+    };
+    let changed = transaction.execute(
+        "INSERT OR IGNORE INTO agent_runs(
+             run_id, project_id, provider, native_session_id, branch_hash,
+             started_at, finished_at, status
+         ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
+        params![
+            row.run_id,
+            row.project_id.as_str(),
+            row.provider.as_str(),
+            row.session_id.as_str(),
+            observed_at,
+            row.finished.then_some(observed_at.as_str()),
+            status
+        ],
+    )?;
+    if changed == 0 {
+        let immutable_matches: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM agent_runs
+                 WHERE run_id = ?1 AND project_id = ?2
+                   AND provider = ?3 AND native_session_id = ?4
+             )",
+            params![
+                row.run_id,
+                row.project_id.as_str(),
+                row.provider.as_str(),
+                row.session_id.as_str()
+            ],
+            |record| record.get(0),
+        )?;
+        if !immutable_matches {
+            return Err(StoreError::ImmutableConflict);
+        }
+        if row.finished {
+            transaction.execute(
+                "UPDATE agent_runs
+                 SET finished_at = ?1, status = ?2
+                 WHERE run_id = ?3
+                   AND (finished_at IS NULL OR (finished_at = ?1 AND status = ?2))",
+                params![observed_at, status, row.run_id],
+            )?;
+            let finish_matches: bool = transaction.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM agent_runs
+                     WHERE run_id = ?1 AND finished_at = ?2 AND status = ?3
+                 )",
+                params![row.run_id, observed_at, status],
+                |record| record.get(0),
+            )?;
+            if !finish_matches {
+                return Err(StoreError::ImmutableConflict);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn insert_graph_action(
+    transaction: &Transaction<'_>,
+    row: &GraphActionRow,
+) -> Result<(), StoreError> {
+    let changed = transaction.execute(
+        "INSERT OR IGNORE INTO action_facts(
+             project_id, session_id, native_action_id, request_event_id,
+             finish_event_id, tool_name, input_hash, redacted_command, succeeded
+         ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, NULL)",
+        params![
+            row.project_id.as_str(),
+            row.session_id.as_str(),
+            row.native_action_id,
+            row.request_event_id.as_str(),
+            row.tool_name,
+            row.input_hash,
+            row.redacted_command
+        ],
+    )?;
+    if changed == 0
+        && !exists(
+            transaction,
+            "SELECT EXISTS(
+                 SELECT 1 FROM action_facts
+                 WHERE project_id = ?1 AND session_id = ?2
+                   AND native_action_id = ?3 AND request_event_id = ?4
+                   AND tool_name = ?5 AND input_hash = ?6
+                   AND redacted_command IS ?7
+             )",
+            params![
+                row.project_id.as_str(),
+                row.session_id.as_str(),
+                row.native_action_id,
+                row.request_event_id.as_str(),
+                row.tool_name,
+                row.input_hash,
+                row.redacted_command
+            ],
+        )?
+    {
+        return Err(StoreError::ImmutableConflict);
+    }
+    Ok(())
+}
+
+fn insert_graph_artifact(
+    transaction: &Transaction<'_>,
+    row: &GraphArtifactRow,
+    encrypted_path: &[u8],
+) -> Result<(), StoreError> {
+    let observed_at = format_timestamp(row.observed_at)?;
+    transaction.execute(
+        "INSERT INTO work_items(work_id, project_id, status, created_at, updated_at)
+         VALUES (?1, ?2, 'observed', ?3, ?3)
+         ON CONFLICT(work_id) DO NOTHING",
+        params![row.work_id.as_str(), row.project_id.as_str(), observed_at],
+    )?;
+    let work_matches: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM work_items WHERE work_id = ?1 AND project_id = ?2
+         )",
+        params![row.work_id.as_str(), row.project_id.as_str()],
+        |record| record.get(0),
+    )?;
+    if !work_matches {
+        return Err(StoreError::ImmutableConflict);
+    }
+    let changed = transaction.execute(
+        "INSERT OR IGNORE INTO artifacts(
+             artifact_id, work_id, path_hash, encrypted_path,
+             content_hash, operation, observed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            row.artifact_id,
+            row.work_id.as_str(),
+            row.path_hash,
+            encrypted_path,
+            row.content_hash,
+            row.operation,
+            observed_at
+        ],
+    )?;
+    if changed == 0
+        && !exists(
+            transaction,
+            "SELECT EXISTS(
+                 SELECT 1 FROM artifacts
+                 WHERE artifact_id = ?1 AND work_id = ?2 AND path_hash = ?3
+                   AND content_hash IS ?4 AND operation = ?5 AND observed_at = ?6
+             )",
+            params![
+                row.artifact_id,
+                row.work_id.as_str(),
+                row.path_hash,
+                row.content_hash,
+                row.operation,
+                observed_at
+            ],
+        )?
+    {
+        return Err(StoreError::ImmutableConflict);
+    }
+    transaction.execute(
+        "INSERT OR IGNORE INTO work_evidence(
+             work_id, assertion_id, event_id, evidence_id
+         )
+         SELECT ?1, NULL, event_id, evidence_id
+         FROM event_evidence
+         WHERE event_id = ?2",
+        params![row.work_id.as_str(), row.evidence_event_id.as_str()],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn apply_graph_finish(
+    transaction: &Transaction<'_>,
+    row: &GraphFinishRow,
+) -> Result<(), StoreError> {
+    let request_event_id: Option<String> = transaction
+        .query_row(
+            "SELECT action_facts.request_event_id
+             FROM action_facts
+             INNER JOIN activity_events AS request_events
+                 ON request_events.event_id = action_facts.request_event_id
+             INNER JOIN activity_events AS finish_events
+                 ON finish_events.event_id = ?4
+             WHERE action_facts.project_id = ?1
+               AND action_facts.session_id = ?2
+               AND action_facts.native_action_id = ?3
+               AND request_events.event_seq <= finish_events.event_seq
+             ORDER BY request_events.event_seq DESC
+             LIMIT 1",
+            params![
+                row.project_id.as_str(),
+                row.session_id.as_str(),
+                row.native_action_id,
+                row.finish_event_id.as_str()
+            ],
+            |record| record.get(0),
+        )
+        .optional()?;
+    let Some(request_event_id) = request_event_id else {
+        return Ok(());
+    };
+    transaction.execute(
+        "UPDATE action_facts
+         SET finish_event_id = ?1, succeeded = ?2
+         WHERE project_id = ?3 AND session_id = ?4
+           AND native_action_id = ?5 AND request_event_id = ?6
+           AND (finish_event_id IS NULL OR finish_event_id = ?1)",
+        params![
+            row.finish_event_id.as_str(),
+            i64::from(row.succeeded),
+            row.project_id.as_str(),
+            row.session_id.as_str(),
+            row.native_action_id,
+            request_event_id
+        ],
+    )?;
+    let action_matches: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM action_facts
+             WHERE project_id = ?1 AND session_id = ?2
+               AND native_action_id = ?3 AND request_event_id = ?4
+               AND finish_event_id = ?5 AND succeeded = ?6
+         )",
+        params![
+            row.project_id.as_str(),
+            row.session_id.as_str(),
+            row.native_action_id,
+            request_event_id,
+            row.finish_event_id.as_str(),
+            i64::from(row.succeeded)
+        ],
+        |record| record.get(0),
+    )?;
+    if !action_matches {
+        return Err(StoreError::ImmutableConflict);
+    }
+    let observed_at = format_timestamp(row.observed_at)?;
+    let changed = transaction.execute(
+        "INSERT OR IGNORE INTO verification_facts(
+             verification_id, project_id, work_id, session_id,
+             native_action_id, succeeded, basis, event_id, observed_at
+         ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            row.verification_id,
+            row.project_id.as_str(),
+            row.session_id.as_str(),
+            row.native_action_id,
+            i64::from(row.succeeded),
+            row.basis,
+            row.finish_event_id.as_str(),
+            observed_at
+        ],
+    )?;
+    if changed == 0
+        && !exists(
+            transaction,
+            "SELECT EXISTS(
+                 SELECT 1 FROM verification_facts
+                 WHERE verification_id = ?1 AND project_id = ?2
+                   AND session_id = ?3 AND native_action_id = ?4
+                   AND succeeded = ?5 AND basis = ?6
+                   AND event_id = ?7 AND observed_at = ?8
+             )",
+            params![
+                row.verification_id,
+                row.project_id.as_str(),
+                row.session_id.as_str(),
+                row.native_action_id,
+                i64::from(row.succeeded),
+                row.basis,
+                row.finish_event_id.as_str(),
+                observed_at
+            ],
+        )?
+    {
+        return Err(StoreError::ImmutableConflict);
+    }
+    Ok(())
 }
 
 fn commit(
@@ -2033,6 +2763,89 @@ fn hash_part(hasher: &mut blake3::Hasher, value: &[u8]) -> Result<(), StoreError
 fn add_len(total: &mut usize, value: usize) -> Result<(), StoreError> {
     *total = total.checked_add(value).ok_or(StoreError::InvalidBatch)?;
     Ok(())
+}
+
+fn validate_graph_identity(
+    project_id: &ProjectId,
+    session_id: &SessionId,
+    event_id: &EventId,
+) -> Result<(), StoreError> {
+    validate_graph_event_identity(project_id, event_id)?;
+    if !bounded_identifier(session_id.as_str()) {
+        return Err(StoreError::InvalidBatch);
+    }
+    Ok(())
+}
+
+fn validate_graph_event_identity(
+    project_id: &ProjectId,
+    event_id: &EventId,
+) -> Result<(), StoreError> {
+    if !bounded_identifier(project_id.as_str()) || !bounded_identifier(event_id.as_str()) {
+        return Err(StoreError::InvalidBatch);
+    }
+    Ok(())
+}
+
+fn graph_semantic_bytes(batch: &GraphWriteBatch) -> Result<usize, StoreError> {
+    let mut total = size_of::<u64>()
+        .checked_mul(2)
+        .ok_or(StoreError::InvalidBatch)?;
+    add_len(&mut total, batch.reducer_name.len())?;
+    add_len(&mut total, batch.next_event_id.as_str().len())?;
+    for row in &batch.runs {
+        add_len(&mut total, row.run_id.len())?;
+        add_len(&mut total, row.project_id.as_str().len())?;
+        add_len(&mut total, row.session_id.as_str().len())?;
+        add_len(&mut total, row.evidence_event_id.as_str().len())?;
+        add_len(&mut total, format_timestamp(row.observed_at)?.len())?;
+        add_len(&mut total, 3)?;
+    }
+    for row in &batch.contexts {
+        add_len(&mut total, row.project_id.as_str().len())?;
+        add_len(&mut total, row.session_id.as_str().len())?;
+        add_len(&mut total, row.evidence_event_id.as_str().len())?;
+        if let Some(branch_hash) = &row.branch_hash {
+            add_len(&mut total, branch_hash.len())?;
+        }
+    }
+    for row in &batch.actions {
+        add_len(&mut total, row.project_id.as_str().len())?;
+        add_len(&mut total, row.session_id.as_str().len())?;
+        add_len(&mut total, row.native_action_id.len())?;
+        add_len(&mut total, row.request_event_id.as_str().len())?;
+        add_len(&mut total, row.tool_name.len())?;
+        add_len(&mut total, row.input_hash.len())?;
+        if let Some(command) = &row.redacted_command {
+            add_len(&mut total, command.len())?;
+        }
+    }
+    for row in &batch.artifacts {
+        add_len(&mut total, row.artifact_id.len())?;
+        add_len(&mut total, row.work_id.as_str().len())?;
+        add_len(&mut total, row.project_id.as_str().len())?;
+        add_len(&mut total, row.path_hash.len())?;
+        add_len(&mut total, row.operation.len())?;
+        add_len(&mut total, row.evidence_event_id.as_str().len())?;
+        add_len(&mut total, format_timestamp(row.observed_at)?.len())?;
+        if let Some(path) = &row.project_relative_path {
+            add_len(&mut total, path.len())?;
+        }
+        if let Some(content_hash) = &row.content_hash {
+            add_len(&mut total, content_hash.len())?;
+        }
+    }
+    for row in &batch.finishes {
+        add_len(&mut total, row.verification_id.len())?;
+        add_len(&mut total, row.project_id.as_str().len())?;
+        add_len(&mut total, row.session_id.as_str().len())?;
+        add_len(&mut total, row.native_action_id.len())?;
+        add_len(&mut total, row.basis.len())?;
+        add_len(&mut total, row.finish_event_id.as_str().len())?;
+        add_len(&mut total, format_timestamp(row.observed_at)?.len())?;
+        add_len(&mut total, 1)?;
+    }
+    Ok(total)
 }
 
 fn bounded_metadata(value: &str) -> bool {

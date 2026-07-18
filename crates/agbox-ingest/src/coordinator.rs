@@ -18,10 +18,12 @@ use agbox_adapters::{
 };
 use agbox_core::{ContentRef, EventPayload, PrivacyLabel, ProjectId, Provider, SourceObservation};
 use agbox_store::{
-    ContentRefWrite, CursorState, EvidenceLink, EvidenceOwner, EvidenceWrite, IngestionChunk,
-    IngestionFault, MAX_BATCH_BYTES, MAX_BATCH_RECORDS, ReadStore, SchemaFingerprintUpdate,
-    StoreError, WriterHandle, stable_content_ref_id,
+    ContentRefWrite, CursorState, EvidenceLink, EvidenceOwner, EvidenceWrite, GraphActionRow,
+    GraphArtifactRow, GraphFinishRow, GraphRunRow, GraphSessionContextRow, GraphWriteBatch,
+    IngestionChunk, IngestionFault, MAX_BATCH_BYTES, MAX_BATCH_RECORDS, ReadStore,
+    SchemaFingerprintUpdate, StoreError, WriterHandle, stable_content_ref_id,
 };
+use agbox_workgraph::{CommittedEvent, GraphMutation, ReducedFact};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Notify;
 
@@ -89,6 +91,8 @@ pub enum IngestError {
     WatcherStopped,
     #[error("injected retryable ingestion failure")]
     InjectedRetry(RetryClass),
+    #[error("graph mutation is invalid")]
+    InvalidGraphMutation,
 }
 
 impl fmt::Debug for IngestError {
@@ -106,8 +110,217 @@ impl fmt::Debug for IngestError {
             Self::WorkerStopped => "WorkerStopped",
             Self::WatcherStopped => "WatcherStopped",
             Self::InjectedRetry(_) => "InjectedRetry",
+            Self::InvalidGraphMutation => "InvalidGraphMutation",
         })
     }
+}
+
+/// Translates a pure workgraph mutation into the store-owned persistence DTO.
+///
+/// The boundary is intentionally one-way: store signatures never name a
+/// workgraph type.
+///
+/// # Errors
+///
+/// Returns [`IngestError::InvalidGraphMutation`] when the mutation has no
+/// committed watermark or a deterministic store identifier cannot be built.
+#[allow(clippy::too_many_lines)]
+pub fn graph_write_batch(mutation: GraphMutation) -> Result<GraphWriteBatch, IngestError> {
+    let next_event_seq = mutation
+        .through_event_seq
+        .ok_or(IngestError::InvalidGraphMutation)?;
+    let next_event_id = mutation
+        .through_event_id
+        .ok_or(IngestError::InvalidGraphMutation)?;
+    let mut batch = GraphWriteBatch {
+        reducer_name: "deterministic-facts-v1".to_owned(),
+        expected_event_seq: mutation.expected_event_seq,
+        next_event_seq,
+        next_event_id,
+        runs: Vec::new(),
+        contexts: Vec::new(),
+        actions: Vec::new(),
+        artifacts: Vec::new(),
+        finishes: Vec::new(),
+    };
+    for fact in mutation.facts {
+        match fact {
+            ReducedFact::AgentRunStarted {
+                project_id,
+                session_id,
+                provider,
+                native_agent_id,
+                observed_at,
+                evidence,
+            } => batch.runs.push(GraphRunRow {
+                run_id: stable_graph_id(
+                    "run",
+                    &[
+                        project_id.as_str(),
+                        session_id.as_str(),
+                        provider.as_str(),
+                        &native_agent_id,
+                    ],
+                ),
+                project_id,
+                provider,
+                session_id,
+                observed_at,
+                finished: false,
+                succeeded: None,
+                evidence_event_id: evidence,
+            }),
+            ReducedFact::AgentRunFinished {
+                project_id,
+                session_id,
+                provider,
+                native_agent_id,
+                succeeded,
+                observed_at,
+                evidence,
+            } => batch.runs.push(GraphRunRow {
+                run_id: stable_graph_id(
+                    "run",
+                    &[
+                        project_id.as_str(),
+                        session_id.as_str(),
+                        provider.as_str(),
+                        &native_agent_id,
+                    ],
+                ),
+                project_id,
+                provider,
+                session_id,
+                observed_at,
+                finished: true,
+                succeeded: Some(succeeded),
+                evidence_event_id: evidence,
+            }),
+            ReducedFact::SessionContext {
+                project_id,
+                session_id,
+                branch_hash,
+                evidence,
+            } => batch.contexts.push(GraphSessionContextRow {
+                project_id,
+                session_id,
+                branch_hash,
+                evidence_event_id: evidence,
+            }),
+            ReducedFact::Artifact {
+                project_id,
+                session_id,
+                path_hash,
+                project_relative_path,
+                operation,
+                content_hash,
+                observed_at,
+                evidence,
+            } => {
+                let work_id = agbox_core::WorkId::parse_wire(&stable_graph_id(
+                    "work",
+                    &[project_id.as_str(), session_id.as_str()],
+                ))
+                .ok_or(IngestError::InvalidGraphMutation)?;
+                batch.artifacts.push(GraphArtifactRow {
+                    artifact_id: stable_graph_id(
+                        "artifact",
+                        &[evidence.as_str(), path_hash.as_str()],
+                    ),
+                    work_id,
+                    project_id,
+                    path_hash,
+                    project_relative_path,
+                    content_hash,
+                    operation,
+                    observed_at,
+                    evidence_event_id: evidence,
+                });
+            }
+            ReducedFact::ActionRequested {
+                project_id,
+                session_id,
+                native_action_id,
+                tool_name,
+                input_hash,
+                redacted_input,
+                evidence,
+            } => batch.actions.push(GraphActionRow {
+                project_id,
+                session_id,
+                native_action_id,
+                request_event_id: evidence,
+                tool_name,
+                input_hash,
+                redacted_command: redacted_input,
+            }),
+            ReducedFact::ActionFinishedObserved {
+                project_id,
+                session_id,
+                native_action_id,
+                succeeded,
+                observed_at,
+                evidence,
+            }
+            | ReducedFact::Verification {
+                project_id,
+                session_id,
+                native_action_id,
+                succeeded,
+                observed_at,
+                evidence,
+                ..
+            } => batch.finishes.push(GraphFinishRow {
+                verification_id: stable_graph_id("verification", &[evidence.as_str()]),
+                project_id,
+                session_id,
+                native_action_id,
+                succeeded,
+                basis: "structured_tool_result".to_owned(),
+                finish_event_id: evidence,
+                observed_at,
+            }),
+            ReducedFact::HumanObjective { .. }
+            | ReducedFact::HumanConstraint { .. }
+            | ReducedFact::AgentStatement { .. } => {}
+        }
+    }
+    batch.validate()?;
+    Ok(batch)
+}
+
+/// Loads one bounded store page and translates it into the workgraph's pure
+/// committed-event input.
+///
+/// # Errors
+///
+/// Returns a store read or bounded decoding error.
+pub async fn reducer_events_after(
+    read: &ReadStore,
+    through_event_seq: u64,
+    max_events: usize,
+    max_bytes: usize,
+) -> Result<Vec<CommittedEvent>, IngestError> {
+    Ok(read
+        .events_after(through_event_seq, max_events, max_bytes)
+        .await?
+        .into_iter()
+        .map(|stored| CommittedEvent {
+            event_seq: stored.event_seq,
+            event: stored.event,
+        })
+        .collect())
+}
+
+fn stable_graph_id(prefix: &str, parts: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"agbox.graph.id.v1");
+    hasher.update(prefix.as_bytes());
+    for part in parts {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("{prefix}_{}", &hasher.finalize().to_hex()[..24])
 }
 
 impl From<VerifiedOpenError> for IngestError {

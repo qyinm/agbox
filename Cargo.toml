@@ -23,6 +23,7 @@ expect_used = "deny"
 agbox-adapters = { path = "crates/agbox-adapters" }
 agbox-core = { path = "crates/agbox-core" }
 agbox-store = { path = "crates/agbox-store" }
+agbox-workgraph = { path = "crates/agbox-workgraph" }
 aho-corasick = "1"
 anyhow = "1"
 async-trait = "0.1"

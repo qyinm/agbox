@@ -288,6 +288,16 @@ pub mod test_support {
             &self.database_path
         }
 
+        #[must_use]
+        pub fn read_store(&self) -> &ReadStore {
+            self.store.read()
+        }
+
+        #[must_use]
+        pub fn writer(&self) -> &agbox_store::WriterHandle {
+            self.store.writer()
+        }
+
         pub fn health(&self) -> Result<SourceHealth, IngestError> {
             self.coordinator.source_health(&self.key)
         }
@@ -394,4 +404,5 @@ pub mod test_support {
 pub use coordinator::{
     CoordinatorSource, IngestError, IngestionCoordinator, IngestionRuntime, ProcessReport,
     RetryClass, RetryClock, RetryPolicy, SourceHealth, TokioRetryClock, WorkLease,
+    graph_write_batch, reducer_events_after,
 };

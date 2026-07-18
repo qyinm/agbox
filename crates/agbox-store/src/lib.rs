@@ -13,12 +13,18 @@ use rusqlite::Connection;
 pub use crypto::MemoryKeyProvider;
 pub use crypto::{CryptoError, KeyProvider, KeyringKeyProvider, open, seal};
 pub use evidence::{EvidenceContext, EvidenceError, EvidenceOwnerRef, EvidenceVault};
-pub use read::{READ_POOL_SIZE, ReadPool, ReadStore};
+#[cfg(feature = "test-support")]
+pub use read::GraphCounts;
+pub use read::{
+    MAX_EVENT_PAGE_BYTES, MAX_EVENT_PAGE_ROWS, READ_POOL_SIZE, ReadPool, ReadStore, StoredEvent,
+};
 pub use writer::{
     CommitReceipt, CommitSubmission, ContentRefWrite, CursorState, EvidenceLink, EvidenceOwner,
-    EvidenceWrite, IngestionChunk, IngestionFault, MAX_BATCH_BYTES, MAX_BATCH_RECORDS,
-    SchemaFingerprintUpdate, SourceRegistration, SourceRegistrationReceipt, WRITER_QUEUE_CAPACITY,
-    WriterHandle, stable_content_ref_id,
+    EvidenceWrite, GraphActionRow, GraphApplyReceipt, GraphArtifactRow, GraphFinishRow,
+    GraphRunRow, GraphSessionContextRow, GraphWriteBatch, IngestionChunk, IngestionFault,
+    MAX_BATCH_BYTES, MAX_BATCH_RECORDS, MAX_GRAPH_FACTS, SchemaFingerprintUpdate,
+    SourceRegistration, SourceRegistrationReceipt, WRITER_QUEUE_CAPACITY, WriterHandle,
+    stable_content_ref_id,
 };
 
 #[derive(thiserror::Error)]
@@ -49,6 +55,8 @@ pub enum StoreError {
     InvalidReference,
     #[error("cursor conflict")]
     CursorConflict,
+    #[error("reducer watermark conflict")]
+    ReducerWatermarkConflict,
     #[error("immutable row conflict")]
     ImmutableConflict,
     #[error("writer stopped")]
@@ -75,6 +83,7 @@ impl fmt::Debug for StoreError {
             Self::ProjectMismatch => "ProjectMismatch",
             Self::InvalidReference => "InvalidReference",
             Self::CursorConflict => "CursorConflict",
+            Self::ReducerWatermarkConflict => "ReducerWatermarkConflict",
             Self::ImmutableConflict => "ImmutableConflict",
             Self::WriterStopped => "WriterStopped",
             Self::ReaderStopped => "ReaderStopped",

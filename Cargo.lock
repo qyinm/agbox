@@ -49,6 +49,7 @@ dependencies = [
  "agbox-adapters",
  "agbox-core",
  "agbox-store",
+ "agbox-workgraph",
  "blake3",
  "notify",
  "proptest",
@@ -73,6 +74,7 @@ dependencies = [
  "keyring",
  "rusqlite",
  "rustix",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -80,6 +82,17 @@ dependencies = [
  "tokio",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "agbox-workgraph"
+version = "0.2.0"
+dependencies = [
+ "agbox-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
 ]
 
 [[package]]

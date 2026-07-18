@@ -6,12 +6,37 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use agbox_core::{
+    ActivityEventDraft, ActivityEventV1, Actor, EventId, EventPayload, PrivacyLabel, ProjectId,
+    SemanticKey, SessionId, SourceRef,
+};
 use rusqlite::{OpenFlags, OptionalExtension};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{CursorState, StoreError, fs_security};
 
 pub const READ_POOL_SIZE: usize = 4;
+pub const MAX_EVENT_PAGE_ROWS: usize = agbox_core::limits::MAX_BATCH_RECORDS;
+pub const MAX_EVENT_PAGE_BYTES: usize = agbox_core::limits::MAX_BATCH_SEMANTIC_BYTES;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredEvent {
+    pub event_seq: u64,
+    pub event: ActivityEventV1,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraphCounts {
+    pub projects: u64,
+    pub runs: u64,
+    pub actions: u64,
+    pub artifacts: u64,
+    pub verifications: u64,
+    pub evidence: u64,
+    pub evidence_joins: u64,
+}
 
 struct ReadPoolInner {
     connections: Mutex<Vec<rusqlite::Connection>>,
@@ -169,6 +194,70 @@ impl ReadStore {
             .await
     }
 
+    /// Returns a bounded page of committed events ordered by the local event
+    /// sequence.
+    ///
+    /// The sequence is only a local reducer watermark. The returned page is
+    /// clamped to 1,000 rows and four MiB of serialized semantic event data.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, read-pool, database, timestamp, or event decoding
+    /// error.
+    pub async fn events_after(
+        &self,
+        through_event_seq: u64,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<StoredEvent>, StoreError> {
+        if through_event_seq > i64::MAX as u64 || max_events == 0 || max_bytes == 0 {
+            return Err(StoreError::InvalidBatch);
+        }
+        let row_limit = max_events.min(MAX_EVENT_PAGE_ROWS);
+        let byte_limit = max_bytes.min(MAX_EVENT_PAGE_BYTES);
+        self.pool
+            .execute(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT event_seq, event_id, semantic_key, schema_version,
+                            occurred_at, observed_at, project_id, session_id,
+                            turn_id, actor, correlation_id, causation_id,
+                            source_json, payload_json, privacy
+                     FROM activity_events
+                     WHERE event_seq > ?1
+                     ORDER BY event_seq
+                     LIMIT ?2",
+                )?;
+                let mut rows = statement.query(rusqlite::params![
+                    i64::try_from(through_event_seq).map_err(|_| StoreError::InvalidBatch)?,
+                    i64::try_from(row_limit).map_err(|_| StoreError::InvalidBatch)?,
+                ])?;
+                let mut events = Vec::with_capacity(row_limit);
+                let mut semantic_bytes = 0_usize;
+                while let Some(row) = rows.next()? {
+                    let event_seq: i64 = row.get(0)?;
+                    let event = decode_event_row(row)?;
+                    let event_bytes = serde_json::to_vec(&event)?
+                        .len()
+                        .checked_add(size_of::<u64>())
+                        .ok_or(StoreError::InvalidBatch)?;
+                    let next_bytes = semantic_bytes
+                        .checked_add(event_bytes)
+                        .ok_or(StoreError::InvalidBatch)?;
+                    if next_bytes > byte_limit {
+                        break;
+                    }
+                    semantic_bytes = next_bytes;
+                    events.push(StoredEvent {
+                        event_seq: u64::try_from(event_seq)
+                            .map_err(|_| StoreError::InvalidBatch)?,
+                        event,
+                    });
+                }
+                Ok(events)
+            })
+            .await
+    }
+
     /// Returns the number of quarantined records for one source generation.
     ///
     /// # Errors
@@ -259,6 +348,93 @@ impl ReadStore {
             })
             .await
     }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn graph_counts_for_test(&self) -> Result<GraphCounts, StoreError> {
+        self.pool
+            .execute(|connection| {
+                Ok(GraphCounts {
+                    projects: count_table(connection, "projects")?,
+                    runs: count_table(connection, "agent_runs")?,
+                    actions: count_table(connection, "action_facts")?,
+                    artifacts: count_table(connection, "artifacts")?,
+                    verifications: count_table(connection, "verification_facts")?,
+                    evidence: count_table(connection, "evidence_objects")?,
+                    evidence_joins: count_table(connection, "work_evidence")?,
+                })
+            })
+            .await
+    }
+}
+
+fn decode_event_row(row: &rusqlite::Row<'_>) -> Result<ActivityEventV1, StoreError> {
+    let event_id: String = row.get(1)?;
+    let semantic_key: String = row.get(2)?;
+    let schema_version: i64 = row.get(3)?;
+    let occurred_at: String = row.get(4)?;
+    let observed_at: String = row.get(5)?;
+    let project_id: String = row.get(6)?;
+    let session_id: String = row.get(7)?;
+    let actor: String = row.get(9)?;
+    let source_json: String = row.get(12)?;
+    let payload_json: String = row.get(13)?;
+    let privacy: String = row.get(14)?;
+    ActivityEventV1::new(ActivityEventDraft {
+        event_id: EventId::parse_wire(&event_id).ok_or(StoreError::InvalidBatch)?,
+        semantic_key: SemanticKey::parse_wire(&semantic_key).ok_or(StoreError::InvalidBatch)?,
+        schema_version: u16::try_from(schema_version).map_err(|_| StoreError::InvalidBatch)?,
+        occurred_at: OffsetDateTime::parse(&occurred_at, &Rfc3339)
+            .map_err(|_| StoreError::InvalidBatch)?,
+        observed_at: OffsetDateTime::parse(&observed_at, &Rfc3339)
+            .map_err(|_| StoreError::InvalidBatch)?,
+        project_id: ProjectId::parse_wire(&project_id).ok_or(StoreError::InvalidBatch)?,
+        session_id: SessionId::parse_wire(&session_id).ok_or(StoreError::InvalidBatch)?,
+        turn_id: row.get(8)?,
+        actor: parse_actor(&actor)?,
+        correlation_id: row.get(10)?,
+        causation_id: row.get(11)?,
+        source: serde_json::from_str::<SourceRef>(&source_json)?,
+        payload: serde_json::from_str::<EventPayload>(&payload_json)?,
+        privacy: parse_privacy(&privacy)?,
+    })
+    .map_err(|_| StoreError::InvalidBatch)
+}
+
+fn parse_actor(value: &str) -> Result<Actor, StoreError> {
+    match value {
+        "human" => Ok(Actor::Human),
+        "agent" => Ok(Actor::Agent),
+        "tool" => Ok(Actor::Tool),
+        "system" => Ok(Actor::System),
+        _ => Err(StoreError::InvalidBatch),
+    }
+}
+
+fn parse_privacy(value: &str) -> Result<PrivacyLabel, StoreError> {
+    match value {
+        "restricted_local" => Ok(PrivacyLabel::RestrictedLocal),
+        "private_local" => Ok(PrivacyLabel::PrivateLocal),
+        "derived_local" => Ok(PrivacyLabel::DerivedLocal),
+        "sync_eligible" => Ok(PrivacyLabel::SyncEligible),
+        _ => Err(StoreError::InvalidBatch),
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn count_table(connection: &rusqlite::Connection, table: &'static str) -> Result<u64, StoreError> {
+    let query = match table {
+        "projects" => "SELECT count(*) FROM projects",
+        "agent_runs" => "SELECT count(*) FROM agent_runs",
+        "action_facts" => "SELECT count(*) FROM action_facts",
+        "artifacts" => "SELECT count(*) FROM artifacts",
+        "verification_facts" => "SELECT count(*) FROM verification_facts",
+        "evidence_objects" => "SELECT count(*) FROM evidence_objects",
+        "work_evidence" => "SELECT count(*) FROM work_evidence",
+        _ => return Err(StoreError::InvalidBatch),
+    };
+    let value: i64 = connection.query_row(query, [], |row| row.get(0))?;
+    u64::try_from(value).map_err(|_| StoreError::InvalidBatch)
 }
 
 fn validate_source_generation(source_id: &str, generation: u64) -> Result<(), StoreError> {
