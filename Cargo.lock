@@ -89,6 +89,7 @@ name = "agbox-workgraph"
 version = "0.2.0"
 dependencies = [
  "agbox-core",
+ "blake3",
  "serde",
  "serde_json",
  "thiserror",

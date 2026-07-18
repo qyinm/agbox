@@ -113,7 +113,7 @@ impl fmt::Debug for ReducedFact {
         formatter
             .debug_struct("ReducedFact")
             .field("kind", &self.kind())
-            .field("evidence", self.evidence())
+            .field("evidence", self.evidence_id())
             .finish_non_exhaustive()
     }
 }
@@ -135,7 +135,8 @@ impl ReducedFact {
         }
     }
 
-    fn evidence(&self) -> &EventId {
+    #[must_use]
+    pub fn evidence_id(&self) -> &EventId {
         match self {
             Self::AgentRunStarted { evidence, .. }
             | Self::AgentRunFinished { evidence, .. }
