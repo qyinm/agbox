@@ -222,7 +222,7 @@ impl ReadStore {
                  WHERE w.project_id = ?1
                    AND (?2 IS NULL OR w.status = ?2)
                    AND r.revision = (SELECT max(r2.revision) FROM work_contract_revisions r2 WHERE r2.work_id = w.work_id)
-                 ORDER BY r.revision DESC, w.updated_at DESC
+                 ORDER BY r.created_at DESC, r.revision DESC, w.work_id ASC
                  LIMIT ?3",
             )?;
             let rows = statement.query_map(rusqlite::params![project.as_str(), status, i64::from(limit)], |row| {
@@ -686,17 +686,24 @@ fn work_status_wire(value: WorkStatus) -> &'static str {
 ///
 /// Returns [`StoreError::InvalidBatch`] for empty or over-limit text.
 pub fn fts_literal_query(query: &str) -> Result<String, StoreError> {
-    if query.is_empty() || query.len() > 1024 || !query.is_char_boundary(query.len()) {
+    if query.is_empty() || query.len() > 1024 {
         return Err(StoreError::InvalidBatch);
     }
     let terms = query
         .split_whitespace()
         .filter_map(|term| {
-            let clipped: String = term
-                .chars()
-                .take_while(|c| !c.is_control())
-                .take(64)
-                .collect();
+            let mut end = 0;
+            for (offset, character) in term.char_indices() {
+                if character.is_control() {
+                    break;
+                }
+                let next = offset + character.len_utf8();
+                if next > 64 {
+                    break;
+                }
+                end = next;
+            }
+            let clipped = &term[..end];
             (!clipped.is_empty()).then_some(clipped)
         })
         .take(16)

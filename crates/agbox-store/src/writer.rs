@@ -1515,7 +1515,7 @@ impl WriterHandle {
             || !bounded_identifier(work_id.as_str())
             || value.is_empty()
             || value.len() > agbox_core::limits::MAX_INLINE_BYTES
-            || !correction_field(&field).is_some()
+            || correction_field(&field).is_none()
         {
             return Err(StoreError::InvalidBatch);
         }
@@ -1678,6 +1678,10 @@ impl WriterHandle {
 
     /// Marks at most 256 expired evidence blobs as delete-pending and queues
     /// their contained deletion. Metadata remains available until unlink.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded database or timestamp validation error.
     pub async fn run_retention(
         &self,
         observed_at: OffsetDateTime,
@@ -1692,6 +1696,10 @@ impl WriterHandle {
 
     /// Removes at most 256 aged, owner-validated vault files which have no
     /// corresponding evidence metadata row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded database or vault traversal error.
     pub async fn cleanup_orphans(
         &self,
         observed_at: OffsetDateTime,
@@ -2868,7 +2876,7 @@ fn forget(
     let inserted = if let Some(work_id) = &work_id {
         // Work forget may remove only work-owned evidence. Event evidence can
         // be shared across works and is immutable source provenance.
-        transaction.execute("INSERT OR IGNORE INTO evidence_delete_queue(deletion_job_id,evidence_id,project_hash,attempts,state,created_at) SELECT ?3,e.evidence_id,?4,0,'pending',?5 FROM evidence_objects e WHERE e.project_id = ?1 AND e.owner_kind = 'work' AND e.owner_id = ?2", params![scope_project.as_str(), work_id.as_str(), job, project_hash, timestamp])?
+        transaction.execute("INSERT OR IGNORE INTO evidence_delete_queue(deletion_job_id,evidence_id,project_hash,attempts,state,created_at) SELECT ?3,e.evidence_id,?4,0,'pending',?5 FROM evidence_objects e WHERE e.project_id = ?1 AND e.owner_kind = 'work' AND e.owner_id = ?2 AND NOT EXISTS (SELECT 1 FROM work_evidence other WHERE other.evidence_id = e.evidence_id AND other.work_id <> ?2)", params![scope_project.as_str(), work_id.as_str(), job, project_hash, timestamp])?
     } else {
         transaction.execute("INSERT OR IGNORE INTO evidence_delete_queue(deletion_job_id,evidence_id,project_hash,attempts,state,created_at) SELECT ?2,evidence_id,?3,0,'pending',?4 FROM evidence_objects WHERE project_id = ?1", params![scope_project.as_str(), job, project_hash, timestamp])?
     };

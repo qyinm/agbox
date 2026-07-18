@@ -268,7 +268,7 @@ impl EvidenceVault {
             let age = now
                 .duration_since(entry.metadata()?.modified()?)
                 .unwrap_or(Duration::ZERO);
-            if age >= Duration::from_secs(24 * 60 * 60) {
+            if age >= Duration::from_hours(24) {
                 candidates.push(id);
             }
         }

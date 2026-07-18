@@ -10,7 +10,7 @@ use agbox_core::{
 };
 use agbox_store::{
     AuditRecord, EvidenceContext, EvidenceMetadata, EvidenceOwnerRef, EvidenceVault, ForgetOutcome,
-    ForgetTarget, ReadStore, StoreError, WriterHandle,
+    ForgetTarget, HumanCorrectionReceipt, ReadStore, StoreError, WriterHandle,
 };
 use async_trait::async_trait;
 use time::OffsetDateTime;
@@ -132,10 +132,19 @@ pub trait StoreWriter: Send + Sync {
     async fn record_audit(&self, record: AuditRecord) -> Result<(), StoreError>;
     async fn forget(
         &self,
+        project: &ProjectId,
         target: ForgetTarget,
         actor: &'static str,
         observed_at: OffsetDateTime,
     ) -> Result<ForgetOutcome, StoreError>;
+    async fn correct(
+        &self,
+        project: &ProjectId,
+        work_id: WorkId,
+        field: &'static str,
+        value: String,
+        observed_at: OffsetDateTime,
+    ) -> Result<HumanCorrectionReceipt, StoreError>;
 }
 
 #[async_trait]
@@ -145,15 +154,34 @@ impl StoreWriter for WriterHandle {
     }
     async fn forget(
         &self,
+        project: &ProjectId,
         target: ForgetTarget,
         actor: &'static str,
         observed_at: OffsetDateTime,
     ) -> Result<ForgetOutcome, StoreError> {
-        self.forget(target, actor, observed_at).await
+        self.forget_in_project(project, target, actor, observed_at)
+            .await
+    }
+    async fn correct(
+        &self,
+        project: &ProjectId,
+        work_id: WorkId,
+        field: &'static str,
+        value: String,
+        observed_at: OffsetDateTime,
+    ) -> Result<HumanCorrectionReceipt, StoreError> {
+        self.apply_human_correction(project.clone(), work_id, field.into(), value, observed_at)
+            .await
     }
 }
 
 pub trait EvidenceReader: Send + Sync {
+    /// Reads one same-project evidence object using its stored owner context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::Evidence`] when the owner context is incomplete
+    /// or the vault cannot authenticate/read the object.
     fn get(
         &self,
         evidence_id: &EvidenceId,
@@ -207,6 +235,13 @@ where
     W: StoreWriter,
     V: EvidenceReader,
 {
+    /// Dispatches one request under a verified, immutable project scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded validation, authorization, storage, or evidence error;
+    /// unknown same-project identifiers are represented as `NotFound`.
+    #[allow(clippy::single_match_else, clippy::too_many_lines)]
     pub async fn handle(
         &self,
         scope: RequestScope,
@@ -227,12 +262,23 @@ where
             AppRequest::GetWork { work_id } => {
                 match self.reader.work(scope.project_id(), &work_id).await? {
                     Some(value) => {
-                        self.audit(&scope, "handoff.work.read", Some(work_id), "ok")
-                            .await?;
                         ensure_detail_size(&value)?;
+                        self.audit_detail(
+                            &scope,
+                            "handoff.work.read",
+                            Some(work_id),
+                            Some(value.contract_id.clone()),
+                            Some(value.revision),
+                            "ok",
+                        )
+                        .await?;
                         Ok(AppResponse::Work(Box::new(value)))
                     }
-                    None => Ok(AppResponse::NotFound),
+                    None => {
+                        self.audit(&scope, "handoff.work.read", Some(work_id), "not_found")
+                            .await?;
+                        Ok(AppResponse::NotFound)
+                    }
                 }
             }
             AppRequest::CurrentWork => {
@@ -250,14 +296,29 @@ where
                 match selected.into_iter().next() {
                     Some(row) => match self.reader.work(scope.project_id(), &row.work_id).await? {
                         Some(value) => {
-                            self.audit(&scope, "handoff.work.read", Some(row.work_id), "ok")
-                                .await?;
                             ensure_detail_size(&value)?;
+                            self.audit_detail(
+                                &scope,
+                                "handoff.work.read",
+                                Some(row.work_id),
+                                Some(value.contract_id.clone()),
+                                Some(value.revision),
+                                "ok",
+                            )
+                            .await?;
                             Ok(AppResponse::Work(Box::new(value)))
                         }
-                        None => Ok(AppResponse::NotFound),
+                        None => {
+                            self.audit(&scope, "handoff.work.read", Some(row.work_id), "not_found")
+                                .await?;
+                            Ok(AppResponse::NotFound)
+                        }
                     },
-                    None => Ok(AppResponse::NotFound),
+                    None => {
+                        self.audit(&scope, "handoff.work.read", None, "not_found")
+                            .await?;
+                        Ok(AppResponse::NotFound)
+                    }
                 }
             }
             AppRequest::SearchWork { query, limit } => {
@@ -272,7 +333,7 @@ where
                 Ok(AppResponse::Search(bounded_page(rows)?))
             }
             AppRequest::ForgetWork { work_id } => {
-                self.require_cli(&scope)?;
+                Self::require_cli(&scope)?;
                 if self
                     .reader
                     .work(scope.project_id(), &work_id)
@@ -284,6 +345,7 @@ where
                 let _ = self
                     .writer
                     .forget(
+                        scope.project_id(),
                         ForgetTarget::Work(work_id),
                         "human_cli",
                         OffsetDateTime::now_utc(),
@@ -292,10 +354,11 @@ where
                 Ok(AppResponse::Accepted)
             }
             AppRequest::ForgetProject => {
-                self.require_cli(&scope)?;
+                Self::require_cli(&scope)?;
                 let _ = self
                     .writer
                     .forget(
+                        scope.project_id(),
                         ForgetTarget::Project(scope.project_id().clone()),
                         "human_cli",
                         OffsetDateTime::now_utc(),
@@ -303,14 +366,56 @@ where
                     .await?;
                 Ok(AppResponse::Accepted)
             }
-            // A correction must create new immutable HumanIntent evidence and
-            // a new contract revision. Fail closed until that writer operation
-            // exists rather than claiming an unstored correction succeeded.
-            AppRequest::CorrectWork { .. } => Err(ServiceError::OperationDenied),
+            AppRequest::CorrectWork {
+                work_id,
+                field,
+                value,
+            } => {
+                if !matches!(
+                    scope.actor(),
+                    RequestActor::HumanCli | RequestActor::HumanTui
+                ) {
+                    self.audit(&scope, "handoff.correction", Some(work_id), "denied")
+                        .await?;
+                    return Err(ServiceError::OperationDenied);
+                }
+                if value.is_empty() || value.len() > agbox_core::limits::MAX_INLINE_BYTES {
+                    self.audit(&scope, "handoff.correction", Some(work_id), "invalid")
+                        .await?;
+                    return Err(ServiceError::InvalidRequest);
+                }
+                let Some(previous) = self.reader.work(scope.project_id(), &work_id).await? else {
+                    self.audit(&scope, "handoff.correction", Some(work_id), "not_found")
+                        .await?;
+                    return Ok(AppResponse::NotFound);
+                };
+                let field_name = correction_field_name(field);
+                let receipt = self
+                    .writer
+                    .correct(
+                        scope.project_id(),
+                        work_id,
+                        field_name,
+                        value,
+                        OffsetDateTime::now_utc(),
+                    )
+                    .await?;
+                self.audit_detail(
+                    &scope,
+                    "handoff.correction",
+                    Some(previous.work_id),
+                    Some(receipt.contract_id),
+                    Some(receipt.revision),
+                    "accepted",
+                )
+                .await?;
+                Ok(AppResponse::Accepted)
+            }
             AppRequest::Health => Ok(AppResponse::Health(HealthSnapshot { ready: true })),
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn evidence(
         &self,
         scope: RequestScope,
@@ -322,34 +427,101 @@ where
             .evidence_owner(scope.project_id(), &evidence_id)
             .await?
         else {
+            self.audit(&scope, "handoff.evidence.read", None, "not_found")
+                .await?;
             return Ok(AppResponse::NotFound);
         };
-        self.audit(&scope, "handoff.evidence.read", owner.work_id.clone(), "ok")
-            .await?;
+        let owner_work_id = owner.work_id.clone();
         match disclosure {
-            EvidenceDisclosure::Redacted => Ok(AppResponse::Evidence(view_redacted(owner))),
+            EvidenceDisclosure::Redacted => {
+                self.audit_detail(
+                    &scope,
+                    "handoff.evidence.read",
+                    owner_work_id.clone(),
+                    owner.contract_id.clone(),
+                    owner.revision,
+                    "ok",
+                )
+                .await?;
+                Ok(AppResponse::Evidence(view_redacted(owner)))
+            }
             EvidenceDisclosure::AuthorizedRaw
                 if matches!(scope.actor(), RequestActor::HumanCli) =>
             {
                 if !matches!(owner.availability, EvidenceAvailability::Available) {
+                    self.audit_detail(
+                        &scope,
+                        "handoff.evidence.raw",
+                        owner_work_id.clone(),
+                        owner.contract_id.clone(),
+                        owner.revision,
+                        "unavailable",
+                    )
+                    .await?;
                     return Ok(AppResponse::Evidence(view_redacted(owner)));
                 }
-                let raw = self.vault.get(&evidence_id, &owner)?;
-                if raw.len() > MAX_EVIDENCE_RESPONSE_BYTES {
-                    return Err(ServiceError::EvidenceUnavailable);
-                }
-                self.audit(&scope, "handoff.evidence.raw", owner.work_id.clone(), "ok")
-                    .await?;
-                Ok(AppResponse::Evidence(EvidenceView {
+                let raw = match self.vault.get(&evidence_id, &owner) {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        self.audit_detail(
+                            &scope,
+                            "handoff.evidence.raw",
+                            owner_work_id.clone(),
+                            owner.contract_id.clone(),
+                            owner.revision,
+                            "failed",
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                };
+                let view = EvidenceView {
                     evidence_id,
                     media_type: owner.media_type,
                     untrusted_data: true,
                     availability: owner.availability,
                     redacted_preview: owner.redacted_preview,
                     raw: Some(raw),
-                }))
+                };
+                if serde_json::to_vec(&view)
+                    .map_err(|_| ServiceError::EvidenceUnavailable)?
+                    .len()
+                    > MAX_EVIDENCE_RESPONSE_BYTES
+                {
+                    self.audit_detail(
+                        &scope,
+                        "handoff.evidence.raw",
+                        owner_work_id.clone(),
+                        owner.contract_id.clone(),
+                        owner.revision,
+                        "too_large",
+                    )
+                    .await?;
+                    return Err(ServiceError::EvidenceUnavailable);
+                }
+                self.audit_detail(
+                    &scope,
+                    "handoff.evidence.raw",
+                    owner_work_id.clone(),
+                    owner.contract_id.clone(),
+                    owner.revision,
+                    "ok",
+                )
+                .await?;
+                Ok(AppResponse::Evidence(view))
             }
-            EvidenceDisclosure::AuthorizedRaw => Err(ServiceError::DisclosureDenied),
+            EvidenceDisclosure::AuthorizedRaw => {
+                self.audit_detail(
+                    &scope,
+                    "handoff.evidence.raw",
+                    owner_work_id.clone(),
+                    owner.contract_id.clone(),
+                    owner.revision,
+                    "denied",
+                )
+                .await?;
+                Err(ServiceError::DisclosureDenied)
+            }
         }
     }
     async fn audit(
@@ -359,11 +531,26 @@ where
         work_id: Option<WorkId>,
         result: &'static str,
     ) -> Result<(), ServiceError> {
+        self.audit_detail(scope, kind, work_id, None, None, result)
+            .await
+    }
+    async fn audit_detail(
+        &self,
+        scope: &RequestScope,
+        kind: &'static str,
+        work_id: Option<WorkId>,
+        contract_id: Option<agbox_core::ContractId>,
+        revision: Option<u64>,
+        result: &'static str,
+    ) -> Result<(), ServiceError> {
         self.writer
             .record_audit(AuditRecord {
                 kind,
                 project_id: scope.project_id().clone(),
                 work_id,
+                contract_id,
+                revision,
+                provider: provider_name(scope.actor()),
                 actor: actor_name(scope.actor()),
                 result,
                 observed_at: OffsetDateTime::now_utc(),
@@ -371,7 +558,7 @@ where
             .await?;
         Ok(())
     }
-    fn require_cli(&self, scope: &RequestScope) -> Result<(), ServiceError> {
+    fn require_cli(scope: &RequestScope) -> Result<(), ServiceError> {
         if matches!(scope.actor(), RequestActor::HumanCli) {
             Ok(())
         } else {
@@ -396,6 +583,23 @@ fn actor_name(actor: RequestActor) -> &'static str {
         RequestActor::HumanTui => "human_tui",
         RequestActor::Agent(Provider::Claude) => "agent_claude",
         RequestActor::Agent(Provider::Codex) => "agent_codex",
+    }
+}
+fn provider_name(actor: RequestActor) -> Option<&'static str> {
+    match actor {
+        RequestActor::Agent(Provider::Claude) => Some("claude"),
+        RequestActor::Agent(Provider::Codex) => Some("codex"),
+        RequestActor::HumanCli | RequestActor::HumanTui => None,
+    }
+}
+fn correction_field_name(field: agbox_core::api::CorrectableField) -> &'static str {
+    match field {
+        agbox_core::api::CorrectableField::Objective => "objective",
+        agbox_core::api::CorrectableField::Summary => "summary",
+        agbox_core::api::CorrectableField::NextAction => "next_action",
+        agbox_core::api::CorrectableField::Blocker => "blocker",
+        agbox_core::api::CorrectableField::Constraint => "constraint",
+        agbox_core::api::CorrectableField::CompletionCriterion => "completion_criterion",
     }
 }
 fn bounded_page<T: serde::Serialize>(rows: Vec<T>) -> Result<BoundedPage<T>, ServiceError> {
@@ -429,7 +633,9 @@ fn ensure_detail_size(value: &WorkDetail) -> Result<(), ServiceError> {
 
 #[cfg(feature = "test-support")]
 pub mod test_support {
-    use super::*;
+    use super::{ProjectId, RequestActor, RequestScope};
+
+    #[must_use]
     pub fn scope(project_id: ProjectId, actor: RequestActor) -> RequestScope {
         RequestScope::verified(project_id, actor)
     }

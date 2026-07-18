@@ -208,7 +208,7 @@ impl std::fmt::Debug for EvidenceView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EvidenceView")
             .field("evidence_id", &self.evidence_id)
-            .field("media_type", &self.media_type)
+            .field("media_type_bytes", &self.media_type.len())
             .field("untrusted_data", &self.untrusted_data)
             .field("availability", &self.availability)
             .field("preview_bytes", &self.redacted_preview.len())

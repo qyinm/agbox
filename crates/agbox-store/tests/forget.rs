@@ -44,6 +44,9 @@ fn hostile_fts_syntax_becomes_bounded_literal_terms() {
     );
     assert!(fts_literal_query("   ").is_err());
     assert!(fts_literal_query(&"a ".repeat(600)).is_err());
+    let unicode = fts_literal_query(&format!("{} tail", "한".repeat(40))).unwrap();
+    let first_term = unicode.split('"').nth(1).unwrap();
+    assert!(first_term.len() <= 64);
 }
 
 #[tokio::test]
