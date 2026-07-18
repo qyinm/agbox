@@ -184,12 +184,13 @@ impl ProvisionalContractBuilder {
         apply_action_facts(&mut draft, facts, &policy)?;
         draft.normalize();
         let activity_changed = draft.activity_projection() != previous_activity;
+        let new_active_observation = draft.projection_state.observe_active_facts(facts);
         let authoritative_changed =
             draft.projection_state.authoritative_digest() != previous_authoritative;
         let new_authoritative_success =
             authoritative_changed && facts.iter().any(ReducedFact::successful_structured_result);
         if previous.is_some_and(|contract| contract.status == WorkStatus::Completed)
-            && activity_changed
+            && (activity_changed || new_active_observation)
             && !new_authoritative_success
         {
             draft.projection_state.completion_reopened = true;
@@ -295,6 +296,16 @@ struct ProjectionState {
     actions: BTreeMap<String, ActionProjection>,
     #[serde(default)]
     completion_reopened: bool,
+    #[serde(default)]
+    latest_active_observation: Option<ActiveObservationKey>,
+    #[serde(default)]
+    unordered_active_identity_watermark: BTreeSet<EventId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct ActiveObservationKey {
+    observed_at: OffsetDateTime,
+    evidence: EventId,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -331,6 +342,35 @@ impl ProjectionState {
             .values()
             .filter_map(|action| action.authoritative.as_ref())
             .any(|outcome| !outcome.succeeded)
+    }
+
+    fn observe_active_facts(&mut self, facts: &[ReducedFact]) -> bool {
+        let mut observed_new_identity = false;
+        for fact in facts.iter().filter(|fact| fact.active_work()) {
+            if let Some(observed_at) = fact.observed_at() {
+                let candidate = ActiveObservationKey {
+                    observed_at,
+                    evidence: fact.evidence_id().clone(),
+                };
+                if self
+                    .latest_active_observation
+                    .as_ref()
+                    .is_none_or(|watermark| &candidate > watermark)
+                {
+                    self.latest_active_observation = Some(candidate);
+                    observed_new_identity = true;
+                }
+            } else {
+                observed_new_identity |= self
+                    .unordered_active_identity_watermark
+                    .insert(fact.evidence_id().clone());
+            }
+        }
+        while self.unordered_active_identity_watermark.len() > agbox_core::limits::MAX_BATCH_RECORDS
+        {
+            self.unordered_active_identity_watermark.pop_first();
+        }
+        observed_new_identity
     }
 }
 

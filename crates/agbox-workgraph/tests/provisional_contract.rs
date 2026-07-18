@@ -103,6 +103,29 @@ fn agent_run_finished(evidence: &str) -> ReducedFact {
     }
 }
 
+fn agent_run_started(evidence: &str) -> ReducedFact {
+    ReducedFact::AgentRunStarted {
+        project_id: project(),
+        session_id: session(),
+        provider: agbox_core::Provider::Codex,
+        native_agent_id: "run-b".into(),
+        observed_at: datetime!(2026-07-17 12:02 UTC),
+        evidence: event_id(evidence),
+    }
+}
+
+fn hash_only_action_request(evidence: &str) -> ReducedFact {
+    ReducedFact::ActionRequested {
+        project_id: project(),
+        session_id: session(),
+        native_action_id: "private-action".into(),
+        tool_name: "shell".into(),
+        input_hash: format!("hash-{evidence}"),
+        redacted_input: None,
+        evidence: event_id(evidence),
+    }
+}
+
 #[test]
 fn provisional_contract_is_useful_without_a_model() {
     let facts = facts_for_active_parser_work();
@@ -267,12 +290,80 @@ fn reopened_completion_stays_active_until_a_new_authoritative_success() {
                 )],
             )
             .unwrap();
-
         assert_eq!(completed.status, WorkStatus::Completed);
         assert_eq!(reopened.status, WorkStatus::Active);
         assert_eq!(neutral.status, WorkStatus::Active, "{neutral_fact:?}");
         assert_eq!(reverified.status, WorkStatus::Completed);
         assert_eq!(reverified.revision, neutral.revision + 1);
+    }
+}
+
+#[test]
+fn provenance_only_active_facts_open_a_new_completion_epoch() {
+    let active_facts = vec![
+        agent_run_started("evt-new-run"),
+        artifact(None, "evt-hash-only-artifact"),
+        hash_only_action_request("evt-hash-only-request"),
+        ReducedFact::HumanObjective {
+            project_id: project(),
+            content_hash: "b3:private-objective".into(),
+            redacted_text: None,
+            observed_at: datetime!(2026-07-17 12:02 UTC),
+            evidence: event_id("evt-hash-only-objective"),
+        },
+        ReducedFact::HumanConstraint {
+            project_id: project(),
+            content_hash: "b3:private-constraint".into(),
+            redacted_text: None,
+            observed_at: datetime!(2026-07-17 12:02 UTC),
+            evidence: event_id("evt-hash-only-constraint"),
+        },
+    ];
+
+    for active_fact in active_facts {
+        let builder = ProvisionalContractBuilder::new("deterministic-v1")
+            .for_work(WorkId::for_test("work-provenance-active"));
+        let completed = builder
+            .build(
+                None,
+                &[action_verification(
+                    "verify",
+                    true,
+                    Some("cargo test"),
+                    datetime!(2026-07-17 12:01 UTC),
+                    "evt-completed-before-private-activity",
+                )],
+            )
+            .unwrap();
+        let reopened = builder
+            .build(Some(&completed), std::slice::from_ref(&active_fact))
+            .unwrap();
+        let neutral = builder
+            .build(Some(&reopened), &[agent_run_finished("evt-neutral-finish")])
+            .unwrap();
+        let reverified = builder
+            .build(
+                Some(&neutral),
+                &[action_verification(
+                    "verify",
+                    true,
+                    Some("cargo test"),
+                    datetime!(2026-07-17 12:04 UTC),
+                    "evt-reverified-private-activity",
+                )],
+            )
+            .unwrap();
+        let replayed_activity = builder
+            .build(Some(&reverified), std::slice::from_ref(&active_fact))
+            .unwrap();
+
+        assert_eq!(completed.status, WorkStatus::Completed);
+        assert_eq!(reopened.status, WorkStatus::Active, "{active_fact:?}");
+        assert_eq!(reopened.revision, completed.revision + 1);
+        assert_eq!(neutral.status, WorkStatus::Active, "{active_fact:?}");
+        assert_eq!(reverified.status, WorkStatus::Completed);
+        assert_eq!(replayed_activity.status, WorkStatus::Completed);
+        assert_eq!(replayed_activity.revision, reverified.revision);
     }
 }
 
