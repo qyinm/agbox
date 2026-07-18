@@ -2924,6 +2924,10 @@ fn forget(
             [work_id.as_str()],
         )?)?;
         deleted(transaction.execute(
+            "DELETE FROM verification_facts WHERE project_id = ?1 AND work_id = ?2",
+            params![scope_project.as_str(), work_id.as_str()],
+        )?)?;
+        deleted(transaction.execute(
             "DELETE FROM work_search WHERE work_id = ?1 AND project_id = ?2",
             params![work_id.as_str(), scope_project.as_str()],
         )?)?;
