@@ -48,7 +48,15 @@ pub struct ProvisionalContract {
     pub confidence_basis_points: u16,
     pub created_at: OffsetDateTime,
     pub extractor_version: String,
+    /// Stable digest of the complete fact slice used for this revision.
+    ///
+    /// This is intentionally independent of the capped display evidence so a
+    /// large aggregate replay remains idempotent.
+    #[serde(default)]
+    pub fact_set_digest: String,
     pub material_content_hash: String,
+    #[serde(default)]
+    projection_state: ProjectionState,
 }
 
 impl ProvisionalContract {
@@ -161,39 +169,34 @@ impl ProvisionalContractBuilder {
             return Err(ContractBuildError::MixedProjects);
         }
 
-        let previous_evidence: BTreeSet<EventId> = previous
-            .map(|contract| {
-                contract
-                    .evidence_refs
-                    .iter()
-                    .take(MAX_CONTRACT_EVIDENCE_REFS)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        let new_facts = facts
-            .iter()
-            .filter(|fact| !previous_evidence.contains(fact.evidence_id()))
-            .collect::<Vec<_>>();
+        let fact_set_digest = fact_set_digest(facts);
+        if let Some(previous) = previous
+            && previous.fact_set_digest == fact_set_digest
+        {
+            return Ok(previous.clone());
+        }
         let policy = RedactionPolicy::new()?;
         let mut draft = MaterialDraft::from_previous(previous);
+        let previous_activity = draft.activity_projection();
+        let previous_authoritative = draft.projection_state.authoritative_digest();
         apply_text_facts(&mut draft, facts, &policy)?;
         apply_artifact_facts(&mut draft, facts, &policy)?;
         apply_action_facts(&mut draft, facts, &policy)?;
-
-        let all_fact_refs;
-        let status_facts = if previous.is_some() {
-            new_facts.as_slice()
-        } else {
-            all_fact_refs = facts.iter().collect::<Vec<_>>();
-            all_fact_refs.as_slice()
-        };
-        if !status_facts.is_empty() {
-            let (status, evidence) =
-                derive_status(status_facts, previous.map(|value| value.status));
-            draft.status = status;
-            draft.field_evidence.insert(ContractField::Status, evidence);
-        }
+        draft.normalize();
+        let activity_changed = draft.activity_projection() != previous_activity;
+        let authoritative_changed =
+            draft.projection_state.authoritative_digest() != previous_authoritative;
+        let (status, status_evidence) = derive_status(
+            &draft.projection_state,
+            facts,
+            previous.map(|value| value.status),
+            activity_changed,
+            authoritative_changed,
+        );
+        draft.status = status;
+        draft
+            .field_evidence
+            .insert(ContractField::Status, status_evidence);
         draft
             .field_evidence
             .entry(ContractField::Status)
@@ -267,9 +270,55 @@ impl ProvisionalContractBuilder {
             confidence_basis_points: 10_000,
             created_at,
             extractor_version: self.extractor_version.clone(),
+            fact_set_digest,
             material_content_hash,
+            projection_state: draft.projection_state,
         })
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct ProjectionState {
+    actions: BTreeMap<String, ActionProjection>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct ActionProjection {
+    request: Option<ProjectedText>,
+    finished: bool,
+    authoritative: Option<ProjectedOutcome>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ProjectedText {
+    text: String,
+    evidence: EventId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ProjectedOutcome {
+    command: Option<String>,
+    succeeded: bool,
+    observed_at: OffsetDateTime,
+    evidence: EventId,
+}
+
+impl ProjectionState {
+    fn authoritative_digest(&self) -> Vec<(String, Option<ProjectedOutcome>)> {
+        self.actions
+            .iter()
+            .map(|(key, action)| (key.clone(), action.authoritative.clone()))
+            .collect()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct ActivityProjection {
+    objective: Option<String>,
+    summary: String,
+    next_actions: Vec<String>,
+    constraints: Vec<String>,
+    artifacts: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -285,6 +334,7 @@ struct MaterialDraft {
     artifacts: Vec<String>,
     verification: Vec<String>,
     field_evidence: BTreeMap<ContractField, Vec<EventId>>,
+    projection_state: ProjectionState,
 }
 
 impl MaterialDraft {
@@ -302,6 +352,7 @@ impl MaterialDraft {
                 artifacts: Vec::new(),
                 verification: Vec::new(),
                 field_evidence: BTreeMap::new(),
+                projection_state: ProjectionState::default(),
             },
             |contract| Self {
                 objective: contract.objective.clone(),
@@ -315,8 +366,19 @@ impl MaterialDraft {
                 artifacts: contract.artifacts.clone(),
                 verification: contract.verification.clone(),
                 field_evidence: contract.field_evidence.clone(),
+                projection_state: contract.projection_state.clone(),
             },
         )
+    }
+
+    fn activity_projection(&self) -> ActivityProjection {
+        ActivityProjection {
+            objective: self.objective.clone(),
+            summary: self.summary.clone(),
+            next_actions: self.next_actions.clone(),
+            constraints: self.constraints.clone(),
+            artifacts: self.artifacts.clone(),
+        }
     }
 
     fn normalize(&mut self) {
@@ -359,16 +421,19 @@ fn apply_text_facts(
         .filter_map(|fact| match fact {
             ReducedFact::HumanObjective {
                 redacted_text: Some(text),
+                observed_at,
                 evidence,
                 ..
             } => safe_text(text, DisclosureClass::HumanIntent, policy)
                 .transpose()
-                .map(|value| value.map(|value| (evidence.as_str(), evidence.clone(), value))),
+                .map(|value| {
+                    value.map(|value| ((*observed_at, evidence.as_str()), evidence.clone(), value))
+                }),
             _ => None,
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
-        .max_by(|left, right| left.0.cmp(right.0))
+        .max_by(|left, right| left.0.cmp(&right.0))
     {
         draft.objective = Some(text);
         draft
@@ -380,16 +445,19 @@ fn apply_text_facts(
         .filter_map(|fact| match fact {
             ReducedFact::HumanConstraint {
                 redacted_text: Some(text),
+                observed_at,
                 evidence,
                 ..
             } => safe_text(text, DisclosureClass::HumanIntent, policy)
                 .transpose()
-                .map(|value| value.map(|value| (evidence.as_str(), evidence.clone(), value))),
+                .map(|value| {
+                    value.map(|value| ((*observed_at, evidence.as_str()), evidence.clone(), value))
+                }),
             _ => None,
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
-        .max_by(|left, right| left.0.cmp(right.0))
+        .max_by(|left, right| left.0.cmp(&right.0))
     {
         draft.constraints = vec![text];
         draft
@@ -401,16 +469,19 @@ fn apply_text_facts(
         .filter_map(|fact| match fact {
             ReducedFact::AgentStatement {
                 redacted_text: Some(text),
+                observed_at,
                 evidence,
                 ..
             } => safe_text(text, DisclosureClass::AgentStatement, policy)
                 .transpose()
-                .map(|value| value.map(|value| (evidence.as_str(), evidence.clone(), value))),
+                .map(|value| {
+                    value.map(|value| ((*observed_at, evidence.as_str()), evidence.clone(), value))
+                }),
             _ => None,
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
-        .max_by(|left, right| left.0.cmp(right.0))
+        .max_by(|left, right| left.0.cmp(&right.0))
     {
         draft.summary = text;
         draft
@@ -450,73 +521,151 @@ fn apply_action_facts(
     facts: &[ReducedFact],
     policy: &RedactionPolicy,
 ) -> Result<(), ContractBuildError> {
-    let outcomes = latest_finished_outcomes(facts.iter());
-
-    for (_action_id, (fact, _)) in outcomes {
-        let ReducedFact::Verification {
-            command: Some(command),
-            succeeded,
-            evidence,
-            ..
-        } = fact
-        else {
-            continue;
-        };
-        let Some(text) = safe_text(command, DisclosureClass::ToolResult, policy)? else {
-            continue;
-        };
-        draft.verification.push(text.clone());
-        draft
-            .field_evidence
-            .entry(ContractField::Verification)
-            .or_default()
-            .push(evidence.clone());
-        if *succeeded {
-            draft.completed_steps.push(text);
-            draft
-                .field_evidence
-                .entry(ContractField::CompletedSteps)
-                .or_default()
-                .push(evidence.clone());
-            draft.blockers.clear();
-            draft.field_evidence.remove(&ContractField::Blockers);
-        } else {
-            draft.blockers.push(text);
-            draft
-                .field_evidence
-                .entry(ContractField::Blockers)
-                .or_default()
-                .push(evidence.clone());
-        }
-    }
-
-    let finished = facts
-        .iter()
-        .filter_map(ReducedFact::finished_action_id)
-        .collect::<BTreeSet<_>>();
     for fact in facts {
-        let ReducedFact::ActionRequested {
-            native_action_id,
+        update_action_projection(&mut draft.projection_state, fact, policy)?;
+    }
+    while draft.projection_state.actions.len() > MAX_CONTRACT_EVIDENCE_REFS {
+        draft.projection_state.actions.pop_last();
+    }
+    project_action_fields(draft);
+    Ok(())
+}
+
+fn update_action_projection(
+    projection: &mut ProjectionState,
+    fact: &ReducedFact,
+    policy: &RedactionPolicy,
+) -> Result<(), ContractBuildError> {
+    let Some(key) = fact.action_projection_key() else {
+        return Ok(());
+    };
+    let action = projection.actions.entry(key).or_default();
+    match fact {
+        ReducedFact::ActionRequested {
             redacted_input: Some(input),
             evidence,
             ..
-        } = fact
-        else {
-            continue;
-        };
-        if finished.contains(native_action_id.as_str()) {
-            continue;
+        } => {
+            if let Some(text) = safe_text(input, DisclosureClass::ObservedState, policy)? {
+                let candidate = ProjectedText {
+                    text,
+                    evidence: evidence.clone(),
+                };
+                if action
+                    .request
+                    .as_ref()
+                    .is_none_or(|existing| candidate.evidence > existing.evidence)
+                {
+                    action.request = Some(candidate);
+                }
+            }
         }
-        if let Some(text) = safe_text(input, DisclosureClass::ObservedState, policy)? {
-            draft.next_actions.push(text);
+        ReducedFact::ActionFinishedObserved { .. } => action.finished = true,
+        ReducedFact::EligibleVerificationObserved {
+            succeeded,
+            observed_at,
+            evidence,
+            ..
+        } => {
+            action.finished = true;
+            update_authoritative(
+                action,
+                ProjectedOutcome {
+                    command: None,
+                    succeeded: *succeeded,
+                    observed_at: *observed_at,
+                    evidence: evidence.clone(),
+                },
+            );
+        }
+        ReducedFact::Verification {
+            command,
+            succeeded,
+            observed_at,
+            evidence,
+            ..
+        } => {
+            action.finished = true;
+            let command = command
+                .as_deref()
+                .map(|text| safe_text(text, DisclosureClass::ToolResult, policy))
+                .transpose()?
+                .flatten();
+            update_authoritative(
+                action,
+                ProjectedOutcome {
+                    command,
+                    succeeded: *succeeded,
+                    observed_at: *observed_at,
+                    evidence: evidence.clone(),
+                },
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn project_action_fields(draft: &mut MaterialDraft) {
+    for field in [
+        ContractField::CompletedSteps,
+        ContractField::NextActions,
+        ContractField::Blockers,
+        ContractField::Verification,
+    ] {
+        draft.field_evidence.remove(&field);
+    }
+    draft.completed_steps.clear();
+    draft.next_actions.clear();
+    draft.blockers.clear();
+    draft.verification.clear();
+
+    for action in draft.projection_state.actions.values() {
+        if !action.finished
+            && let Some(request) = &action.request
+        {
+            draft.next_actions.push(request.text.clone());
             draft
                 .field_evidence
                 .entry(ContractField::NextActions)
                 .or_default()
-                .push(evidence.clone());
+                .push(request.evidence.clone());
         }
+        let Some(outcome) = &action.authoritative else {
+            continue;
+        };
+        let Some(command) = &outcome.command else {
+            continue;
+        };
+        draft.verification.push(command.clone());
+        draft
+            .field_evidence
+            .entry(ContractField::Verification)
+            .or_default()
+            .push(outcome.evidence.clone());
+        let (values, field) = if outcome.succeeded {
+            (&mut draft.completed_steps, ContractField::CompletedSteps)
+        } else {
+            (&mut draft.blockers, ContractField::Blockers)
+        };
+        values.push(command.clone());
+        draft
+            .field_evidence
+            .entry(field)
+            .or_default()
+            .push(outcome.evidence.clone());
     }
-    Ok(())
+}
+
+fn update_authoritative(action: &mut ActionProjection, candidate: ProjectedOutcome) {
+    let candidate_key = (candidate.observed_at, candidate.evidence.as_str());
+    if action
+        .authoritative
+        .as_ref()
+        .is_none_or(|existing| candidate_key > (existing.observed_at, existing.evidence.as_str()))
+    {
+        action.authoritative = Some(candidate);
+    }
 }
 
 fn safe_text(
@@ -532,8 +681,11 @@ fn safe_text(
 }
 
 fn derive_status(
-    facts: &[&ReducedFact],
+    projection: &ProjectionState,
+    facts: &[ReducedFact],
     previous: Option<WorkStatus>,
+    activity_changed: bool,
+    authoritative_changed: bool,
 ) -> (WorkStatus, Vec<EventId>) {
     let abandonment = facts
         .iter()
@@ -544,21 +696,24 @@ fn derive_status(
         return (WorkStatus::Abandoned, abandonment);
     }
 
-    let outcomes = latest_finished_outcomes(facts.iter().copied());
-    let failed = outcomes
+    let failed = projection
+        .actions
         .values()
-        .filter(|(fact, _)| fact.failed_structured_result())
-        .map(|(fact, _)| fact.evidence_id().clone())
+        .filter_map(|action| action.authoritative.as_ref())
+        .filter(|outcome| !outcome.succeeded)
+        .map(|outcome| outcome.evidence.clone())
         .collect::<Vec<_>>();
     if !failed.is_empty() {
         return (WorkStatus::Blocked, failed);
     }
-    let completed = outcomes
+    let completed = projection
+        .actions
         .values()
-        .filter(|(fact, _)| fact.successful_structured_result())
-        .map(|(fact, _)| fact.evidence_id().clone())
+        .filter_map(|action| action.authoritative.as_ref())
+        .filter(|outcome| outcome.succeeded)
+        .map(|outcome| outcome.evidence.clone())
         .collect::<Vec<_>>();
-    if !completed.is_empty() {
+    if !completed.is_empty() && (previous.is_none() || authoritative_changed || !activity_changed) {
         return (WorkStatus::Completed, completed);
     }
     let active = facts
@@ -566,8 +721,11 @@ fn derive_status(
         .filter(|fact| fact.active_work())
         .map(|fact| fact.evidence_id().clone())
         .collect::<Vec<_>>();
-    if !active.is_empty() {
+    if activity_changed && !active.is_empty() {
         return (WorkStatus::Active, active);
+    }
+    if !completed.is_empty() {
+        return (WorkStatus::Completed, completed);
     }
     (
         previous.unwrap_or(WorkStatus::Observed),
@@ -576,36 +734,6 @@ fn derive_status(
             .map(|fact| fact.evidence_id().clone())
             .collect(),
     )
-}
-
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
-struct StatusKey(OffsetDateTime, String);
-
-impl StatusKey {
-    fn for_fact(fact: &ReducedFact) -> Self {
-        Self(
-            fact.observed_at().unwrap_or(OffsetDateTime::UNIX_EPOCH),
-            fact.evidence_id().as_str().to_owned(),
-        )
-    }
-}
-
-fn latest_finished_outcomes<'a>(
-    facts: impl IntoIterator<Item = &'a ReducedFact>,
-) -> BTreeMap<&'a str, (&'a ReducedFact, StatusKey)> {
-    let mut outcomes = BTreeMap::new();
-    for fact in facts {
-        if let Some(action_id) = fact.finished_action_id() {
-            let key = StatusKey::for_fact(fact);
-            if outcomes
-                .get(action_id)
-                .is_none_or(|(_, existing)| key > *existing)
-            {
-                outcomes.insert(action_id, (fact, key));
-            }
-        }
-    }
-    outcomes
 }
 
 fn retain_field_evidence(
@@ -697,6 +825,21 @@ fn validate_field_evidence(
 fn material_hash(draft: &MaterialDraft) -> Result<String, serde_json::Error> {
     let encoded = serde_json::to_vec(draft)?;
     Ok(format!("b3:{}", blake3::hash(&encoded).to_hex()))
+}
+
+fn fact_set_digest(facts: &[ReducedFact]) -> String {
+    let mut evidence = facts
+        .iter()
+        .map(ReducedFact::evidence_id)
+        .collect::<Vec<_>>();
+    evidence.sort();
+    evidence.dedup();
+    let mut hasher = blake3::Hasher::new();
+    for reference in evidence {
+        hasher.update(&(reference.as_str().len() as u64).to_le_bytes());
+        hasher.update(reference.as_str().as_bytes());
+    }
+    format!("b3:{}", hasher.finalize().to_hex())
 }
 
 fn stable_work_id(project_id: &ProjectId, evidence_refs: &[EventId]) -> WorkId {
@@ -816,17 +959,35 @@ impl ReducedFact {
         )
     }
 
-    fn finished_action_id(&self) -> Option<&str> {
+    fn action_projection_key(&self) -> Option<String> {
         match self {
-            Self::ActionFinishedObserved {
-                native_action_id, ..
+            Self::ActionRequested {
+                session_id,
+                native_action_id,
+                ..
+            }
+            | Self::ActionFinishedObserved {
+                session_id,
+                native_action_id,
+                ..
             }
             | Self::EligibleVerificationObserved {
-                native_action_id, ..
+                session_id,
+                native_action_id,
+                ..
             }
             | Self::Verification {
-                native_action_id, ..
-            } => Some(native_action_id),
+                session_id,
+                native_action_id,
+                ..
+            } => {
+                let mut hasher = blake3::Hasher::new();
+                for value in [session_id.as_str(), native_action_id.as_str()] {
+                    hasher.update(&(value.len() as u64).to_le_bytes());
+                    hasher.update(value.as_bytes());
+                }
+                Some(format!("b3:{}", hasher.finalize().to_hex()))
+            }
             _ => None,
         }
     }
@@ -839,11 +1000,11 @@ impl ReducedFact {
             | Self::Artifact { observed_at, .. }
             | Self::ActionFinishedObserved { observed_at, .. }
             | Self::EligibleVerificationObserved { observed_at, .. }
-            | Self::Verification { observed_at, .. } => Some(*observed_at),
-            Self::ActionRequested { .. }
-            | Self::HumanObjective { .. }
-            | Self::HumanConstraint { .. }
-            | Self::AgentStatement { .. } => None,
+            | Self::Verification { observed_at, .. }
+            | Self::HumanObjective { observed_at, .. }
+            | Self::HumanConstraint { observed_at, .. }
+            | Self::AgentStatement { observed_at, .. } => Some(*observed_at),
+            Self::ActionRequested { .. } => None,
         }
     }
 }

@@ -30,6 +30,7 @@ pub mod test_support {
                 project_id: project_id.clone(),
                 content_hash: "b3:objective".into(),
                 redacted_text: Some("Implement the parser".into()),
+                observed_at: datetime!(2026-07-17 11:57 UTC),
                 evidence: event_id("evt-objective"),
             },
             ReducedFact::AgentRunStarted {
@@ -63,6 +64,7 @@ pub mod test_support {
                 project_id,
                 content_hash: "b3:summary".into(),
                 redacted_text: Some("Parser implementation is in progress".into()),
+                observed_at: datetime!(2026-07-17 12:01 UTC),
                 evidence: event_id("evt-summary"),
             },
         ]

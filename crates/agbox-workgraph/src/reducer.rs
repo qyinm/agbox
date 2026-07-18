@@ -92,18 +92,21 @@ pub enum ReducedFact {
         project_id: ProjectId,
         content_hash: String,
         redacted_text: Option<String>,
+        observed_at: OffsetDateTime,
         evidence: EventId,
     },
     HumanConstraint {
         project_id: ProjectId,
         content_hash: String,
         redacted_text: Option<String>,
+        observed_at: OffsetDateTime,
         evidence: EventId,
     },
     AgentStatement {
         project_id: ProjectId,
         content_hash: String,
         redacted_text: Option<String>,
+        observed_at: OffsetDateTime,
         evidence: EventId,
     },
 }
@@ -316,6 +319,7 @@ impl DeterministicReducer {
                             project_id,
                             content_hash: content.hash().to_owned(),
                             redacted_text,
+                            observed_at,
                             evidence,
                         }
                     } else {
@@ -323,6 +327,7 @@ impl DeterministicReducer {
                             project_id,
                             content_hash: content.hash().to_owned(),
                             redacted_text,
+                            observed_at,
                             evidence,
                         }
                     };
@@ -333,6 +338,7 @@ impl DeterministicReducer {
                         project_id,
                         content_hash: content.hash().to_owned(),
                         redacted_text: nonempty(content.redacted_excerpt()),
+                        observed_at,
                         evidence,
                     });
                 }

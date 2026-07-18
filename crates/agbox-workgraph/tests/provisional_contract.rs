@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use agbox_core::{EventId, ProjectId, WorkId, WorkStatus};
+use agbox_core::{EventId, ProjectId, SessionId, WorkId, WorkStatus};
 use agbox_workgraph::{
     ContractField, ProvisionalContractBuilder, ReducedFact,
     test_support::facts_for_active_parser_work,
@@ -15,6 +15,10 @@ fn event_id(value: &str) -> EventId {
 
 fn project() -> ProjectId {
     ProjectId::for_test("project-a")
+}
+
+fn session() -> SessionId {
+    SessionId::parse_wire("session-a").unwrap()
 }
 
 fn artifact(path: Option<&str>, evidence: &str) -> ReducedFact {
@@ -31,14 +35,58 @@ fn artifact(path: Option<&str>, evidence: &str) -> ReducedFact {
 }
 
 fn verification(succeeded: bool, command: Option<&str>, evidence: &str) -> ReducedFact {
+    action_verification(
+        "verify",
+        succeeded,
+        command,
+        datetime!(2026-07-17 12:01 UTC),
+        evidence,
+    )
+}
+
+fn action_verification(
+    action_id: &str,
+    succeeded: bool,
+    command: Option<&str>,
+    observed_at: time::OffsetDateTime,
+    evidence: &str,
+) -> ReducedFact {
     ReducedFact::Verification {
         project_id: project(),
-        session_id: agbox_core::SessionId::parse_wire("session-a").unwrap(),
-        native_action_id: "verify".into(),
+        session_id: session(),
+        native_action_id: action_id.into(),
         command: command.map(str::to_owned),
         succeeded,
         basis: "structured_tool_result",
-        observed_at: datetime!(2026-07-17 12:01 UTC),
+        observed_at,
+        evidence: event_id(evidence),
+    }
+}
+
+fn observed_finish(
+    action_id: &str,
+    succeeded: bool,
+    observed_at: time::OffsetDateTime,
+    evidence: &str,
+) -> ReducedFact {
+    ReducedFact::ActionFinishedObserved {
+        project_id: project(),
+        session_id: session(),
+        native_action_id: action_id.into(),
+        succeeded,
+        observed_at,
+        evidence: event_id(evidence),
+    }
+}
+
+fn action_request(action_id: &str, input: &str, evidence: &str) -> ReducedFact {
+    ReducedFact::ActionRequested {
+        project_id: project(),
+        session_id: session(),
+        native_action_id: action_id.into(),
+        tool_name: "shell".into(),
+        input_hash: format!("hash-{evidence}"),
+        redacted_input: Some(input.into()),
         evidence: event_id(evidence),
     }
 }
@@ -110,6 +158,7 @@ fn explicit_human_abandonment_has_status_precedence() {
             project_id: project(),
             content_hash: "abandonment-hash".into(),
             redacted_text: Some("Abandon this work".into()),
+            observed_at: datetime!(2026-07-17 12:02 UTC),
             evidence: event_id("evt-abandonment"),
         },
     ];
@@ -162,12 +211,14 @@ fn hash_only_facts_support_provenance_without_generating_prose() {
             project_id: project(),
             content_hash: "private-objective-hash".into(),
             redacted_text: None,
+            observed_at: datetime!(2026-07-17 12:00 UTC),
             evidence: event_id("evt-objective-hash"),
         },
         ReducedFact::AgentStatement {
             project_id: project(),
             content_hash: "private-summary-hash".into(),
             redacted_text: None,
+            observed_at: datetime!(2026-07-17 12:00 UTC),
             evidence: event_id("evt-summary-hash"),
         },
         artifact(None, "evt-artifact-hash"),
@@ -201,6 +252,7 @@ fn bounded_excerpts_are_redacted_again_at_the_contract_boundary() {
         project_id: project(),
         content_hash: "hash".into(),
         redacted_text: Some("token=PRIVATE_VALUE /Users/alice/project".into()),
+        observed_at: datetime!(2026-07-17 12:00 UTC),
         evidence: event_id("evt-sensitive"),
     }];
     let contract = ProvisionalContractBuilder::new("deterministic-v1")
@@ -209,6 +261,205 @@ fn bounded_excerpts_are_redacted_again_at_the_contract_boundary() {
 
     assert!(!contract.summary.contains("PRIVATE_VALUE"));
     assert!(!contract.summary.contains("/Users/alice"));
+}
+
+#[test]
+fn latest_human_and_agent_text_uses_observation_chronology_not_event_id_order() {
+    let facts = vec![
+        ReducedFact::HumanObjective {
+            project_id: project(),
+            content_hash: "old-objective".into(),
+            redacted_text: Some("Old objective".into()),
+            observed_at: datetime!(2026-07-17 12:00 UTC),
+            evidence: event_id("evt-z-old-objective"),
+        },
+        ReducedFact::HumanObjective {
+            project_id: project(),
+            content_hash: "new-objective".into(),
+            redacted_text: Some("New objective".into()),
+            observed_at: datetime!(2026-07-17 12:01 UTC),
+            evidence: event_id("evt-a-new-objective"),
+        },
+        ReducedFact::HumanConstraint {
+            project_id: project(),
+            content_hash: "old-constraint".into(),
+            redacted_text: Some("Never use the old path".into()),
+            observed_at: datetime!(2026-07-17 12:00 UTC),
+            evidence: event_id("evt-z-old-constraint"),
+        },
+        ReducedFact::HumanConstraint {
+            project_id: project(),
+            content_hash: "new-constraint".into(),
+            redacted_text: Some("Never expose secrets".into()),
+            observed_at: datetime!(2026-07-17 12:01 UTC),
+            evidence: event_id("evt-a-new-constraint"),
+        },
+        ReducedFact::AgentStatement {
+            project_id: project(),
+            content_hash: "old-summary".into(),
+            redacted_text: Some("Old summary".into()),
+            observed_at: datetime!(2026-07-17 12:00 UTC),
+            evidence: event_id("evt-z-old-summary"),
+        },
+        ReducedFact::AgentStatement {
+            project_id: project(),
+            content_hash: "new-summary".into(),
+            redacted_text: Some("New summary".into()),
+            observed_at: datetime!(2026-07-17 12:01 UTC),
+            evidence: event_id("evt-a-new-summary"),
+        },
+    ];
+
+    let contract = ProvisionalContractBuilder::new("deterministic-v1")
+        .build(None, &facts)
+        .unwrap();
+    assert_eq!(contract.objective.as_deref(), Some("New objective"));
+    assert_eq!(contract.constraints, ["Never expose secrets"]);
+    assert_eq!(contract.summary, "New summary");
+}
+
+#[test]
+fn observed_finish_never_supersedes_authoritative_success_or_failure() {
+    for succeeded in [false, true] {
+        let command = if succeeded {
+            "cargo test"
+        } else {
+            "cargo clippy"
+        };
+        let authoritative_facts = vec![
+            action_request("same-action", command, "evt-request"),
+            action_verification(
+                "same-action",
+                succeeded,
+                Some(command),
+                datetime!(2026-07-17 12:01 UTC),
+                "evt-authoritative",
+            ),
+        ];
+        let mismatched = observed_finish(
+            "same-action",
+            !succeeded,
+            datetime!(2026-07-17 12:02 UTC),
+            "evt-mismatched",
+        );
+        let builder = ProvisionalContractBuilder::new("deterministic-v1");
+        let authoritative = builder.build(None, &authoritative_facts).unwrap();
+        let later_mismatch = builder
+            .build(Some(&authoritative), std::slice::from_ref(&mismatched))
+            .unwrap();
+        let mut aggregate_facts = authoritative_facts;
+        aggregate_facts.push(mismatched);
+        let aggregate = builder.build(None, &aggregate_facts).unwrap();
+
+        for contract in [&later_mismatch, &aggregate] {
+            assert_eq!(
+                contract.status,
+                if succeeded {
+                    WorkStatus::Completed
+                } else {
+                    WorkStatus::Blocked
+                }
+            );
+            assert_eq!(contract.verification, [command]);
+            assert!(contract.next_actions.is_empty());
+            if succeeded {
+                assert_eq!(contract.completed_steps, [command]);
+            } else {
+                assert_eq!(contract.blockers, [command]);
+            }
+        }
+        assert_eq!(later_mismatch.revision, authoritative.revision);
+        assert_eq!(
+            later_mismatch.material_content_hash,
+            authoritative.material_content_hash
+        );
+    }
+}
+
+#[test]
+fn mixed_action_outcomes_keep_failed_blockers_in_both_action_id_orders() {
+    for (failed_id, successful_id) in [("a", "z"), ("z", "a")] {
+        let facts = vec![
+            action_verification(
+                failed_id,
+                false,
+                Some("cargo test failing-suite"),
+                datetime!(2026-07-17 12:01 UTC),
+                &format!("evt-failed-{failed_id}"),
+            ),
+            action_verification(
+                successful_id,
+                true,
+                Some("cargo test passing-suite"),
+                datetime!(2026-07-17 12:01 UTC),
+                &format!("evt-success-{successful_id}"),
+            ),
+        ];
+        let contract = ProvisionalContractBuilder::new("deterministic-v1")
+            .build(None, &facts)
+            .unwrap();
+        assert_eq!(contract.status, WorkStatus::Blocked);
+        assert_eq!(contract.blockers, ["cargo test failing-suite"]);
+        assert_eq!(contract.completed_steps, ["cargo test passing-suite"]);
+    }
+}
+
+#[test]
+fn finishing_one_action_removes_only_its_next_action_across_revisions() {
+    let builder = ProvisionalContractBuilder::new("deterministic-v1");
+    let requested = builder
+        .build(
+            None,
+            &[
+                action_request("finished", "cargo test finished", "evt-request-finished"),
+                action_request("pending", "cargo test pending", "evt-request-pending"),
+            ],
+        )
+        .unwrap();
+    let finished = builder
+        .build(
+            Some(&requested),
+            &[action_verification(
+                "finished",
+                true,
+                Some("cargo test finished"),
+                datetime!(2026-07-17 12:01 UTC),
+                "evt-finish",
+            )],
+        )
+        .unwrap();
+
+    assert_eq!(requested.next_actions.len(), 2);
+    assert_eq!(finished.next_actions, ["cargo test pending"]);
+    assert_eq!(finished.completed_steps, ["cargo test finished"]);
+}
+
+#[test]
+fn identical_large_aggregate_replay_is_deduplicated_beyond_evidence_cap() {
+    let mut facts = (0..=agbox_core::limits::MAX_CONTRACT_EVIDENCE_REFS)
+        .map(|index| {
+            artifact(
+                Some(&format!("src/generated-{index}.rs")),
+                &format!("evt-{index:03}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    facts.push(action_verification(
+        "verify-large",
+        true,
+        Some("cargo test"),
+        datetime!(2026-07-17 12:02 UTC),
+        "evt-verification-large",
+    ));
+    let builder = ProvisionalContractBuilder::new("deterministic-v1");
+    let first = builder.build(None, &facts).unwrap();
+    let replay = builder.build(Some(&first), &facts).unwrap();
+
+    assert!(first.evidence_truncated);
+    assert_eq!(first.status, WorkStatus::Completed);
+    assert_eq!(replay.revision, first.revision);
+    assert_eq!(replay.status, first.status);
+    assert_eq!(replay.material_content_hash, first.material_content_hash);
 }
 
 #[test]
