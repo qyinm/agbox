@@ -115,6 +115,7 @@ fn semantic_publication_is_disabled_until_explicitly_configured() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn publish_semantic_rejects_cross_project_input_before_extractor_execution() {
     let fixture = FixtureRuntime::codex_records(1).await;
     fixture.drain().await.unwrap();
@@ -191,9 +192,9 @@ async fn publish_semantic_rejects_cross_project_input_before_extractor_execution
     assert!(matches!(
         coordinator
             .publish_semantic(
-                project_id,
-                work_id,
-                stored,
+                project_id.clone(),
+                work_id.clone(),
+                stored.clone(),
                 input,
                 &DisabledExtractor,
                 &policy,
@@ -204,6 +205,28 @@ async fn publish_semantic_rejects_cross_project_input_before_extractor_execution
         Err(IngestError::Semantic(
             agbox_workgraph::SemanticError::InvalidProposal
         ))
+    ));
+    let fabricated_same_project_input = ExtractionInput::bounded(
+        extraction_input_contract(project_id.clone(), work_id.clone()),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(matches!(
+        coordinator
+            .publish_semantic(
+                project_id,
+                work_id,
+                stored,
+                fabricated_same_project_input,
+                &DisabledExtractor,
+                &policy,
+                event.event.event_id().as_str().into(),
+                datetime!(2026-07-19 13:01 UTC),
+            )
+            .await,
+        Err(IngestError::InvalidGraphMutation)
     ));
 }
 

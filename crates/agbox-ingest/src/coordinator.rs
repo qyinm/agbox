@@ -1048,6 +1048,9 @@ impl IngestionCoordinator {
             return Err(IngestError::InvalidGraphMutation);
         }
         input.validate_project(&project_id, &work_id)?;
+        if !Self::semantic_input_matches_contract(&input.previous_contract, &stored_previous) {
+            return Err(IngestError::InvalidGraphMutation);
+        }
         if !policy.project_matches(&project_id) {
             return Err(IngestError::InvalidGraphMutation);
         }
@@ -1168,6 +1171,29 @@ impl IngestionCoordinator {
             | DisclosureClass::SystemInstruction
             | DisclosureClass::DeveloperInstruction => None,
         }
+    }
+
+    fn semantic_input_matches_contract(
+        input: &agbox_core::WorkContractRevision,
+        stored: &ProvisionalContract,
+    ) -> bool {
+        input.contract_id() == &stored.contract_id
+            && input.work_id() == &stored.work_id
+            && input.revision() == stored.revision
+            && input.project_id() == &stored.project_id
+            && input.objective() == stored.objective.as_deref()
+            && input.status() == stored.status
+            && input.summary() == stored.summary
+            && input.completed_steps() == stored.completed_steps
+            && input.next_actions() == stored.next_actions
+            && input.blockers() == stored.blockers
+            && input.constraints() == stored.constraints
+            && input.completion_criteria() == stored.completion_criteria
+            && input.artifacts() == stored.artifacts
+            && input.verification() == stored.verification
+            && input.confidence_basis_points() == stored.confidence_basis_points
+            && input.created_at() == stored.created_at
+            && input.extractor_version() == stored.extractor_version
     }
 
     /// Registers immutable decode facts for an already store-registered source.
