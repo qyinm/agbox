@@ -368,6 +368,66 @@ fn provenance_only_active_facts_open_a_new_completion_epoch() {
 }
 
 #[test]
+fn same_timestamp_active_identity_distinguishes_unseen_fact_from_replay() {
+    let builder = ProvisionalContractBuilder::new("deterministic-v1")
+        .for_work(WorkId::for_test("work-active-identity"));
+    let completed = builder
+        .build(
+            None,
+            &[action_verification(
+                "verify",
+                true,
+                Some("cargo test"),
+                datetime!(2026-07-17 12:01 UTC),
+                "evt-completed-before-same-time",
+            )],
+        )
+        .unwrap();
+    let first_active = artifact(None, "evt-z-same-time");
+    let reopened = builder
+        .build(Some(&completed), std::slice::from_ref(&first_active))
+        .unwrap();
+    let reverified = builder
+        .build(
+            Some(&reopened),
+            &[action_verification(
+                "verify",
+                true,
+                Some("cargo test"),
+                datetime!(2026-07-17 12:04 UTC),
+                "evt-reverified-before-same-time",
+            )],
+        )
+        .unwrap();
+    let replayed = builder
+        .build(Some(&reverified), std::slice::from_ref(&first_active))
+        .unwrap();
+    let unseen_same_time = builder
+        .build(Some(&replayed), &[artifact(None, "evt-a-same-time")])
+        .unwrap();
+    let completed_again = builder
+        .build(
+            Some(&unseen_same_time),
+            &[action_verification(
+                "verify",
+                true,
+                Some("cargo test"),
+                datetime!(2026-07-17 12:05 UTC),
+                "evt-reverified-after-unseen-same-time",
+            )],
+        )
+        .unwrap();
+
+    assert_eq!(reopened.status, WorkStatus::Active);
+    assert_eq!(reverified.status, WorkStatus::Completed);
+    assert_eq!(replayed.status, WorkStatus::Completed);
+    assert_eq!(replayed.revision, reverified.revision);
+    assert_eq!(unseen_same_time.status, WorkStatus::Active);
+    assert_eq!(unseen_same_time.revision, replayed.revision + 1);
+    assert_eq!(completed_again.status, WorkStatus::Completed);
+}
+
+#[test]
 fn replay_does_not_create_a_duplicate_revision() {
     let facts = facts_for_active_parser_work();
     let builder = ProvisionalContractBuilder::new("deterministic-v1");

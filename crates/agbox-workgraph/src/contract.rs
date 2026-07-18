@@ -297,15 +297,9 @@ struct ProjectionState {
     #[serde(default)]
     completion_reopened: bool,
     #[serde(default)]
-    latest_active_observation: Option<ActiveObservationKey>,
+    active_identity_watermark: BTreeSet<EventId>,
     #[serde(default)]
-    unordered_active_identity_watermark: BTreeSet<EventId>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-struct ActiveObservationKey {
-    observed_at: OffsetDateTime,
-    evidence: EventId,
+    active_identity_truncated: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -347,28 +341,17 @@ impl ProjectionState {
     fn observe_active_facts(&mut self, facts: &[ReducedFact]) -> bool {
         let mut observed_new_identity = false;
         for fact in facts.iter().filter(|fact| fact.active_work()) {
-            if let Some(observed_at) = fact.observed_at() {
-                let candidate = ActiveObservationKey {
-                    observed_at,
-                    evidence: fact.evidence_id().clone(),
-                };
-                if self
-                    .latest_active_observation
-                    .as_ref()
-                    .is_none_or(|watermark| &candidate > watermark)
-                {
-                    self.latest_active_observation = Some(candidate);
-                    observed_new_identity = true;
-                }
-            } else {
-                observed_new_identity |= self
-                    .unordered_active_identity_watermark
-                    .insert(fact.evidence_id().clone());
-            }
+            observed_new_identity |= self
+                .active_identity_watermark
+                .insert(fact.evidence_id().clone());
         }
-        while self.unordered_active_identity_watermark.len() > agbox_core::limits::MAX_BATCH_RECORDS
-        {
-            self.unordered_active_identity_watermark.pop_first();
+        // A reducer page cannot contain more identities than this bound. If a
+        // long-lived contract exceeds it across pages, deterministic eviction
+        // degrades conservatively: an evicted replay may reopen work, but an
+        // unseen active fact is never silently discarded as a lexical loser.
+        while self.active_identity_watermark.len() > agbox_core::limits::MAX_BATCH_RECORDS {
+            self.active_identity_watermark.pop_last();
+            self.active_identity_truncated = true;
         }
         observed_new_identity
     }
