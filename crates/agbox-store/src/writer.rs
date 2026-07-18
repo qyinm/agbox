@@ -3099,6 +3099,33 @@ fn record_audit(
     connection: &mut rusqlite::Connection,
     record: &AuditRecord,
 ) -> Result<(), StoreError> {
+    const KINDS: &[&str] = &[
+        "handoff.work.read",
+        "handoff.evidence.read",
+        "handoff.evidence.raw",
+        "handoff.search",
+        "handoff.correction",
+    ];
+    const RESULTS: &[&str] = &[
+        "ok",
+        "accepted",
+        "not_found",
+        "denied",
+        "invalid",
+        "unavailable",
+        "failed",
+        "too_large",
+    ];
+    const ACTORS: &[&str] = &["human_cli", "human_tui", "agent_claude", "agent_codex"];
+    if !KINDS.contains(&record.kind)
+        || !RESULTS.contains(&record.result)
+        || !ACTORS.contains(&record.actor)
+        || record
+            .provider
+            .is_some_and(|value| !matches!(value, "claude" | "codex"))
+    {
+        return Err(StoreError::InvalidBatch);
+    }
     let observed_at = format_timestamp(record.observed_at)?;
     let audit_id = format!("audit_app_{}", uuid::Uuid::new_v4().simple());
     let detail = serde_json::json!({
