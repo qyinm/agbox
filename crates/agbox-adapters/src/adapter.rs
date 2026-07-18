@@ -312,6 +312,34 @@ impl fmt::Debug for DecodedRecord {
     }
 }
 
+/// Move-only normalized output from one verified record.
+///
+/// This type deliberately has no public constructor: callers can consume a
+/// [`DecodedRecord`] without copying evidence plaintext, while construction
+/// and limit enforcement remain inside the adapter boundary.
+pub struct DecodedRecordParts {
+    pub observation: SourceObservation,
+    pub events: Vec<ActivityEventV1>,
+    pub evidence: Vec<DecodedEvidence>,
+    pub disposition: DecodeDisposition,
+    pub next_state: DecoderState,
+    pub semantic_bytes: usize,
+}
+
+impl fmt::Debug for DecodedRecordParts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DecodedRecordParts")
+            .field("observation", &self.observation)
+            .field("event_count", &self.events.len())
+            .field("evidence_count", &self.evidence.len())
+            .field("disposition", &self.disposition)
+            .field("next_state_bytes", &self.next_state.as_bytes().len())
+            .field("semantic_bytes", &self.semantic_bytes)
+            .finish()
+    }
+}
+
 impl DecodedRecord {
     /// Constructs a record and replaces over-limit normalized output with a
     /// bounded diagnostic. The draft's reported semantic byte count is ignored
@@ -357,6 +385,20 @@ impl DecodedRecord {
     #[must_use]
     pub const fn semantic_bytes(&self) -> usize {
         self.semantic_bytes
+    }
+
+    /// Consumes the validated record so evidence plaintext can move directly
+    /// into encrypted-store write ownership.
+    #[must_use]
+    pub fn into_parts(self) -> DecodedRecordParts {
+        DecodedRecordParts {
+            observation: self.observation,
+            events: self.events,
+            evidence: self.evidence,
+            disposition: self.disposition,
+            next_state: self.next_state,
+            semantic_bytes: self.semantic_bytes,
+        }
     }
 
     #[cfg(feature = "test-support")]

@@ -522,6 +522,43 @@ fn normalized_output_limits_discard_partial_results_and_preserve_identity_state(
 }
 
 #[test]
+fn consuming_record_parts_moves_evidence_plaintext_allocation() {
+    let source = MemoryRecordSource::new(br#"{"type":"future-record"}"#.to_vec());
+    let base = agbox_adapters::decode_fixture("claude", &source).unwrap();
+    let event = ActivityEventV1::fixture_message();
+    let evidence = DecodedEvidence {
+        evidence_id: EvidenceId::for_test("evidence_move"),
+        owner_event_id: event.event_id().clone(),
+        content: ContentRef::bounded(
+            "b3:evidence-move".to_owned(),
+            16,
+            "text/plain",
+            None,
+            DisclosureClass::ObservedState,
+            None,
+        )
+        .unwrap(),
+        plaintext: zeroize::Zeroizing::new(b"move-only-secret".to_vec()),
+    };
+    let pointer = evidence.plaintext.as_ptr();
+    let record = DecodedRecord::new(
+        DecodedRecordDraft {
+            observation: base.observation().clone(),
+            events: vec![event],
+            evidence: vec![evidence],
+            disposition: DecodeDisposition::Known,
+            next_state: DecoderState::default(),
+            semantic_bytes: 0,
+        },
+        &DecoderState::default(),
+    );
+
+    let parts = record.into_parts();
+    assert_eq!(parts.evidence.len(), 1);
+    assert_eq!(parts.evidence[0].plaintext.as_ptr(), pointer);
+}
+
+#[test]
 fn task_eight_output_api_smoke_uses_bounded_constructors_and_read_accessors() {
     let source = MemoryRecordSource::new(br#"{"type":"future-record"}"#.to_vec());
     let fixture = agbox_adapters::decode_fixture("claude", &source).unwrap();

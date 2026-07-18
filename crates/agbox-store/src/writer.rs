@@ -14,6 +14,7 @@ use crate::{EvidenceContext, EvidenceOwnerRef, EvidenceVault, StoreError};
 pub const MAX_BATCH_BYTES: usize = agbox_core::limits::MAX_BATCH_SEMANTIC_BYTES;
 pub const MAX_BATCH_RECORDS: usize = agbox_core::limits::MAX_BATCH_RECORDS;
 pub const WRITER_QUEUE_CAPACITY: usize = 32;
+const BUSY_RETRY_DELAYS_MS: [u64; 3] = [1, 3, 7];
 
 #[derive(Clone)]
 pub struct SourceRegistration {
@@ -619,7 +620,7 @@ pub(crate) fn run_writer(
                 let _ = reply.send(register_source(&mut connection, &vault, &registration));
             }
             WriteCommand::Commit { chunk, reply } => {
-                let _ = reply.send(commit(&mut connection, &vault, &chunk));
+                let _ = reply.send(commit_with_busy_retry(&mut connection, &vault, &chunk));
             }
             WriteCommand::Shutdown { reply } => {
                 let _ = reply.send(());
@@ -627,6 +628,33 @@ pub(crate) fn run_writer(
             }
         }
     }
+}
+
+fn commit_with_busy_retry(
+    connection: &mut rusqlite::Connection,
+    vault: &EvidenceVault,
+    chunk: &IngestionChunk,
+) -> Result<CommitReceipt, StoreError> {
+    for delay_ms in BUSY_RETRY_DELAYS_MS {
+        match commit(connection, vault, chunk) {
+            Err(StoreError::Sqlite(error)) if is_busy(&error) => {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            result => return result,
+        }
+    }
+    commit(connection, vault, chunk)
+}
+
+fn is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 fn validate_registration(registration: &SourceRegistration) -> Result<(), StoreError> {
@@ -996,6 +1024,7 @@ fn commit(
     vault: &EvidenceVault,
     chunk: &IngestionChunk,
 ) -> Result<CommitReceipt, StoreError> {
+    chunk.validate()?;
     let commit_digest = chunk.commit_digest()?;
     let preflight_cursor = load_cursor(connection, &chunk.expected_cursor)?;
     let registered = load_registered_source(connection, chunk)?;

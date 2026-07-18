@@ -10,6 +10,7 @@ test-support = [
     "agbox-adapters/test-support",
     "agbox-core/test-support",
     "agbox-store/test-support",
+    "dep:tempfile",
 ]
 
 [dependencies]
@@ -23,12 +24,12 @@ serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
+tempfile = { workspace = true, optional = true }
 zeroize.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 rusqlite.workspace = true
-tempfile.workspace = true
 
 [lints]
 workspace = true

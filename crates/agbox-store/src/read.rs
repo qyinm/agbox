@@ -169,6 +169,55 @@ impl ReadStore {
             .await
     }
 
+    /// Returns the number of quarantined records for one source generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, read-pool, database, or numeric error.
+    pub async fn fault_count(
+        &self,
+        source_id: impl Into<String>,
+        generation: u64,
+    ) -> Result<u64, StoreError> {
+        let source_id = source_id.into();
+        validate_source_generation(&source_id, generation)?;
+        self.pool
+            .execute(move |connection| {
+                let value: i64 = connection.query_row(
+                    "SELECT count(*) FROM ingestion_faults
+                     WHERE source_id = ?1 AND generation = ?2",
+                    rusqlite::params![
+                        source_id,
+                        i64::try_from(generation).map_err(|_| StoreError::InvalidBatch)?
+                    ],
+                    |row| row.get(0),
+                )?;
+                u64::try_from(value).map_err(|_| StoreError::InvalidBatch)
+            })
+            .await
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn event_ids_for_test(&self, limit: usize) -> Result<Vec<String>, StoreError> {
+        const MAX_TEST_EVENT_IDS: usize = 4_096;
+        if limit > MAX_TEST_EVENT_IDS {
+            return Err(StoreError::InvalidBatch);
+        }
+        self.pool
+            .execute(move |connection| {
+                let mut statement = connection
+                    .prepare("SELECT event_id FROM activity_events ORDER BY event_id LIMIT ?1")?;
+                let rows = statement.query_map(
+                    [i64::try_from(limit).map_err(|_| StoreError::InvalidBatch)?],
+                    |row| row.get::<_, String>(0),
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(StoreError::from)
+            })
+            .await
+    }
+
     /// Returns one bounded source cursor without exposing a `SQLite` connection.
     ///
     /// # Errors
@@ -180,13 +229,7 @@ impl ReadStore {
         generation: u64,
     ) -> Result<Option<CursorState>, StoreError> {
         let source_id = source_id.into();
-        if source_id.is_empty()
-            || source_id.len() > 128
-            || generation == 0
-            || generation > i64::MAX as u64
-        {
-            return Err(StoreError::InvalidBatch);
-        }
+        validate_source_generation(&source_id, generation)?;
         self.pool
             .execute(move |connection| {
                 let row: Option<(i64, Vec<u8>)> = connection
@@ -216,6 +259,17 @@ impl ReadStore {
             })
             .await
     }
+}
+
+fn validate_source_generation(source_id: &str, generation: u64) -> Result<(), StoreError> {
+    if source_id.is_empty()
+        || source_id.len() > 128
+        || generation == 0
+        || generation > i64::MAX as u64
+    {
+        return Err(StoreError::InvalidBatch);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
