@@ -2,10 +2,10 @@ use std::{collections::HashSet, fmt, sync::Arc};
 
 use agbox_core::{
     ActivityEventV1, ContentRef, DisclosureClass, EventId, EvidenceId, PrivacyLabel, ProjectId,
-    Provider, SessionId, SourceObservation, WorkId,
+    Provider, SessionId, SourceObservation, WorkId, WorkStatus,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
@@ -286,6 +286,39 @@ pub struct WorkContractRow {
     pub verification: Vec<String>,
 }
 
+/// The store deliberately deserializes the immutable contract independently
+/// from the publication projections.  Keeping this DTO private prevents the
+/// persistence API from becoming coupled to the pure workgraph crate while
+/// still requiring the complete contract wire shape at the trust boundary.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContractProjectionDto {
+    contract_id: agbox_core::ContractId,
+    work_id: WorkId,
+    revision: u64,
+    project_id: ProjectId,
+    objective: Option<String>,
+    status: WorkStatus,
+    summary: String,
+    completed_steps: Vec<String>,
+    next_actions: Vec<String>,
+    blockers: Vec<String>,
+    constraints: Vec<String>,
+    completion_criteria: Vec<String>,
+    artifacts: Vec<String>,
+    verification: Vec<String>,
+    evidence_refs: Vec<EventId>,
+    field_evidence: serde_json::Value,
+    evidence_truncated: bool,
+    confidence_basis_points: u16,
+    created_at: OffsetDateTime,
+    extractor_version: String,
+    #[serde(default)]
+    fact_set_digest: String,
+    material_content_hash: String,
+    projection_state: serde_json::Value,
+}
+
 impl fmt::Debug for WorkContractRow {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -414,25 +447,67 @@ impl WorkWriteBatch {
                 return Err(StoreError::InvalidBatch);
             }
         }
-        let encoded: serde_json::Value = serde_json::from_str(&self.contract.contract_json)?;
-        if encoded.get("work_id").and_then(serde_json::Value::as_str) != Some(self.work_id.as_str())
-            || encoded
-                .get("project_id")
-                .and_then(serde_json::Value::as_str)
-                != Some(self.project_id.as_str())
-            || encoded.get("revision").and_then(serde_json::Value::as_u64)
-                != Some(self.contract.revision)
-            || encoded
-                .get("material_content_hash")
-                .and_then(serde_json::Value::as_str)
-                .is_none_or(|hash| !bounded_metadata(hash))
-        {
-            return Err(StoreError::InvalidBatch);
-        }
+        validate_contract_projection(self)?;
         if serde_json::to_vec(self)?.len() > MAX_BATCH_BYTES {
             return Err(StoreError::InvalidBatch);
         }
         Ok(())
+    }
+}
+
+fn validate_contract_projection(batch: &WorkWriteBatch) -> Result<(), StoreError> {
+    let contract: ContractProjectionDto = serde_json::from_str(&batch.contract.contract_json)?;
+    if contract.contract_id != batch.contract.contract_id
+        || contract.work_id != batch.work_id
+        || contract.revision != batch.contract.revision
+        || contract.project_id != batch.project_id
+        || contract.extractor_version != batch.contract.extractor_version
+        || contract.created_at != batch.observed_at
+        || work_status_name(contract.status) != batch.status
+        || contract.objective != batch.contract.objective
+        || contract.summary != batch.contract.summary
+        || contract.completed_steps != batch.contract.completed_steps
+        || contract.next_actions != batch.contract.next_actions
+        || contract.blockers != batch.contract.blockers
+        || contract.artifacts != batch.contract.artifacts
+        || contract.verification != batch.contract.verification
+        || !bounded_metadata(&contract.material_content_hash)
+    {
+        return Err(StoreError::InvalidBatch);
+    }
+    if contract.confidence_basis_points > 10_000
+        || contract.evidence_refs.len() > agbox_core::limits::MAX_CONTRACT_EVIDENCE_REFS
+        || contract
+            .evidence_refs
+            .iter()
+            .any(|event_id| !bounded_identifier(event_id.as_str()))
+        || !bounded_contract_field_list(&contract.constraints)
+        || !bounded_contract_field_list(&contract.completion_criteria)
+        || !contract.field_evidence.is_object()
+        || !contract.projection_state.is_object()
+        || (!contract.fact_set_digest.is_empty() && !bounded_metadata(&contract.fact_set_digest))
+        || (contract.evidence_truncated
+            && contract.evidence_refs.len() != agbox_core::limits::MAX_CONTRACT_EVIDENCE_REFS)
+    {
+        return Err(StoreError::InvalidBatch);
+    }
+    Ok(())
+}
+
+fn bounded_contract_field_list(values: &[String]) -> bool {
+    values.len() <= agbox_core::limits::MAX_CONTRACT_ITEMS_PER_FIELD
+        && values
+            .iter()
+            .all(|value| value.len() <= agbox_core::limits::MAX_INLINE_BYTES)
+}
+
+fn work_status_name(status: WorkStatus) -> &'static str {
+    match status {
+        WorkStatus::Observed => "observed",
+        WorkStatus::Active => "active",
+        WorkStatus::Blocked => "blocked",
+        WorkStatus::Completed => "completed",
+        WorkStatus::Abandoned => "abandoned",
     }
 }
 

@@ -5,7 +5,7 @@ use agbox_ingest::{
     IngestionCoordinator, WorkPublicationRequest, graph_write_batch, test_support::FixtureRuntime,
     work_write_batch,
 };
-use agbox_store::{WorkCandidateQuery, WorkContractRow, WorkWriteBatch};
+use agbox_store::{StoreError, WorkCandidateQuery, WorkContractRow, WorkWriteBatch};
 use agbox_workgraph::{
     CorrelationDecision, CorrelationInput, Correlator, GraphMutation, ProvisionalContractBuilder,
     ReducedFact, WorkCandidate,
@@ -19,6 +19,56 @@ fn work_id(value: &str) -> WorkId {
 
 fn contract_id(value: &str) -> ContractId {
     ContractId::parse_wire(value).unwrap()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn contract_json(
+    contract_id: &str,
+    work_id: &str,
+    project_id: &str,
+    status: &str,
+    objective: Option<&str>,
+    summary: &str,
+    completed_steps: &[&str],
+    next_actions: &[&str],
+    blockers: &[&str],
+    artifacts: &[&str],
+    verification: &[&str],
+    created_at: OffsetDateTime,
+    extractor_version: &str,
+    material_content_hash: &str,
+) -> String {
+    serde_json::json!({
+        "contract_id": contract_id,
+        "work_id": work_id,
+        "revision": 1,
+        "project_id": project_id,
+        "objective": objective,
+        "status": status,
+        "summary": summary,
+        "completed_steps": completed_steps,
+        "next_actions": next_actions,
+        "blockers": blockers,
+        "constraints": [],
+        "completion_criteria": [],
+        "artifacts": artifacts,
+        "verification": verification,
+        "evidence_refs": [],
+        "field_evidence": {},
+        "evidence_truncated": false,
+        "confidence_basis_points": 10_000,
+        "created_at": created_at,
+        "extractor_version": extractor_version,
+        "fact_set_digest": "",
+        "material_content_hash": material_content_hash,
+        "projection_state": {
+            "actions": {},
+            "completion_reopened": false,
+            "active_identity_watermark": [],
+            "active_identity_truncated": false
+        }
+    })
+    .to_string()
 }
 
 #[test]
@@ -92,9 +142,21 @@ async fn provisional_revision_fts_and_visibility_commit_atomically_and_replay_ex
         contract: WorkContractRow {
             contract_id: contract_id("contract-publication"),
             revision: 1,
-            contract_json: format!(
-                r#"{{"work_id":"work-publication","project_id":"{}","revision":1,"objective":"Ship parser","summary":"Parser work","completed_steps":[],"next_actions":["run tests"],"blockers":[],"artifacts":["src/parser.rs"],"verification":[],"material_content_hash":"b3:one"}}"#,
-                project_id.as_str()
+            contract_json: contract_json(
+                "contract-publication",
+                "work-publication",
+                project_id.as_str(),
+                "active",
+                Some("Ship parser"),
+                "Parser work",
+                &[],
+                &["run tests"],
+                &[],
+                &["src/parser.rs"],
+                &[],
+                datetime!(2026-07-19 12:00 UTC),
+                "deterministic-v1",
+                "b3:one",
             ),
             extractor_version: "deterministic-v1".into(),
             objective: Some("Ship parser".into()),
@@ -134,6 +196,88 @@ async fn provisional_revision_fts_and_visibility_commit_atomically_and_replay_ex
         )
         .unwrap();
     assert_eq!(hit, 1);
+}
+
+#[tokio::test]
+async fn inconsistent_contract_projections_fail_closed_before_any_rows_are_visible() {
+    let fixture = FixtureRuntime::codex_records(1).await;
+    fixture.drain().await.unwrap();
+    let event = &fixture
+        .read_store()
+        .events_after(0, 1, 1024 * 1024)
+        .await
+        .unwrap()[0];
+    let project_id = event.event.project_id().clone();
+    let observed_at = event.event.observed_at();
+    let batch = WorkWriteBatch {
+        visibility_name: "work-projection-validation".into(),
+        expected_event_seq: 0,
+        next_event_seq: event.event_seq,
+        next_event_id: event.event.event_id().clone(),
+        project_id: project_id.clone(),
+        work_id: work_id("work-projection-validation"),
+        status: "active".into(),
+        observed_at,
+        evidence_event_ids: vec![event.event.event_id().clone()],
+        artifact_ids: Vec::new(),
+        edges: Vec::new(),
+        contract: WorkContractRow {
+            contract_id: contract_id("contract-projection-validation"),
+            revision: 1,
+            contract_json: contract_json(
+                "contract-projection-validation",
+                "work-projection-validation",
+                project_id.as_str(),
+                "active",
+                Some("Validate projections"),
+                "Projection validation",
+                &[],
+                &["run tests"],
+                &[],
+                &[],
+                &[],
+                observed_at,
+                "deterministic-v1",
+                "b3:projection-validation",
+            ),
+            extractor_version: "deterministic-v1".into(),
+            objective: Some("Validate projections".into()),
+            summary: "Projection validation".into(),
+            completed_steps: Vec::new(),
+            next_actions: vec!["run tests".into()],
+            blockers: Vec::new(),
+            artifacts: Vec::new(),
+            verification: Vec::new(),
+        },
+    };
+
+    let mut status_mismatch = batch.clone();
+    status_mismatch.status = "blocked".into();
+    assert!(matches!(
+        fixture.writer().apply_work(status_mismatch).await,
+        Err(StoreError::InvalidBatch)
+    ));
+
+    let mut fts_mismatch = batch;
+    fts_mismatch.contract.next_actions.push("tampered".into());
+    assert!(matches!(
+        fixture.writer().apply_work(fts_mismatch).await,
+        Err(StoreError::InvalidBatch)
+    ));
+
+    let connection = Connection::open(fixture.database_path()).unwrap();
+    let counts: (i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT count(*) FROM work_items WHERE work_id = ?1),
+                (SELECT count(*) FROM work_contract_revisions WHERE work_id = ?1),
+                (SELECT count(*) FROM work_search WHERE work_id = ?1),
+                (SELECT count(*) FROM reducer_watermarks WHERE reducer_name = ?2)",
+            params!["work-projection-validation", "work-projection-validation"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(counts, (0, 0, 0, 0));
 }
 
 #[tokio::test]
@@ -226,7 +370,22 @@ async fn invalid_evidence_leaves_no_partial_work_rows_or_visibility_watermark() 
         contract: WorkContractRow {
             contract_id: contract_id("contract-must-rollback"),
             revision: 1,
-            contract_json: r#"{"work_id":"work-must-rollback","project_id":"different-project","revision":1,"material_content_hash":"b3:rollback"}"#.into(),
+            contract_json: contract_json(
+                "contract-rollback",
+                "work-must-rollback",
+                "different-project",
+                "active",
+                None,
+                "",
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                datetime!(2026-07-19 12:00 UTC),
+                "deterministic-v1",
+                "b3:rollback",
+            ),
             extractor_version: "deterministic-v1".into(),
             objective: None,
             summary: String::new(),
@@ -604,9 +763,21 @@ async fn candidate_loading_is_priority_ordered_bounded_and_observably_truncated(
                 contract: WorkContractRow {
                     contract_id: contract_id(&contract),
                     revision: 1,
-                    contract_json: format!(
-                        r#"{{"work_id":"{work}","project_id":"{}","revision":1,"material_content_hash":"b3:{index:03}"}}"#,
-                        event.event.project_id().as_str()
+                    contract_json: contract_json(
+                        &contract,
+                        &work,
+                        event.event.project_id().as_str(),
+                        "active",
+                        None,
+                        "",
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        event.event.observed_at(),
+                        "deterministic-v1",
+                        &format!("b3:{index:03}"),
                     ),
                     extractor_version: "deterministic-v1".into(),
                     objective: None,
