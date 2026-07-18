@@ -262,7 +262,13 @@ fn contains_absolute_path(value: &str) -> bool {
                 || bytes[index - 1].is_ascii_whitespace()
                 || bytes[index - 1].is_ascii_punctuation())
     });
-    windows_drive_path || unix_absolute_path
+    let rooted_backslash = bytes.iter().enumerate().any(|(index, byte)| {
+        *byte == b'\\'
+            && (index == 0
+                || bytes[index - 1].is_ascii_whitespace()
+                || bytes[index - 1].is_ascii_punctuation())
+    });
+    windows_drive_path || unix_absolute_path || rooted_backslash
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -418,50 +424,6 @@ pub fn filter_proposals(
     policy.validate(proposals)
 }
 
-/// Applies authority-filtered refinement to a provisional contract. Every
-/// accepted field is redacted again and must carry valid event provenance.
-///
-/// # Errors
-///
-/// Returns [`SemanticError::InvalidProposal`] when the response shape or
-/// revision counter is invalid.
-pub fn refine_provisional_contract(
-    previous: &ProvisionalContract,
-    proposals: &ProposedAssertions,
-    extractor_version: impl Into<String>,
-) -> Result<ProvisionalContract, SemanticError> {
-    refine_provisional_contract_at_with_policy(
-        previous,
-        proposals,
-        extractor_version,
-        previous.created_at,
-        None,
-    )
-}
-
-/// As [`refine_provisional_contract`] but stamps the new immutable revision
-/// with the extractor observation time.
-///
-/// # Errors
-///
-/// Returns [`SemanticError::InvalidProposal`] when the response shape or
-/// revision counter is invalid, or [`SemanticError::Serialization`] when the
-/// material digest cannot be encoded.
-pub fn refine_provisional_contract_at(
-    previous: &ProvisionalContract,
-    proposals: &ProposedAssertions,
-    extractor_version: impl Into<String>,
-    observed_at: time::OffsetDateTime,
-) -> Result<ProvisionalContract, SemanticError> {
-    refine_provisional_contract_at_with_policy(
-        previous,
-        proposals,
-        extractor_version,
-        observed_at,
-        None,
-    )
-}
-
 /// Refines a contract while using the policy's immutable evidence-to-event
 /// mapping for provenance.
 ///
@@ -474,7 +436,7 @@ pub fn refine_provisional_contract_at_with_policy(
     proposals: &ProposedAssertions,
     extractor_version: impl Into<String>,
     observed_at: time::OffsetDateTime,
-    policy: Option<&SemanticPolicy>,
+    policy: &SemanticPolicy,
 ) -> Result<ProvisionalContract, SemanticError> {
     proposals.validate_shape()?;
     if proposals.assertions.is_empty() {
@@ -483,11 +445,12 @@ pub fn refine_provisional_contract_at_with_policy(
     let mut refined = previous.clone();
     let redaction = RedactionPolicy::new()?;
     for assertion in &proposals.assertions {
+        if assertion.value.trim().is_empty() {
+            return Err(SemanticError::InvalidProposal);
+        }
         let field = canonical_field(&assertion.field).ok_or(SemanticError::InvalidProposal)?;
         let redacted = redaction.redact(&assertion.value, None, DisclosureClass::DerivedText)?;
-        let events = policy
-            .ok_or(SemanticError::InvalidProposal)?
-            .event_ids_for(assertion);
+        let events = policy.event_ids_for(assertion);
         if events.is_empty() {
             return Err(SemanticError::InvalidProposal);
         }
@@ -651,13 +614,22 @@ mod tests {
                 privacy: PrivacyLabel::PrivateLocal,
                 excerpt: "diagnostic C:\\Users\\alice\\secret".into(),
             }],
-            vec![BoundedArtifact {
-                project_id,
-                artifact_id: "artifact-1".into(),
-                state: "modified /private/tmp/secret.txt".into(),
-                privacy: PrivacyLabel::PrivateLocal,
-                disclosure_class: DisclosureClass::AgentStatement,
-            }],
+            vec![
+                BoundedArtifact {
+                    project_id,
+                    artifact_id: "artifact-1".into(),
+                    state: "modified /private/tmp/secret.txt".into(),
+                    privacy: PrivacyLabel::PrivateLocal,
+                    disclosure_class: DisclosureClass::AgentStatement,
+                },
+                BoundedArtifact {
+                    project_id: ProjectId::parse_wire("project-egress").unwrap(),
+                    artifact_id: "artifact-unc".into(),
+                    state: "modified \\\\server\\share\\secret.txt".into(),
+                    privacy: PrivacyLabel::PrivateLocal,
+                    disclosure_class: DisclosureClass::AgentStatement,
+                },
+            ],
         )
         .unwrap();
         assert!(input.new_facts.is_empty());

@@ -9,8 +9,7 @@ pub use semantic::{
     BoundedArtifact, BoundedEvidence, BoundedFact, DisabledExtractor, EndpointPolicy,
     ExtractionInput, LoopbackExtractor, MAX_ASSERTION_VALUE_BYTES, MAX_ASSERTIONS_PER_RUN,
     MAX_EXTRACTION_INPUT_BYTES, MAX_RESPONSE_BYTES, ProposedAssertion, ProposedAssertions,
-    SemanticError, SemanticExtractor, filter_proposals, refine_provisional_contract,
-    refine_provisional_contract_at, refine_provisional_contract_at_with_policy,
+    SemanticError, SemanticExtractor, filter_proposals, refine_provisional_contract_at_with_policy,
 };
 
 pub use contract::{

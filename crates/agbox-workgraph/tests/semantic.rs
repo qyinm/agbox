@@ -3,7 +3,7 @@
 use agbox_core::{Authority, DisclosureClass, EventId, EvidenceId, ProjectId};
 use agbox_workgraph::{
     AuthorityEvidence, EndpointPolicy, ProposedAssertion, ProposedAssertions,
-    ProvisionalContractBuilder, SemanticError, SemanticPolicy, refine_provisional_contract,
+    ProvisionalContractBuilder, SemanticError, SemanticPolicy,
     refine_provisional_contract_at_with_policy,
 };
 
@@ -71,7 +71,7 @@ fn summary_refinement_retains_the_evidence_that_authorized_it() {
         &proposals,
         "semantic-v1",
         previous.created_at,
-        Some(&policy),
+        &policy,
     )
     .unwrap();
     assert_eq!(
@@ -121,7 +121,7 @@ fn summary_refinement_redacts_credentials_before_persistence() {
         &proposals,
         "semantic-v1",
         previous.created_at,
-        Some(&policy),
+        &policy,
     )
     .unwrap();
     assert_eq!(refined.summary, "Authorization: [REDACTED_SECRET]");
@@ -138,8 +138,58 @@ fn empty_or_unsupported_proposals_cannot_create_a_refined_revision() {
         assertions: Vec::new(),
     };
     assert!(matches!(
-        refine_provisional_contract(&previous, &empty, "semantic-v1"),
+        refine_provisional_contract_at_with_policy(
+            &previous,
+            &empty,
+            "semantic-v1",
+            previous.created_at,
+            &SemanticPolicy::default(),
+        ),
         Err(SemanticError::NoAssertions)
+    ));
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn empty_values_are_filtered_and_cannot_create_a_refinement() {
+    let facts = agbox_workgraph::test_support::facts_for_active_parser_work();
+    let previous = ProvisionalContractBuilder::new("deterministic-v1")
+        .build(None, &facts)
+        .unwrap();
+    let empty_values = ProposedAssertions {
+        assertions: ["summary", "blocker", "verification", "objective"]
+            .into_iter()
+            .map(|field| ProposedAssertion {
+                field: field.into(),
+                value: " \t ".into(),
+                authority: Authority::HumanIntent,
+                evidence_refs: Vec::new(),
+                confidence_basis_points: 9_000,
+            })
+            .collect(),
+    };
+    let policy = SemanticPolicy::default();
+    let filtered = policy.validate(empty_values.clone()).unwrap();
+    assert!(filtered.assertions.is_empty());
+    assert!(matches!(
+        refine_provisional_contract_at_with_policy(
+            &previous,
+            &filtered,
+            "semantic-v1",
+            previous.created_at,
+            &policy,
+        ),
+        Err(SemanticError::NoAssertions)
+    ));
+    assert!(matches!(
+        refine_provisional_contract_at_with_policy(
+            &previous,
+            &empty_values,
+            "semantic-v1",
+            previous.created_at,
+            &policy,
+        ),
+        Err(SemanticError::InvalidProposal)
     ));
 }
 
@@ -179,7 +229,7 @@ fn accepted_non_summary_field_is_applied_with_store_provenance() {
         &proposals,
         "semantic-v1",
         previous.created_at,
-        Some(&policy),
+        &policy,
     )
     .unwrap();
     assert_eq!(refined.objective.as_deref(), Some("Ship the parser"));

@@ -1104,7 +1104,7 @@ impl IngestionCoordinator {
                     &proposals,
                     extractor_version.clone(),
                     observed_at,
-                    Some(&authoritative_policy),
+                    &authoritative_policy,
                 )
             });
         match result {

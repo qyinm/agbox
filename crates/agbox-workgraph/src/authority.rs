@@ -169,6 +169,9 @@ impl SemanticPolicy {
             if !is_supported_field(&field) {
                 continue;
             }
+            if proposal.value.trim().is_empty() {
+                continue;
+            }
             let effective = self.effective_authority(&proposal);
             let Some(authority) = effective else {
                 continue;
