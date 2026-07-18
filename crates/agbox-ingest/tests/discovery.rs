@@ -235,6 +235,101 @@ fn deep_dfs_cursor_uses_prefix_sharing_and_stays_within_its_exact_bound() {
 }
 
 #[test]
+fn root_eviction_keeps_a_later_root_sibling_exactly_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut deep = temp.path().join("first");
+    fs::create_dir(&deep).unwrap();
+    for _ in 0..40 {
+        deep.push("d");
+        fs::create_dir(&deep).unwrap();
+    }
+    fs::write(deep.join("deep.jsonl"), b"record").unwrap();
+    fs::write(temp.path().join("later.jsonl"), b"record").unwrap();
+    let mut walker = DiscoveryWalker::new(Provider::Codex, root_spec(temp.path())).unwrap();
+    let mut names = Vec::new();
+    for _ in 0..32 {
+        let batch = walker.next_batch(256).unwrap();
+        assert!(walker.live_stream_count_for_test() <= 32);
+        names.extend(batch.sources.into_iter().map(|source| source.path));
+        if batch.cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        names
+            .iter()
+            .filter(|path| path.ends_with("later.jsonl"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        names
+            .iter()
+            .filter(|path| path.ends_with("deep.jsonl"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn deleted_accounted_child_cannot_suppress_the_following_root_sibling() {
+    let temp = tempfile::tempdir().unwrap();
+    let bad = temp.path().join("bad");
+    fs::create_dir(&bad).unwrap();
+    fs::write(bad.join("ignored.jsonl"), b"record").unwrap();
+    fs::write(temp.path().join("later.jsonl"), b"record").unwrap();
+    let mut walker = DiscoveryWalker::new(Provider::Codex, root_spec(temp.path())).unwrap();
+    let first = walker.next_batch(3).unwrap();
+    fs::remove_dir_all(&bad).unwrap();
+    let mut paths = first
+        .sources
+        .into_iter()
+        .map(|source| source.path)
+        .collect::<Vec<_>>();
+    for _ in 0..16 {
+        match walker.next_batch(256) {
+            Ok(batch) => {
+                paths.extend(batch.sources.into_iter().map(|source| source.path));
+                if batch.cursor.is_none() {
+                    break;
+                }
+            }
+            Err(agbox_ingest::DiscoveryError::InvalidCursor) => break,
+            Err(error) => panic!("unexpected discovery error: {error:?}"),
+        }
+    }
+    if !paths.iter().any(|path| path.ends_with("later.jsonl")) {
+        let mut fresh = DiscoveryWalker::new(Provider::Codex, root_spec(temp.path())).unwrap();
+        let batch = fresh.next_batch(256).unwrap();
+        paths.extend(batch.sources.into_iter().map(|source| source.path));
+    }
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|path| path.ends_with("later.jsonl"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn over_counted_restored_cursor_rejects_early_eof() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("only.jsonl"), b"record").unwrap();
+    let mut walker = DiscoveryWalker::new(Provider::Codex, root_spec(temp.path())).unwrap();
+    let cursor = walker.next_batch(3).unwrap().cursor.unwrap();
+    let mut encoded: serde_json::Value = serde_json::to_value(cursor).unwrap();
+    encoded["pending_directories"][0]["entries_consumed"] = serde_json::json!(999_u64);
+    let cursor = serde_json::from_value(encoded).unwrap();
+    let mut restored =
+        DiscoveryWalker::from_cursor(Provider::Codex, root_spec(temp.path()), cursor).unwrap();
+    assert!(matches!(
+        restored.next_batch(256),
+        Err(agbox_ingest::DiscoveryError::InvalidCursor)
+    ));
+}
+
+#[test]
 fn cursor_debug_redacts_reversible_components() {
     let temp = tempfile::tempdir().unwrap();
     let secret = "SECRET_CURSOR_COMPONENT";
