@@ -8,8 +8,8 @@ use std::time::Duration;
 use std::{collections::BTreeSet, net::IpAddr};
 
 use agbox_core::{
-    Authority, DisclosureClass, EvidenceId, PrivacyLabel, ProjectId, RedactionPolicy,
-    WorkContractRevision,
+    Authority, ContractId, DisclosureClass, EvidenceId, PrivacyLabel, ProjectId, RedactionPolicy,
+    WorkContractRevision, WorkStatus,
 };
 use futures::StreamExt;
 use reqwest::redirect::Policy;
@@ -124,12 +124,84 @@ pub struct BoundedArtifact {
     pub disclosure_class: DisclosureClass,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct ExtractionInput {
     pub previous_contract: WorkContractRevision,
     pub new_facts: Vec<BoundedFact>,
     pub evidence_excerpts: Vec<BoundedEvidence>,
     pub artifact_state: Vec<BoundedArtifact>,
+}
+
+/// The serializable projection deliberately omits source-run IDs,
+/// evidence-object IDs, and disclosure metadata. They are local provenance,
+/// not semantic input, and must never be accepted as extractor egress.
+#[derive(Serialize)]
+struct ExtractionInputWire<'a> {
+    previous_contract: EgressContract<'a>,
+    new_facts: &'a [BoundedFact],
+    evidence_excerpts: &'a [BoundedEvidence],
+    artifact_state: &'a [BoundedArtifact],
+}
+
+#[derive(Serialize)]
+struct EgressContract<'a> {
+    contract_id: &'a ContractId,
+    work_id: &'a agbox_core::WorkId,
+    revision: u64,
+    project_id: &'a ProjectId,
+    objective: Option<&'a str>,
+    status: WorkStatus,
+    summary: &'a str,
+    completed_steps: &'a [String],
+    next_actions: &'a [String],
+    blockers: &'a [String],
+    constraints: &'a [String],
+    completion_criteria: &'a [String],
+    artifacts: &'a [String],
+    verification: &'a [String],
+    confidence_basis_points: u16,
+    created_at: time::OffsetDateTime,
+    extractor_version: &'a str,
+}
+
+impl<'a> From<&'a WorkContractRevision> for EgressContract<'a> {
+    fn from(contract: &'a WorkContractRevision) -> Self {
+        Self {
+            contract_id: contract.contract_id(),
+            work_id: contract.work_id(),
+            revision: contract.revision(),
+            project_id: contract.project_id(),
+            objective: contract.objective(),
+            status: contract.status(),
+            summary: contract.summary(),
+            completed_steps: contract.completed_steps(),
+            next_actions: contract.next_actions(),
+            blockers: contract.blockers(),
+            constraints: contract.constraints(),
+            completion_criteria: contract.completion_criteria(),
+            artifacts: contract.artifacts(),
+            verification: contract.verification(),
+            confidence_basis_points: contract.confidence_basis_points(),
+            created_at: contract.created_at(),
+            extractor_version: contract.extractor_version(),
+        }
+    }
+}
+
+impl Serialize for ExtractionInput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.validate_egress().map_err(serde::ser::Error::custom)?;
+        ExtractionInputWire {
+            previous_contract: EgressContract::from(&self.previous_contract),
+            new_facts: &self.new_facts,
+            evidence_excerpts: &self.evidence_excerpts,
+            artifact_state: &self.artifact_state,
+        }
+        .serialize(serializer)
+    }
 }
 
 impl ExtractionInput {
@@ -147,6 +219,9 @@ impl ExtractionInput {
         mut evidence_excerpts: Vec<BoundedEvidence>,
         mut artifact_state: Vec<BoundedArtifact>,
     ) -> Result<Self, SemanticError> {
+        if contract_contains_absolute_path(&previous_contract) {
+            return Err(SemanticError::InvalidProposal);
+        }
         let project_id = previous_contract.project_id().clone();
         if new_facts.iter().any(|fact| fact.project_id != project_id)
             || evidence_excerpts
@@ -216,6 +291,7 @@ impl ExtractionInput {
         if serde_json::to_vec(&input)?.len() > MAX_EXTRACTION_INPUT_BYTES {
             return Err(SemanticError::InputTooLarge);
         }
+        input.validate_egress()?;
         Ok(input)
     }
 
@@ -230,6 +306,7 @@ impl ExtractionInput {
         project_id: &ProjectId,
         work_id: &agbox_core::WorkId,
     ) -> Result<(), SemanticError> {
+        self.validate_egress()?;
         if self.previous_contract.project_id() != project_id
             || self.previous_contract.work_id() != work_id
             || self
@@ -249,6 +326,45 @@ impl ExtractionInput {
         }
         Ok(())
     }
+
+    fn validate_egress(&self) -> Result<(), SemanticError> {
+        if contract_contains_absolute_path(&self.previous_contract)
+            || self.new_facts.iter().any(|fact| {
+                fact.privacy == PrivacyLabel::RestrictedLocal
+                    || !fact.disclosure_class.is_transferable()
+                    || fact.text.as_deref().is_some_and(contains_absolute_path)
+            })
+            || self.evidence_excerpts.iter().any(|evidence| {
+                evidence.privacy == PrivacyLabel::RestrictedLocal
+                    || !evidence.disclosure_class.is_transferable()
+                    || contains_absolute_path(&evidence.excerpt)
+            })
+            || self.artifact_state.iter().any(|artifact| {
+                artifact.privacy == PrivacyLabel::RestrictedLocal
+                    || !artifact.disclosure_class.is_transferable()
+                    || contains_absolute_path(&artifact.artifact_id)
+                    || contains_absolute_path(&artifact.state)
+            })
+        {
+            return Err(SemanticError::InvalidProposal);
+        }
+        Ok(())
+    }
+}
+
+fn contract_contains_absolute_path(contract: &WorkContractRevision) -> bool {
+    contract.objective().is_some_and(contains_absolute_path)
+        || contains_absolute_path(contract.summary())
+        || contract
+            .completed_steps()
+            .iter()
+            .chain(contract.next_actions())
+            .chain(contract.blockers())
+            .chain(contract.constraints())
+            .chain(contract.completion_criteria())
+            .chain(contract.artifacts())
+            .chain(contract.verification())
+            .any(|value| contains_absolute_path(value))
 }
 
 fn contains_absolute_path(value: &str) -> bool {
@@ -376,6 +492,7 @@ impl SemanticExtractor for LoopbackExtractor {
     }
 
     async fn extract(&self, input: ExtractionInput) -> Result<ProposedAssertions, SemanticError> {
+        input.validate_egress()?;
         let body = serde_json::to_vec(&input)?;
         if body.len() > MAX_EXTRACTION_INPUT_BYTES {
             return Err(SemanticError::InputTooLarge);
@@ -564,7 +681,7 @@ mod tests {
 
     use super::*;
 
-    fn previous_contract(project_id: ProjectId) -> WorkContractRevision {
+    fn previous_contract(project_id: ProjectId, summary: &str) -> WorkContractRevision {
         let redaction = RedactionPolicy::new().unwrap();
         WorkContractRevision::new(WorkContractRevisionDraft {
             contract_id: ContractId::parse_wire("contract-egress").unwrap(),
@@ -574,7 +691,7 @@ mod tests {
             objective: None,
             status: WorkStatus::Active,
             summary: redaction
-                .redact("safe summary", None, DisclosureClass::DerivedText)
+                .redact(summary, None, DisclosureClass::DerivedText)
                 .unwrap(),
             completed_steps: Vec::new(),
             next_actions: Vec::new(),
@@ -597,7 +714,7 @@ mod tests {
     fn bounded_input_filters_embedded_and_artifact_absolute_paths() {
         let project_id = ProjectId::parse_wire("project-egress").unwrap();
         let input = ExtractionInput::bounded(
-            previous_contract(project_id.clone()),
+            previous_contract(project_id.clone(), "safe summary"),
             vec![BoundedFact {
                 project_id: project_id.clone(),
                 evidence_id: EvidenceId::parse_wire("fact-egress").unwrap(),
@@ -635,5 +752,21 @@ mod tests {
         assert!(input.new_facts.is_empty());
         assert!(input.evidence_excerpts.is_empty());
         assert!(input.artifact_state.is_empty());
+        let encoded = serde_json::to_string(&input).unwrap();
+        assert!(!encoded.contains("source_runs"));
+        assert!(!encoded.contains("evidence_refs"));
+        assert!(!encoded.contains("disclosure_class"));
+    }
+
+    #[test]
+    fn absolute_path_detector_covers_previous_contract_text_forms() {
+        for path in [
+            "/Users/alice/private.rs",
+            "C:\\Users\\alice\\private.rs",
+            "\\\\server\\share\\private.rs",
+            "\\Users\\alice\\private.rs",
+        ] {
+            assert!(contains_absolute_path(path));
+        }
     }
 }
