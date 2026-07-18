@@ -259,6 +259,12 @@ impl SourceAdapter for CodexAdapter {
                     &mut retained,
                     &mut lifecycle,
                 ),
+                "inter_agent_communication" => {
+                    decode_inter_agent_message(record, scope, &mut output, &mut retained)
+                }
+                "inter_agent_communication_metadata" => {
+                    decode_agent_lifecycle(record, scope, &mut state, &mut output, &mut lifecycle)
+                }
                 _ => Ok(()),
             }?;
             if terminal_boundary && state.pending_result_count() > 0 {
@@ -1326,6 +1332,8 @@ fn decode_agent_lifecycle(
             &["payload", "threadId"],
             &["payload", "new_thread_id"],
             &["payload", "receiver_thread_id"],
+            &["payload", "agent_thread_id"],
+            &["payload", "recipient"],
             &["payload", "metadata", "agent_id"],
             &["payload", "metadata", "agentId"],
             &["payload", "metadata", "thread_id"],
@@ -1346,6 +1354,7 @@ fn decode_agent_lifecycle(
             &["payload", "action"],
             &["payload", "metadata", "status"],
             &["payload", "metadata", "action"],
+            &["payload", "kind"],
         ],
         MAX_ID_BYTES,
     )?;
@@ -1371,7 +1380,7 @@ fn decode_agent_lifecycle(
             output,
             lifecycle,
         ),
-        Some("cancelled" | "aborted") => stage_agent_finishes(
+        Some("cancelled" | "aborted" | "interrupted") => stage_agent_finishes(
             scope,
             &agent_ids,
             &causation_id,
@@ -1482,6 +1491,7 @@ fn decode_inter_agent_message(
             &["payload", "thread_id"],
             &["payload", "threadId"],
             &["payload", "receiver_thread_id"],
+            &["payload", "recipient"],
         ],
         "agent",
         scope.session_id,
@@ -1498,10 +1508,10 @@ fn decode_inter_agent_message(
         return Ok(());
     };
     let content = capture_first_graph_message(record, retained)?;
-    let Some(content) = content else {
+    let Some((content, media_type)) = content else {
         return Ok(());
     };
-    emit_graph_message(scope, output, agent_id, &causation_id, &content)
+    emit_graph_message(scope, output, agent_id, &causation_id, &content, media_type)
 }
 
 fn emit_graph_message(
@@ -1510,12 +1520,13 @@ fn emit_graph_message(
     agent_id: &str,
     causation_id: &str,
     content: &SecureCapturedString,
+    media_type: &'static str,
 ) -> Result<(), DecodeError> {
     let event_id = output.event_id(scope)?;
     let content_ref = ContentRef::bounded(
         content.hash.clone(),
         content.total_bytes,
-        "text/plain",
+        media_type,
         None,
         DisclosureClass::AgentStatement,
         None,
@@ -1812,7 +1823,7 @@ fn capture_event_message_content(
 fn capture_first_graph_message(
     record: &dyn RecordSource,
     retained: &mut RetainedBudget,
-) -> Result<Option<SecureCapturedString>, DecodeError> {
+) -> Result<Option<(SecureCapturedString, &'static str)>, DecodeError> {
     for path in [
         &["payload", "message"][..],
         &["payload", "message", "content"][..],
@@ -1820,9 +1831,24 @@ fn capture_first_graph_message(
         &["payload", "content"][..],
     ] {
         if let Some(value) = capture_optional_string(record, path, retained.remaining(), true)? {
+            if value.total_bytes == 0 {
+                continue;
+            }
             retained.charge(&value)?;
-            return Ok(Some(value));
+            return Ok(Some((value, "text/plain")));
         }
+    }
+    if let Some(value) = capture_optional_string(
+        record,
+        &["payload", "encrypted_content"],
+        retained.remaining(),
+        false,
+    )? {
+        if value.total_bytes == 0 {
+            return Ok(None);
+        }
+        retained.charge(&value)?;
+        return Ok(Some((value, "application/octet-stream")));
     }
     Ok(None)
 }
@@ -1877,12 +1903,17 @@ fn capture_graph_causation(
     if let Some(parent) = explicit.into_iter().next() {
         return Ok(Some(parent));
     }
+    let event = capture_graph_ids(record, &[&["payload", "event_id"]], "parent", session_id)?;
+    if let Some(event) = event.into_iter().next() {
+        return Ok(Some(event));
+    }
     let sender = capture_graph_ids(
         record,
         &[
             &["payload", "from_agent_id"],
             &["payload", "fromAgentId"],
             &["payload", "sender_agent_id"],
+            &["payload", "author"],
         ],
         "parent",
         session_id,
@@ -2887,6 +2918,8 @@ fn known_top_type(value: &str) -> bool {
             | "turn_context"
             | "compacted"
             | "world_state"
+            | "inter_agent_communication"
+            | "inter_agent_communication_metadata"
     )
 }
 

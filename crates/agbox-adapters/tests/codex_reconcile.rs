@@ -56,7 +56,7 @@ fn codex_subagent_activity_preserves_parent_relationships_without_raw_graph_data
             .iter()
             .filter(|event| matches!(event.payload(), EventPayload::AgentStarted { .. }))
             .count(),
-        3
+        2
     );
     assert_eq!(
         events
@@ -115,11 +115,13 @@ fn codex_subagent_activity_preserves_parent_relationships_without_raw_graph_data
         "PRIVATE_PARENT",
         "PRIVATE_FORK",
         "PRIVATE_SENDER",
+        "PRIVATE_OTHER_AGENT",
         "PRIVATE_TOKEN",
         "PRIVATE_DELEGATED_PROMPT",
         "PRIVATE_REASONING",
         "PRIVATE_INTER_AGENT_MESSAGE",
         "PRIVATE_MESSAGE_REASONING",
+        "PRIVATE_METADATA_PROMPT",
         "PRIVATE_AGENT_RESULT",
         "PRIVATE_FINISH_REASONING",
         "/Users/alice",
@@ -247,6 +249,242 @@ fn graph_identities_are_provider_session_and_domain_separated() {
 }
 
 #[test]
+fn flattened_producer_communication_maps_parent_correlated_hash_only_message() {
+    let decoded = decode_one(
+        r#"{"timestamp":"2026-07-17T03:00:00Z","type":"inter_agent_communication","payload":{"id":"PRIVATE_MESSAGE_ID","author":"/root/PRIVATE_AUTHOR_/Users/alice","recipient":"/root/PRIVATE_RECIPIENT_/Users/alice","other_recipients":["/root/PRIVATE_OTHER"],"content":"PRIVATE_FLATTENED_MESSAGE token=PRIVATE_TOKEN /Users/alice","encrypted_content":"QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=","trigger_turn":true,"future":{"reasoning":"PRIVATE_ADDITIVE"}}}"#,
+        &DecoderState::default(),
+    );
+    assert!(matches!(decoded.disposition(), DecodeDisposition::Known));
+    let message = decoded
+        .events()
+        .iter()
+        .find(|event| matches!(event.payload(), EventPayload::MessageCreated { .. }))
+        .unwrap();
+    assert_eq!(message.actor(), Actor::Agent);
+    assert!(message.correlation_id().is_some());
+    assert!(message.causation_id().is_some());
+    assert_ne!(message.correlation_id(), message.causation_id());
+    let EventPayload::MessageCreated { content } = message.payload() else {
+        unreachable!();
+    };
+    assert_eq!(
+        content.hash(),
+        blake3::hash(b"PRIVATE_FLATTENED_MESSAGE token=PRIVATE_TOKEN /Users/alice")
+            .to_hex()
+            .as_str()
+    );
+    assert_eq!(
+        content.byte_length(),
+        "PRIVATE_FLATTENED_MESSAGE token=PRIVATE_TOKEN /Users/alice".len() as u64
+    );
+    assert!(content.redacted_excerpt().is_none());
+    assert!(content.local_locator().is_none());
+    assert!(decoded.evidence().is_empty());
+    let serialized = serde_json::to_string(decoded.events()).unwrap();
+    let state = String::from_utf8(decoded.next_state().as_bytes().to_vec()).unwrap();
+    let debug = format!("{decoded:?}");
+    for forbidden in [
+        "PRIVATE_MESSAGE_ID",
+        "PRIVATE_AUTHOR",
+        "PRIVATE_RECIPIENT",
+        "PRIVATE_OTHER",
+        "PRIVATE_FLATTENED_MESSAGE",
+        "PRIVATE_TOKEN",
+        "PRIVATE_ADDITIVE",
+        "/Users/alice",
+        "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=",
+    ] {
+        assert!(!serialized.contains(forbidden));
+        assert!(!state.contains(forbidden));
+        assert!(!debug.contains(forbidden));
+    }
+}
+
+#[test]
+fn flattened_encrypted_communication_hashes_ciphertext_without_retaining_it() {
+    let ciphertext = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=";
+    let decoded = decode_one(
+        &format!(
+            r#"{{"type":"inter_agent_communication","payload":{{"author":"parent","recipient":"child","content":"","encrypted_content":"{ciphertext}","trigger_turn":false}}}}"#
+        ),
+        &DecoderState::default(),
+    );
+    let content = decoded
+        .events()
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::MessageCreated { content } => Some(content),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        content.hash(),
+        blake3::hash(ciphertext.as_bytes()).to_hex().as_str()
+    );
+    assert_eq!(content.byte_length(), ciphertext.len() as u64);
+    assert_eq!(content.media_type(), "application/octet-stream");
+    assert!(content.redacted_excerpt().is_none());
+    assert!(decoded.evidence().is_empty());
+    assert!(
+        !serde_json::to_string(decoded.events())
+            .unwrap()
+            .contains(ciphertext)
+    );
+    assert!(!format!("{decoded:?}").contains(ciphertext));
+}
+
+#[test]
+fn flattened_metadata_stages_one_start_finish_and_suppresses_replay() {
+    let mut state = DecoderState::default();
+    let records = [
+        r#"{"type":"inter_agent_communication_metadata","payload":{"agent_thread_id":"PRIVATE_FLAT_AGENT","parent_thread_id":"PRIVATE_FLAT_PARENT","kind":"started","trigger_turn":true}}"#,
+        r#"{"type":"inter_agent_communication_metadata","payload":{"agent_thread_id":"PRIVATE_FLAT_AGENT","parent_thread_id":"PRIVATE_FLAT_PARENT","kind":"started","trigger_turn":true}}"#,
+        r#"{"type":"inter_agent_communication_metadata","payload":{"agent_thread_id":"PRIVATE_FLAT_AGENT","parent_thread_id":"PRIVATE_FLAT_PARENT","kind":"completed","trigger_turn":false}}"#,
+        r#"{"type":"inter_agent_communication_metadata","payload":{"agent_thread_id":"PRIVATE_FLAT_AGENT","parent_thread_id":"PRIVATE_FLAT_PARENT","kind":"failed","trigger_turn":false}}"#,
+    ]
+    .into_iter()
+    .map(|json| {
+        let decoded = decode_one(json, &state);
+        state = decoded.next_state().clone();
+        decoded
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(records.iter().map(agent_started).sum::<usize>(), 1);
+    assert_eq!(
+        records
+            .iter()
+            .flat_map(agbox_adapters::DecodedRecord::events)
+            .filter(|event| matches!(event.payload(), EventPayload::AgentFinished { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        records
+            .iter()
+            .flat_map(agbox_adapters::DecodedRecord::events)
+            .all(|event| event.causation_id().is_some() && event.correlation_id().is_some())
+    );
+    let combined = format!("{records:?}{}", String::from_utf8_lossy(state.as_bytes()));
+    assert!(!combined.contains("PRIVATE_FLAT_AGENT"));
+    assert!(!combined.contains("PRIVATE_FLAT_PARENT"));
+}
+
+#[test]
+fn real_sub_agent_activity_paths_emit_opaque_parent_correlated_lifecycle() {
+    let started = decode_one(
+        r#"{"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"call_PRIVATE_SPAWN","occurred_at_ms":1783686676512,"agent_thread_id":"PRIVATE_REAL_THREAD","agent_path":"/root/PRIVATE_REAL_PATH","kind":"started"}}"#,
+        &DecoderState::default(),
+    );
+    let event = started
+        .events()
+        .iter()
+        .find(|event| matches!(event.payload(), EventPayload::AgentStarted { .. }))
+        .unwrap();
+    assert!(event.correlation_id().is_some());
+    assert!(event.causation_id().is_some());
+    let EventPayload::AgentStarted { native_agent_id } = event.payload() else {
+        unreachable!();
+    };
+    assert!(native_agent_id.starts_with("codex_graph_"));
+    let serialized = serde_json::to_string(started.events()).unwrap();
+    let state = String::from_utf8(started.next_state().as_bytes().to_vec()).unwrap();
+    let debug = format!("{started:?}");
+    for forbidden in [
+        "PRIVATE_SPAWN",
+        "PRIVATE_REAL_THREAD",
+        "PRIVATE_REAL_PATH",
+        "/root/",
+    ] {
+        assert!(!serialized.contains(forbidden));
+        assert!(!state.contains(forbidden));
+        assert!(!debug.contains(forbidden));
+    }
+}
+
+#[test]
+fn real_trigger_only_metadata_is_known_but_does_not_invent_lifecycle() {
+    for trigger_turn in [true, false] {
+        let decoded = decode_one(
+            &format!(
+                r#"{{"type":"inter_agent_communication_metadata","payload":{{"trigger_turn":{trigger_turn}}}}}"#
+            ),
+            &DecoderState::default(),
+        );
+        assert!(matches!(decoded.disposition(), DecodeDisposition::Known));
+        assert!(decoded.events().is_empty());
+        assert!(decoded.evidence().is_empty());
+    }
+}
+
+#[test]
+fn flattened_malformed_semantics_quarantine_then_valid_ordinal_recovers() {
+    let first = decode_one(
+        r#"{"timestamp":"2026-07-17T03:00:00Z","ordinal":0,"type":"session_meta","payload":{"history_mode":"paginated"}}"#,
+        &DecoderState::default(),
+    );
+    let malformed = decode_one(
+        r#"{"timestamp":"2026-07-17T03:00:01Z","ordinal":1,"type":"inter_agent_communication","payload":{"author":"parent","recipient":"one","recipient":{"secret":"PRIVATE_HETEROGENEOUS_RECIPIENT"},"content":"PRIVATE_MALFORMED_MESSAGE","trigger_turn":true}}"#,
+        first.next_state(),
+    );
+    assert!(matches!(
+        malformed.disposition(),
+        DecodeDisposition::Malformed { .. }
+    ));
+    assert!(malformed.events().is_empty());
+    let progressed: serde_json::Value =
+        serde_json::from_slice(malformed.next_state().as_bytes()).unwrap();
+    assert_eq!(progressed["last_ordinal"], 1);
+    assert!(!format!("{malformed:?}").contains("PRIVATE_HETEROGENEOUS_RECIPIENT"));
+    assert!(!format!("{malformed:?}").contains("PRIVATE_MALFORMED_MESSAGE"));
+
+    let recovered = decode_one(
+        r#"{"timestamp":"2026-07-17T03:00:02Z","ordinal":2,"type":"inter_agent_communication","payload":{"author":"parent","recipient":"child","content":"valid recovery","trigger_turn":true}}"#,
+        malformed.next_state(),
+    );
+    assert!(matches!(recovered.disposition(), DecodeDisposition::Known));
+    assert!(
+        recovered
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::MessageCreated { .. }))
+    );
+}
+
+#[test]
+fn flattened_additive_fields_only_change_schema_fingerprint() {
+    let baseline = decode_one(
+        r#"{"type":"inter_agent_communication","payload":{"author":"parent","recipient":"child","content":"message","trigger_turn":true}}"#,
+        &DecoderState::default(),
+    );
+    let additive = decode_one(
+        r#"{"type":"inter_agent_communication","payload":{"author":"parent","recipient":"child","content":"message","trigger_turn":true,"future":{"reasoning":"PRIVATE_FUTURE_REASONING","path":"/Users/alice/private"}}}"#,
+        &DecoderState::default(),
+    );
+    assert_ne!(
+        baseline.observation().schema_fingerprint(),
+        additive.observation().schema_fingerprint()
+    );
+    let message_projection = |record: &agbox_adapters::DecodedRecord| {
+        record
+            .events()
+            .iter()
+            .find_map(|event| match event.payload() {
+                EventPayload::MessageCreated { content } => Some((
+                    event.correlation_id().map(str::to_owned),
+                    event.causation_id().map(str::to_owned),
+                    content.hash().to_owned(),
+                    content.byte_length(),
+                )),
+                _ => None,
+            })
+    };
+    assert_eq!(message_projection(&baseline), message_projection(&additive));
+    let additive_debug = format!("{additive:?}");
+    assert!(!additive_debug.contains("PRIVATE_FUTURE_REASONING"));
+    assert!(!additive_debug.contains("/Users/alice"));
+}
+
+#[test]
 fn lifecycle_window_is_bounded_and_evicted_identity_can_restart() {
     let mut state = DecoderState::default();
     let mut first_id = None;
@@ -322,6 +560,10 @@ fn two_identities_in_one_record_survive_final_state_staging() {
 #[test]
 fn malformed_null_duplicate_and_heterogeneous_graph_fields_recover_by_ordinal() {
     let bad_records = [
+        r#"{"timestamp":"2026-07-17T03:00:01Z","ordinal":1,"type":"inter_agent_communication","payload":{"author":null,"recipient":"child","content":"PRIVATE_NULL_AUTHOR","trigger_turn":true}}"#,
+        r#"{"timestamp":"2026-07-17T03:00:01Z","ordinal":1,"type":"inter_agent_communication_metadata","payload":{"agent_thread_id":null,"parent_thread_id":"parent","kind":"started","trigger_turn":true}}"#,
+        r#"{"timestamp":"2026-07-17T03:00:01Z","ordinal":1,"type":"inter_agent_communication_metadata","payload":{"agent_thread_id":"agent","parent_thread_id":"parent","kind":{"future":true},"trigger_turn":true}}"#,
+        r#"{"timestamp":"2026-07-17T03:00:01Z","ordinal":1,"type":"inter_agent_communication_metadata","payload":{"agent_thread_id":"agent","parent_thread_id":"parent","kind":"started","kind":"completed","trigger_turn":true}}"#,
         r#"{"timestamp":"2026-07-17T03:00:01Z","ordinal":1,"type":"event_msg","payload":{"type":"sub_agent_activity","agent_id":null,"parent_thread_id":"parent","status":"started"}}"#,
         r#"{"timestamp":"2026-07-17T03:00:01Z","ordinal":1,"type":"event_msg","payload":{"type":"sub_agent_activity","agent_id":"agent","parent_thread_id":"parent","status":null}}"#,
         r#"{"timestamp":"2026-07-17T03:00:01Z","ordinal":1,"type":"event_msg","payload":{"type":"sub_agent_activity","agent_id":"agent","parent_thread_id":"parent","status":{"future":true}}}"#,
@@ -340,6 +582,7 @@ fn malformed_null_duplicate_and_heterogeneous_graph_fields_recover_by_ordinal() 
             serde_json::from_slice(isolated.next_state().as_bytes()).unwrap();
         assert_eq!(progressed["last_ordinal"], 1);
         assert!(!format!("{isolated:?}").contains("PRIVATE_HETEROGENEOUS"));
+        assert!(!format!("{isolated:?}").contains("PRIVATE_NULL_AUTHOR"));
         let recovered = decode_one(
             r#"{"timestamp":"2026-07-17T03:00:02Z","ordinal":2,"type":"event_msg","payload":{"type":"sub_agent_activity","agent_id":"recovered","parent_thread_id":"parent","status":"started"}}"#,
             isolated.next_state(),
@@ -355,7 +598,7 @@ fn unknown_graph_variant_does_not_inspect_irrelevant_fields() {
         &DecoderState::default(),
     );
     let unknown = decode_one(
-        r#"{"timestamp":"2026-07-17T03:00:01Z","ordinal":1,"type":"event_msg","payload":{"type":"future_graph_variant","agent_id":{"token":"PRIVATE_UNKNOWN_AGENT"},"parent_thread_id":["PRIVATE_UNKNOWN_PARENT"],"status":{"reasoning":"PRIVATE_UNKNOWN_REASONING"}}}"#,
+        r#"{"timestamp":"2026-07-17T03:00:01Z","ordinal":1,"type":"future_inter_agent_communication","payload":{"author":{"token":"PRIVATE_UNKNOWN_AGENT"},"recipient":["PRIVATE_UNKNOWN_PARENT"],"content":{"reasoning":"PRIVATE_UNKNOWN_REASONING"}}}"#,
         first.next_state(),
     );
     assert!(matches!(
