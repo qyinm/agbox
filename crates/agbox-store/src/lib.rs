@@ -23,7 +23,7 @@ pub use read::{
     EvidenceMetadata, MAX_EVENT_PAGE_BYTES, MAX_EVENT_PAGE_ROWS, READ_POOL_SIZE, ReadPool,
     ReadStore, ReducerWatermark, StoredEvent,
 };
-pub use retention::{ForgetOutcome, ForgetTarget, RetentionTick};
+pub use retention::{ForgetOutcome, ForgetTarget, RetentionConfig, RetentionTick};
 pub use writer::{
     CommitReceipt, CommitSubmission, ContentRefWrite, CursorState, EvidenceLink, EvidenceOwner,
     EvidenceWrite, ExtractorApplyReceipt, ExtractorWriteBatch, GraphActionRow, GraphApplyReceipt,

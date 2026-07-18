@@ -122,6 +122,7 @@ impl StoreWriter for Writer {
         _: WorkId,
         _: &'static str,
         _: String,
+        _: &'static str,
         _: OffsetDateTime,
     ) -> Result<HumanCorrectionReceipt, StoreError> {
         Ok(HumanCorrectionReceipt {

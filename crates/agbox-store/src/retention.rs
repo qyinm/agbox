@@ -2,6 +2,26 @@
 
 use agbox_core::{ProjectId, WorkId};
 
+/// Runtime policy supplied to the bounded maintenance hook.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetentionConfig {
+    pub evidence_retention_days: u32,
+}
+
+impl RetentionConfig {
+    /// Creates a policy, rejecting an unbounded zero-day window.
+    #[must_use]
+    pub const fn new(evidence_retention_days: u32) -> Option<Self> {
+        if evidence_retention_days == 0 {
+            None
+        } else {
+            Some(Self {
+                evidence_retention_days,
+            })
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ForgetTarget {
     Work(WorkId),

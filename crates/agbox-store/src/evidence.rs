@@ -254,7 +254,7 @@ impl EvidenceVault {
     ) -> Result<Vec<EvidenceId>, EvidenceError> {
         ensure_owner_directory(&self.root)?;
         let mut candidates = Vec::new();
-        for entry in std::fs::read_dir(&self.root)?.take(256) {
+        for entry in std::fs::read_dir(&self.root)? {
             let entry = entry?;
             let name = entry.file_name();
             let text = name.to_string_lossy();
@@ -270,6 +270,9 @@ impl EvidenceVault {
                 .unwrap_or(Duration::ZERO);
             if age >= Duration::from_hours(24) {
                 candidates.push(id);
+                if candidates.len() == 256 {
+                    break;
+                }
             }
         }
         Ok(candidates)

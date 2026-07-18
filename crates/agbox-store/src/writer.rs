@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     AuditRecord, EvidenceContext, EvidenceOwnerRef, EvidenceVault, ForgetOutcome, ForgetTarget,
-    RetentionTick, StoreError,
+    RetentionConfig, RetentionTick, StoreError,
 };
 
 pub const MAX_BATCH_BYTES: usize = agbox_core::limits::MAX_BATCH_SEMANTIC_BYTES;
@@ -1286,6 +1286,7 @@ pub(crate) enum WriteCommand {
         work_id: WorkId,
         field: String,
         value: String,
+        actor: &'static str,
         observed_at: OffsetDateTime,
         reply: oneshot::Sender<Result<HumanCorrectionReceipt, StoreError>>,
     },
@@ -1315,6 +1316,7 @@ pub(crate) enum WriteCommand {
     },
     RetentionTick {
         observed_at: OffsetDateTime,
+        retention_days: Option<u32>,
         reply: oneshot::Sender<Result<RetentionTick, StoreError>>,
     },
     OrphanCleanup {
@@ -1511,11 +1513,32 @@ impl WriterHandle {
         value: String,
         observed_at: OffsetDateTime,
     ) -> Result<HumanCorrectionReceipt, StoreError> {
+        self.apply_human_correction_as(project_id, work_id, field, value, "human_cli", observed_at)
+            .await
+    }
+
+    /// Applies a bounded correction and records its accepted audit row in the
+    /// same immediate transaction as the new immutable revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an ownership, validation, vault, or database error without a
+    /// partially committed correction.
+    pub async fn apply_human_correction_as(
+        &self,
+        project_id: ProjectId,
+        work_id: WorkId,
+        field: String,
+        value: String,
+        actor: &'static str,
+        observed_at: OffsetDateTime,
+    ) -> Result<HumanCorrectionReceipt, StoreError> {
         if !bounded_identifier(project_id.as_str())
             || !bounded_identifier(work_id.as_str())
             || value.is_empty()
             || value.len() > agbox_core::limits::MAX_INLINE_BYTES
             || correction_field(&field).is_none()
+            || !matches!(actor, "human_cli" | "human_tui")
         {
             return Err(StoreError::InvalidBatch);
         }
@@ -1526,6 +1549,7 @@ impl WriterHandle {
                 work_id,
                 field,
                 value,
+                actor,
                 observed_at,
                 reply,
             })
@@ -1686,9 +1710,29 @@ impl WriterHandle {
         &self,
         observed_at: OffsetDateTime,
     ) -> Result<RetentionTick, StoreError> {
+        self.run_retention_with_days(None, observed_at).await
+    }
+
+    /// Applies an explicit evidence-retention window to at most 256 objects.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded validation, database, or writer error.
+    pub async fn run_retention_with_days(
+        &self,
+        retention_days: Option<u32>,
+        observed_at: OffsetDateTime,
+    ) -> Result<RetentionTick, StoreError> {
+        if retention_days.is_some_and(|days| days == 0) {
+            return Err(StoreError::InvalidBatch);
+        }
         let (reply, receive) = oneshot::channel();
         self.sender
-            .send(WriteCommand::RetentionTick { observed_at, reply })
+            .send(WriteCommand::RetentionTick {
+                observed_at,
+                retention_days,
+                reply,
+            })
             .await
             .map_err(|_| StoreError::WriterStopped)?;
         receive.await.map_err(|_| StoreError::WriterStopped)?
@@ -1710,6 +1754,45 @@ impl WriterHandle {
             .await
             .map_err(|_| StoreError::WriterStopped)?;
         receive.await.map_err(|_| StoreError::WriterStopped)?
+    }
+
+    /// Runs the complete bounded maintenance cycle for a configured policy.
+    ///
+    /// The caller (normally a scheduler) supplies the policy explicitly so a
+    /// missing expiry timestamp cannot silently disable retention. Each phase
+    /// is independently capped at 256 rows/files.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first writer, database, or vault error from a maintenance
+    /// phase. Earlier committed phases remain auditable and retryable.
+    pub async fn maintenance_tick(
+        &self,
+        config: RetentionConfig,
+        observed_at: OffsetDateTime,
+    ) -> Result<RetentionTick, StoreError> {
+        if config.evidence_retention_days == 0 {
+            return Err(StoreError::InvalidBatch);
+        }
+        let marked = self
+            .run_retention_with_days(Some(config.evidence_retention_days), observed_at)
+            .await?;
+        let orphans = self.cleanup_orphans(observed_at).await?;
+        let deleted = self.drain_deletion_queue().await?;
+        Ok(RetentionTick {
+            attempted: marked
+                .attempted
+                .saturating_add(orphans.attempted)
+                .saturating_add(deleted.attempted),
+            deleted: marked
+                .deleted
+                .saturating_add(orphans.deleted)
+                .saturating_add(deleted.deleted),
+            failed: marked
+                .failed
+                .saturating_add(orphans.failed)
+                .saturating_add(deleted.failed),
+        })
     }
 
     /// Writes a typed allowlisted audit operation without recording user data.
@@ -1752,7 +1835,7 @@ impl WriterHandle {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 pub(crate) fn run_writer(
     mut connection: rusqlite::Connection,
     vault: Arc<EvidenceVault>,
@@ -1787,6 +1870,7 @@ pub(crate) fn run_writer(
                 work_id,
                 field,
                 value,
+                actor,
                 observed_at,
                 reply,
             } => {
@@ -1797,6 +1881,7 @@ pub(crate) fn run_writer(
                     &work_id,
                     &field,
                     &value,
+                    actor,
                     observed_at,
                 ));
             }
@@ -1838,8 +1923,12 @@ pub(crate) fn run_writer(
             WriteCommand::DrainDeletionQueue { reply } => {
                 let _ = reply.send(drain_deletion_queue(&mut connection, &vault));
             }
-            WriteCommand::RetentionTick { observed_at, reply } => {
-                let _ = reply.send(run_retention(&mut connection, observed_at));
+            WriteCommand::RetentionTick {
+                observed_at,
+                retention_days,
+                reply,
+            } => {
+                let _ = reply.send(run_retention(&mut connection, observed_at, retention_days));
             }
             WriteCommand::OrphanCleanup { observed_at, reply } => {
                 let _ = reply.send(cleanup_orphans(&mut connection, &vault, observed_at));
@@ -2701,7 +2790,7 @@ fn correction_field(value: &str) -> Option<(&'static str, bool)> {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn apply_human_correction(
     connection: &mut rusqlite::Connection,
     vault: &EvidenceVault,
@@ -2709,6 +2798,7 @@ fn apply_human_correction(
     work_id: &WorkId,
     field: &str,
     value: &str,
+    actor: &str,
     observed_at: OffsetDateTime,
 ) -> Result<HumanCorrectionReceipt, StoreError> {
     let Some((json_field, list)) = correction_field(field) else {
@@ -2849,6 +2939,22 @@ fn apply_human_correction(
         "UPDATE work_items SET updated_at=?3 WHERE project_id=?1 AND work_id=?2",
         params![project_id.as_str(), work_id.as_str(), timestamp],
     )?;
+    let audit_id = format!("audit_correction_{}", uuid::Uuid::new_v4().simple());
+    let detail = format!(
+        r#"{{"result":"accepted","contract_id":"{}","revision":{revision}}}"#,
+        contract_id.as_str()
+    );
+    transaction.execute(
+        "INSERT INTO audit_events(audit_id,kind,project_id,work_id,actor,detail_json,created_at) VALUES (?1,'handoff.correction',?2,?3,?4,?5,?6)",
+        params![
+            audit_id,
+            project_id.as_str(),
+            work_id.as_str(),
+            actor,
+            detail,
+            timestamp
+        ],
+    )?;
     transaction.commit()?;
     Ok(HumanCorrectionReceipt {
         evidence_id,
@@ -2898,6 +3004,19 @@ fn forget(
         .optional()?;
     if exists.is_none() {
         return Err(StoreError::InvalidReference);
+    }
+    if let Some(work_id) = &work_id {
+        // A work-owned blob is encrypted with the owner's AAD. Refusing to
+        // forget a shared owner prevents the surviving work from retaining a
+        // row whose ciphertext can no longer be opened under its identity.
+        let shared_owner: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM evidence_objects e INNER JOIN work_evidence own ON own.evidence_id=e.evidence_id WHERE e.project_id=?1 AND e.owner_kind='work' AND e.owner_id=?2 AND EXISTS (SELECT 1 FROM work_evidence other WHERE other.evidence_id=e.evidence_id AND other.work_id<>?2))",
+            params![scope_project.as_str(), work_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if shared_owner {
+            return Err(StoreError::InvalidReference);
+        }
     }
     let job = format!("delete_{}", uuid::Uuid::new_v4().simple());
     let project_hash = blake3::hash(scope_project.as_str().as_bytes())
@@ -3027,18 +3146,27 @@ fn drain_deletion_queue(
     for (job, raw_id) in jobs {
         result.attempted += 1;
         let Some(id) = EvidenceId::parse_wire(&raw_id) else {
-            connection.execute("UPDATE evidence_delete_queue SET attempts = attempts + 1, state = 'failed', last_error_code = 'invalid_evidence_id' WHERE deletion_job_id = ?1 AND evidence_id = ?2", params![job, raw_id])?;
-            maintenance_audit(
-                connection,
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute("UPDATE evidence_delete_queue SET attempts = attempts + 1, state = 'failed', last_error_code = 'invalid_evidence_id' WHERE deletion_job_id = ?1 AND evidence_id = ?2", params![job, raw_id])?;
+            maintenance_audit_transaction(
+                &transaction,
                 "retention.delete.failed",
                 None,
                 "invalid_evidence_id",
             )?;
+            transaction.commit()?;
             result.failed += 1;
             continue;
         };
         if let Ok(()) = vault.remove(&id) {
-            let metadata: Option<(String, String)> = connection
+            // The unlink is deliberately outside SQLite, but every resulting
+            // metadata transition, audit row, and queue removal commits as
+            // one database transaction. A failed commit leaves the queue
+            // retryable instead of recording a partial state.
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let metadata: Option<(String, String)> = transaction
                 .query_row(
                     "SELECT project_id, blob_state FROM evidence_objects WHERE evidence_id = ?1",
                     [raw_id.as_str()],
@@ -3048,18 +3176,32 @@ fn drain_deletion_queue(
             if let Some((project, state)) = metadata
                 && state == "delete_pending"
             {
-                connection.execute("UPDATE evidence_objects SET blob_state = 'expired', retired_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE evidence_id = ?1 AND blob_state = 'delete_pending'", [raw_id.as_str()])?;
+                transaction.execute("UPDATE evidence_objects SET blob_state = 'expired', retired_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE evidence_id = ?1 AND blob_state = 'delete_pending'", [raw_id.as_str()])?;
                 let project = ProjectId::parse_wire(&project).ok_or(StoreError::InvalidBatch)?;
-                maintenance_audit(connection, "retention.expired", Some(&project), "ok")?;
+                maintenance_audit_transaction(
+                    &transaction,
+                    "retention.expired",
+                    Some(&project),
+                    "ok",
+                )?;
             }
-            connection.execute(
+            transaction.execute(
                 "DELETE FROM evidence_delete_queue WHERE deletion_job_id = ?1 AND evidence_id = ?2",
                 params![job, raw_id],
             )?;
+            transaction.commit()?;
             result.deleted += 1;
         } else {
-            connection.execute("UPDATE evidence_delete_queue SET attempts = attempts + 1, state = 'failed', last_error_code = 'unlink_failed' WHERE deletion_job_id = ?1 AND evidence_id = ?2", params![job, raw_id])?;
-            maintenance_audit(connection, "retention.delete.failed", None, "unlink_failed")?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute("UPDATE evidence_delete_queue SET attempts = attempts + 1, state = 'failed', last_error_code = 'unlink_failed' WHERE deletion_job_id = ?1 AND evidence_id = ?2", params![job, raw_id])?;
+            maintenance_audit_transaction(
+                &transaction,
+                "retention.delete.failed",
+                None,
+                "unlink_failed",
+            )?;
+            transaction.commit()?;
             result.failed += 1;
         }
     }
@@ -3069,12 +3211,21 @@ fn drain_deletion_queue(
 fn run_retention(
     connection: &mut rusqlite::Connection,
     observed_at: OffsetDateTime,
+    retention_days: Option<u32>,
 ) -> Result<RetentionTick, StoreError> {
     let timestamp = format_timestamp(observed_at)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let job = format!("retain_{}", uuid::Uuid::new_v4().simple());
-    let rows = transaction.execute("UPDATE evidence_objects SET blob_state = 'delete_pending' WHERE evidence_id IN (SELECT evidence_id FROM evidence_objects WHERE blob_state = 'available' AND expires_at IS NOT NULL AND expires_at <= ?1 ORDER BY expires_at LIMIT 256) AND blob_state = 'available'", [timestamp.as_str()])?;
-    transaction.execute("INSERT OR IGNORE INTO evidence_delete_queue(deletion_job_id,evidence_id,project_hash,attempts,state,created_at) SELECT ?1,evidence_id,lower(hex(project_id)),0,'pending',?2 FROM evidence_objects WHERE blob_state = 'delete_pending' AND retired_at IS NULL AND NOT EXISTS (SELECT 1 FROM evidence_delete_queue q WHERE q.evidence_id = evidence_objects.evidence_id)", params![job, timestamp])?;
+    let rows = if let Some(days) = retention_days {
+        let cutoff = observed_at
+            .checked_sub(time::Duration::days(i64::from(days)))
+            .ok_or(StoreError::InvalidBatch)?;
+        let cutoff = format_timestamp(cutoff)?;
+        transaction.execute("UPDATE evidence_objects SET blob_state = 'delete_pending' WHERE evidence_id IN (SELECT evidence_id FROM evidence_objects WHERE blob_state = 'available' AND ((expires_at IS NOT NULL AND expires_at <= ?1) OR (expires_at IS NULL AND created_at <= ?2)) ORDER BY created_at LIMIT 256) AND blob_state = 'available'", rusqlite::params![timestamp.as_str(), cutoff])?
+    } else {
+        transaction.execute("UPDATE evidence_objects SET blob_state = 'delete_pending' WHERE evidence_id IN (SELECT evidence_id FROM evidence_objects WHERE blob_state = 'available' AND expires_at IS NOT NULL AND expires_at <= ?1 ORDER BY expires_at LIMIT 256) AND blob_state = 'available'", [timestamp.as_str()])?
+    };
+    transaction.execute("INSERT OR IGNORE INTO evidence_delete_queue(deletion_job_id,evidence_id,project_hash,attempts,state,created_at) SELECT ?1,evidence_id,lower(hex(project_id)),0,'pending',?2 FROM evidence_objects WHERE blob_state = 'delete_pending' AND retired_at IS NULL AND NOT EXISTS (SELECT 1 FROM evidence_delete_queue q WHERE q.evidence_id = evidence_objects.evidence_id) ORDER BY created_at LIMIT 256", params![job, timestamp])?;
     transaction.commit()?;
     Ok(RetentionTick {
         attempted: u64::try_from(rows).map_err(|_| StoreError::InvalidBatch)?,
@@ -3127,6 +3278,17 @@ fn maintenance_audit(
 ) -> Result<(), StoreError> {
     let audit_id = format!("audit_maintenance_{}", uuid::Uuid::new_v4().simple());
     connection.execute("INSERT INTO audit_events(audit_id,kind,project_id,work_id,actor,detail_json,created_at) VALUES (?1,?2,?3,NULL,'system',?4,strftime('%Y-%m-%dT%H:%M:%fZ','now'))", params![audit_id, kind, project_id.map(ProjectId::as_str), format!(r#"{{"result":"{result}"}}"#)])?;
+    Ok(())
+}
+
+fn maintenance_audit_transaction(
+    transaction: &Transaction<'_>,
+    kind: &str,
+    project_id: Option<&ProjectId>,
+    result: &str,
+) -> Result<(), StoreError> {
+    let audit_id = format!("audit_maintenance_{}", uuid::Uuid::new_v4().simple());
+    transaction.execute("INSERT INTO audit_events(audit_id,kind,project_id,work_id,actor,detail_json,created_at) VALUES (?1,?2,?3,NULL,'system',?4,strftime('%Y-%m-%dT%H:%M:%fZ','now'))", params![audit_id, kind, project_id.map(ProjectId::as_str), format!(r#"{{"result":"{result}"}}"#)])?;
     Ok(())
 }
 

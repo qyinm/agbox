@@ -143,6 +143,7 @@ pub trait StoreWriter: Send + Sync {
         work_id: WorkId,
         field: &'static str,
         value: String,
+        actor: &'static str,
         observed_at: OffsetDateTime,
     ) -> Result<HumanCorrectionReceipt, StoreError>;
 }
@@ -168,10 +169,18 @@ impl StoreWriter for WriterHandle {
         work_id: WorkId,
         field: &'static str,
         value: String,
+        actor: &'static str,
         observed_at: OffsetDateTime,
     ) -> Result<HumanCorrectionReceipt, StoreError> {
-        self.apply_human_correction(project.clone(), work_id, field.into(), value, observed_at)
-            .await
+        self.apply_human_correction_as(
+            project.clone(),
+            work_id,
+            field.into(),
+            value,
+            actor,
+            observed_at,
+        )
+        .await
     }
 }
 
@@ -385,7 +394,7 @@ where
                         .await?;
                     return Err(ServiceError::InvalidRequest);
                 }
-                let Some(previous) = self.reader.work(scope.project_id(), &work_id).await? else {
+                let Some(_previous) = self.reader.work(scope.project_id(), &work_id).await? else {
                     self.audit(&scope, "handoff.correction", Some(work_id), "not_found")
                         .await?;
                     return Ok(AppResponse::NotFound);
@@ -399,6 +408,7 @@ where
                         work_id,
                         field_name,
                         value,
+                        actor_name(scope.actor()),
                         OffsetDateTime::now_utc(),
                     )
                     .await
@@ -410,15 +420,7 @@ where
                         return Err(error.into());
                     }
                 };
-                self.audit_detail(
-                    &scope,
-                    "handoff.correction",
-                    Some(previous.work_id),
-                    Some(receipt.contract_id),
-                    Some(receipt.revision),
-                    "accepted",
-                )
-                .await?;
+                let _ = receipt;
                 Ok(AppResponse::Accepted)
             }
             AppRequest::Health => Ok(AppResponse::Health(HealthSnapshot { ready: true })),
@@ -493,7 +495,8 @@ where
                     redacted_preview: owner.redacted_preview,
                     raw: Some(raw),
                 };
-                if serde_json::to_vec(&view)
+                let response = AppResponse::Evidence(view);
+                if serde_json::to_vec(&response)
                     .map_err(|_| ServiceError::EvidenceUnavailable)?
                     .len()
                     > MAX_EVIDENCE_RESPONSE_BYTES
@@ -518,7 +521,7 @@ where
                     "ok",
                 )
                 .await?;
-                Ok(AppResponse::Evidence(view))
+                Ok(response)
             }
             EvidenceDisclosure::AuthorizedRaw => {
                 self.audit_detail(
