@@ -80,6 +80,18 @@ impl EvidenceVault {
         })
     }
 
+    pub(crate) fn seal_database_field(
+        &self,
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, EvidenceError> {
+        const MAX_DATABASE_FIELD_BYTES: usize = 32 * 1024;
+        if plaintext.len() > MAX_DATABASE_FIELD_BYTES || aad.len() > MAX_DATABASE_FIELD_BYTES {
+            return Err(EvidenceError::TooLarge);
+        }
+        seal(&self.key, aad, plaintext).map_err(EvidenceError::from)
+    }
+
     fn aad(id: &EvidenceId, context: EvidenceContext<'_>) -> Vec<u8> {
         let (owner_kind, owner_id) = context.owner.aad_parts();
         format!(
@@ -258,4 +270,35 @@ fn safe_component(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_graphic() && byte != b'/' && byte != b'\\')
+}
+
+#[cfg(test)]
+mod database_field_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{MemoryKeyProvider, crypto::open};
+
+    #[test]
+    fn database_field_envelopes_are_bound_to_length_delimited_aad() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = EvidenceVault::open(
+            temp.path().join("evidence"),
+            Arc::new(MemoryKeyProvider::fixed([91_u8; 32])),
+        )
+        .unwrap();
+        let aad_project_a = b"\x07project\x01a";
+        let aad_project_b = b"\x07project\x01b";
+        let envelope = vault
+            .seal_database_field(aad_project_a, b"/private/source")
+            .unwrap();
+        assert_eq!(
+            open(&[91_u8; 32], aad_project_a, &envelope).unwrap(),
+            b"/private/source"
+        );
+        assert!(open(&[91_u8; 32], aad_project_b, &envelope).is_err());
+        assert!(open(&[91_u8; 32], b"source-path-domain", &envelope).is_err());
+    }
 }

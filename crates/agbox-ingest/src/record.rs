@@ -71,6 +71,24 @@ impl RecordWindow {
     }
 }
 
+impl agbox_adapters::RecordSource for RecordWindow {
+    fn start(&self) -> u64 {
+        self.start()
+    }
+
+    fn end(&self) -> u64 {
+        self.content_end()
+    }
+
+    fn record_hash(&self) -> &str {
+        self.record_hash()
+    }
+
+    fn open(&self) -> io::Result<Box<dyn Read + Send>> {
+        Ok(Box::new(Self::open(self)?))
+    }
+}
+
 pub struct WindowReader {
     file: File,
     offset: u64,

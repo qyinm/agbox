@@ -4,7 +4,7 @@ use agbox_core::{
     ActivityEventV1, ContentRef, DisclosureClass, EventId, EvidenceId, PrivacyLabel, ProjectId,
     Provider, SourceObservation, WorkId,
 };
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
@@ -14,6 +14,44 @@ use crate::{EvidenceContext, EvidenceOwnerRef, EvidenceVault, StoreError};
 pub const MAX_BATCH_BYTES: usize = agbox_core::limits::MAX_BATCH_SEMANTIC_BYTES;
 pub const MAX_BATCH_RECORDS: usize = agbox_core::limits::MAX_BATCH_RECORDS;
 pub const WRITER_QUEUE_CAPACITY: usize = 32;
+
+#[derive(Clone)]
+pub struct SourceRegistration {
+    pub project_id: ProjectId,
+    pub repository_identity: String,
+    pub project_root: Zeroizing<Vec<u8>>,
+    pub source_id: String,
+    pub provider: Provider,
+    pub root_class: String,
+    pub source_path: Zeroizing<Vec<u8>>,
+    pub file_identity: String,
+    pub generation: u64,
+    pub size_bytes: u64,
+    pub mtime: OffsetDateTime,
+    pub session_time: Option<OffsetDateTime>,
+    pub initial_cursor: u64,
+}
+
+impl fmt::Debug for SourceRegistration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SourceRegistration")
+            .field("project_id", &self.project_id)
+            .field("source_id", &self.source_id)
+            .field("provider", &self.provider)
+            .field("generation", &self.generation)
+            .field("size_bytes", &self.size_bytes)
+            .field("initial_cursor", &self.initial_cursor)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceRegistrationReceipt {
+    pub source_id: String,
+    pub generation: u64,
+    pub initial_cursor: u64,
+}
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct CursorState {
@@ -487,6 +525,10 @@ pub struct CommitReceipt {
 }
 
 pub(crate) enum WriteCommand {
+    RegisterSource {
+        registration: Box<SourceRegistration>,
+        reply: oneshot::Sender<Result<SourceRegistrationReceipt, StoreError>>,
+    },
     Commit {
         chunk: Box<IngestionChunk>,
         reply: oneshot::Sender<Result<CommitReceipt, StoreError>>,
@@ -510,6 +552,28 @@ impl fmt::Debug for WriterHandle {
 }
 
 impl WriterHandle {
+    /// Atomically registers one project, source, generation, and initial cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid, conflicting, regressing, partially
+    /// associated, unencryptable, or unpersistable registration state.
+    pub async fn register_source(
+        &self,
+        registration: SourceRegistration,
+    ) -> Result<SourceRegistrationReceipt, StoreError> {
+        validate_registration(&registration)?;
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(WriteCommand::RegisterSource {
+                registration: Box::new(registration),
+                reply,
+            })
+            .await
+            .map_err(|_| StoreError::WriterStopped)?;
+        receive.await.map_err(|_| StoreError::WriterStopped)?
+    }
+
     /// Atomically commits a validated bounded ingestion chunk.
     ///
     /// # Errors
@@ -548,6 +612,12 @@ pub(crate) fn run_writer(
 ) {
     while let Some(command) = commands.blocking_recv() {
         match command {
+            WriteCommand::RegisterSource {
+                registration,
+                reply,
+            } => {
+                let _ = reply.send(register_source(&mut connection, &vault, &registration));
+            }
             WriteCommand::Commit { chunk, reply } => {
                 let _ = reply.send(commit(&mut connection, &vault, &chunk));
             }
@@ -557,6 +627,294 @@ pub(crate) fn run_writer(
             }
         }
     }
+}
+
+fn validate_registration(registration: &SourceRegistration) -> Result<(), StoreError> {
+    if !bounded_identifier(registration.project_id.as_str())
+        || !bounded_identifier(&registration.source_id)
+        || !bounded_metadata(&registration.repository_identity)
+        || !bounded_metadata(&registration.file_identity)
+        || !matches!(registration.root_class.as_str(), "active" | "archive")
+        || registration.generation == 0
+        || registration.generation > i64::MAX as u64
+        || registration.size_bytes > i64::MAX as u64
+        || registration.initial_cursor > i64::MAX as u64
+        || (registration.initial_cursor != 0
+            && registration.initial_cursor != registration.size_bytes)
+        || registration.project_root.is_empty()
+        || registration.source_path.is_empty()
+        || registration.project_root.len() > 32 * 1024
+        || registration.source_path.len() > 32 * 1024
+    {
+        return Err(StoreError::InvalidBatch);
+    }
+    let _ = format_timestamp(registration.mtime)?;
+    if let Some(session_time) = registration.session_time {
+        let _ = format_timestamp(session_time)?;
+    }
+    Ok(())
+}
+
+fn register_source(
+    connection: &mut rusqlite::Connection,
+    vault: &EvidenceVault,
+    registration: &SourceRegistration,
+) -> Result<SourceRegistrationReceipt, StoreError> {
+    validate_registration(registration)?;
+    let project_aad = registration_aad(
+        b"agbox.db.project-root.v1",
+        &[
+            registration.project_id.as_str().as_bytes(),
+            registration.repository_identity.as_bytes(),
+        ],
+    )?;
+    let source_aad = registration_aad(
+        b"agbox.db.source-path.v1",
+        &[
+            registration.project_id.as_str().as_bytes(),
+            registration.source_id.as_bytes(),
+            &registration.generation.to_le_bytes(),
+        ],
+    )?;
+    // Both sensitive fields are sealed before SQLite sees any value from the
+    // registration. Plaintext remains in its original Zeroizing allocation.
+    let encrypted_root =
+        vault.seal_database_field(&project_aad, registration.project_root.as_slice())?;
+    let encrypted_source =
+        vault.seal_database_field(&source_aad, registration.source_path.as_slice())?;
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_registration_associations(&transaction, registration)?;
+    let mtime = format_timestamp(registration.mtime)?;
+    let session_time = registration
+        .session_time
+        .map(format_timestamp)
+        .transpose()?;
+
+    transaction.execute(
+        "INSERT INTO projects(
+             project_id, repository_identity, encrypted_root_path, created_at, updated_at
+         ) VALUES (?1, ?2, ?3,
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         ON CONFLICT(project_id) DO UPDATE SET
+             encrypted_root_path = excluded.encrypted_root_path,
+             updated_at = excluded.updated_at",
+        params![
+            registration.project_id.as_str(),
+            registration.repository_identity,
+            encrypted_root,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO sources(
+             source_id, project_id, provider, root_class, encrypted_path,
+             file_identity, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         ON CONFLICT(source_id) DO UPDATE SET
+             encrypted_path = excluded.encrypted_path,
+             file_identity = excluded.file_identity,
+             updated_at = excluded.updated_at",
+        params![
+            registration.source_id,
+            registration.project_id.as_str(),
+            registration.provider.as_str(),
+            registration.root_class,
+            encrypted_source,
+            registration.file_identity,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO source_generations(
+             source_id, generation, size_bytes, mtime, session_time,
+             schema_fingerprint, status
+         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'active')
+         ON CONFLICT(source_id, generation) DO NOTHING",
+        params![
+            registration.source_id,
+            to_i64(registration.generation)?,
+            to_i64(registration.size_bytes)?,
+            mtime,
+            session_time,
+        ],
+    )?;
+    let registration_digest = registration_digest(registration)?;
+    transaction.execute(
+        "INSERT INTO source_cursors(
+             source_id, generation, cursor_offset, parser_state,
+             last_commit_digest, updated_at
+         ) VALUES (?1, ?2, ?3, X'', ?4,
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         ON CONFLICT(source_id, generation) DO NOTHING",
+        params![
+            registration.source_id,
+            to_i64(registration.generation)?,
+            to_i64(registration.initial_cursor)?,
+            registration_digest,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(SourceRegistrationReceipt {
+        source_id: registration.source_id.clone(),
+        generation: registration.generation,
+        initial_cursor: registration.initial_cursor,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_registration_associations(
+    transaction: &Transaction<'_>,
+    registration: &SourceRegistration,
+) -> Result<(), StoreError> {
+    let project: Option<String> = transaction
+        .query_row(
+            "SELECT repository_identity FROM projects WHERE project_id = ?1",
+            [registration.project_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if project
+        .as_deref()
+        .is_some_and(|identity| identity != registration.repository_identity)
+    {
+        return Err(StoreError::ImmutableConflict);
+    }
+    let repository_owner: Option<String> = transaction
+        .query_row(
+            "SELECT project_id FROM projects WHERE repository_identity = ?1 LIMIT 1",
+            [registration.repository_identity.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if repository_owner
+        .as_deref()
+        .is_some_and(|project_id| project_id != registration.project_id.as_str())
+    {
+        return Err(StoreError::ImmutableConflict);
+    }
+
+    let generation = to_i64(registration.generation)?;
+    let maximum: Option<i64> = transaction.query_row(
+        "SELECT max(generation) FROM source_generations WHERE source_id = ?1",
+        [registration.source_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if maximum.is_some_and(|maximum| generation < maximum) {
+        return Err(StoreError::ImmutableConflict);
+    }
+
+    let source: Option<(String, String, String, String)> = transaction
+        .query_row(
+            "SELECT project_id, provider, root_class, file_identity
+             FROM sources WHERE source_id = ?1",
+            [registration.source_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let source_exists = source.is_some();
+    if let Some((project, provider, root_class, file_identity)) = source {
+        let is_next_replacement = maximum
+            .and_then(|value| value.checked_add(1))
+            .is_some_and(|next| next == generation);
+        if project != registration.project_id.as_str()
+            || provider != registration.provider.as_str()
+            || root_class != registration.root_class
+            || (file_identity != registration.file_identity && !is_next_replacement)
+        {
+            return Err(StoreError::ImmutableConflict);
+        }
+    }
+    let file_owner: Option<String> = transaction
+        .query_row(
+            "SELECT source_id FROM sources WHERE file_identity = ?1 LIMIT 1",
+            [registration.file_identity.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if file_owner
+        .as_deref()
+        .is_some_and(|source_id| source_id != registration.source_id)
+    {
+        return Err(StoreError::ImmutableConflict);
+    }
+
+    if source_exists && maximum.is_none() {
+        return Err(StoreError::ImmutableConflict);
+    }
+    let existing: Option<(i64, String, Option<String>, i64)> = transaction
+        .query_row(
+            "SELECT source_generations.size_bytes, source_generations.mtime,
+                    source_generations.session_time, source_cursors.cursor_offset
+             FROM source_generations
+             INNER JOIN source_cursors USING (source_id, generation)
+             WHERE source_id = ?1 AND generation = ?2",
+            params![registration.source_id, generation],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let expected_mtime = format_timestamp(registration.mtime)?;
+    let expected_session = registration
+        .session_time
+        .map(format_timestamp)
+        .transpose()?;
+    if let Some((size, mtime, session_time, cursor)) = existing {
+        if size != to_i64(registration.size_bytes)?
+            || mtime != expected_mtime
+            || session_time != expected_session
+            || cursor != to_i64(registration.initial_cursor)?
+        {
+            return Err(StoreError::ImmutableConflict);
+        }
+        return Ok(());
+    }
+
+    match maximum {
+        None if registration.generation == 1 => Ok(()),
+        Some(previous) if previous.checked_add(1) == Some(generation) => Ok(()),
+        _ => Err(StoreError::ImmutableConflict),
+    }
+}
+
+fn registration_aad(domain: &[u8], parts: &[&[u8]]) -> Result<Vec<u8>, StoreError> {
+    let mut aad = Vec::with_capacity(256);
+    append_aad_part(&mut aad, domain)?;
+    for part in parts {
+        append_aad_part(&mut aad, part)?;
+    }
+    if aad.len() > 32 * 1024 {
+        return Err(StoreError::InvalidBatch);
+    }
+    Ok(aad)
+}
+
+fn append_aad_part(aad: &mut Vec<u8>, part: &[u8]) -> Result<(), StoreError> {
+    aad.extend_from_slice(
+        &u64::try_from(part.len())
+            .map_err(|_| StoreError::InvalidBatch)?
+            .to_le_bytes(),
+    );
+    aad.extend_from_slice(part);
+    Ok(())
+}
+
+fn registration_digest(registration: &SourceRegistration) -> Result<String, StoreError> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"agbox.source.registration.v1");
+    for part in [
+        registration.source_id.as_bytes(),
+        &registration.generation.to_le_bytes(),
+        &registration.initial_cursor.to_le_bytes(),
+    ] {
+        hasher.update(
+            &u64::try_from(part.len())
+                .map_err(|_| StoreError::InvalidBatch)?
+                .to_le_bytes(),
+        );
+        hasher.update(part);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn commit(

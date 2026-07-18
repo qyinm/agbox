@@ -46,12 +46,20 @@ dependencies = [
 name = "agbox-ingest"
 version = "0.2.0"
 dependencies = [
+ "agbox-adapters",
  "agbox-core",
+ "agbox-store",
  "blake3",
  "proptest",
+ "rusqlite",
+ "rustix",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
+ "time",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

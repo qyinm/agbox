@@ -17,7 +17,8 @@ pub use read::{READ_POOL_SIZE, ReadPool, ReadStore};
 pub use writer::{
     CommitReceipt, ContentRefWrite, CursorState, EvidenceLink, EvidenceOwner, EvidenceWrite,
     IngestionChunk, IngestionFault, MAX_BATCH_BYTES, MAX_BATCH_RECORDS, SchemaFingerprintUpdate,
-    WRITER_QUEUE_CAPACITY, WriterHandle, stable_content_ref_id,
+    SourceRegistration, SourceRegistrationReceipt, WRITER_QUEUE_CAPACITY, WriterHandle,
+    stable_content_ref_id,
 };
 
 #[derive(thiserror::Error)]

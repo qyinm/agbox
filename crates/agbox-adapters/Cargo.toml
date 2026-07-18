@@ -6,11 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-test-support = ["agbox-core/test-support", "agbox-ingest/test-support"]
+test-support = ["agbox-core/test-support"]
 
 [dependencies]
 agbox-core.workspace = true
-agbox-ingest = { path = "../agbox-ingest" }
 blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,6 +19,7 @@ time.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+agbox-ingest = { path = "../agbox-ingest" }
 proptest.workspace = true
 tempfile.workspace = true
 

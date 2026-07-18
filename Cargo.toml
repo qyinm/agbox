@@ -20,7 +20,9 @@ unwrap_used = "deny"
 expect_used = "deny"
 
 [workspace.dependencies]
+agbox-adapters = { path = "crates/agbox-adapters" }
 agbox-core = { path = "crates/agbox-core" }
+agbox-store = { path = "crates/agbox-store" }
 aho-corasick = "1"
 anyhow = "1"
 async-trait = "0.1"
