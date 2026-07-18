@@ -42,7 +42,7 @@ fn keyed_queue_live_work_preempts_catchup_and_capacity_is_explicit() {
     queue.try_enqueue(key(1), 1, WorkPriority::Archive).unwrap();
     queue.try_enqueue(key(2), 1, WorkPriority::Live).unwrap();
     assert_eq!(
-        queue.pop().unwrap().key.source_id,
+        queue.pop().unwrap().key.source_id(),
         "source_00000000000000000000000000000002"
     );
     queue
@@ -80,7 +80,13 @@ fn keyed_queue_fifo_is_stable_within_priority_and_promoted_work_is_not_stale() {
     queue.try_enqueue(key(3), 1, WorkPriority::Live).unwrap();
 
     let popped: Vec<_> = std::iter::from_fn(|| queue.pop())
-        .map(|item| (item.key.source_id, item.target_offset, item.priority))
+        .map(|item| {
+            (
+                item.key.source_id().to_owned(),
+                item.target_offset,
+                item.priority,
+            )
+        })
         .collect();
     assert_eq!(
         popped,
@@ -129,6 +135,21 @@ fn keyed_queue_source_keys_and_runtime_limits_use_safe_canonical_contracts() {
         SourceKey::new("source_00000000000000000000000000000001", 0),
         Err(SourceKeyError::InvalidGeneration)
     );
+
+    let valid = key(8);
+    assert!(!format!("{valid:?}").contains("00000000000000000000000000000008"));
+    let mut queue = KeyedQueue::new(1);
+    assert_eq!(
+        queue.try_enqueue(valid, 1, WorkPriority::Live),
+        Ok(EnqueueOutcome::Inserted)
+    );
+}
+
+#[test]
+fn source_key_reads_use_accessors_after_validated_construction() {
+    let key = key(7);
+    assert_eq!(key.source_id(), "source_00000000000000000000000000000007");
+    assert_eq!(key.generation(), 1);
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

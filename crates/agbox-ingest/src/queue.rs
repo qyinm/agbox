@@ -36,12 +36,23 @@ impl WorkPriority {
 }
 
 /// A validated source generation identity used to coalesce queued work.
+///
+/// ```compile_fail
+/// use agbox_ingest::SourceKey;
+///
+/// let _ = SourceKey {
+///     source_id: "../../untrusted".to_owned(),
+///     generation: 0,
+/// };
+/// ```
+///
+/// Source keys can only be created through [`SourceKey::new`].
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct SourceKey {
     /// Canonical source identifier.
-    pub source_id: String,
+    source_id: String,
     /// Monotonically increasing source generation.
-    pub generation: u64,
+    generation: u64,
 }
 
 impl SourceKey {
@@ -63,6 +74,18 @@ impl SourceKey {
             source_id,
             generation,
         })
+    }
+
+    /// Returns the canonical source identifier.
+    #[must_use]
+    pub fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    /// Returns the validated source generation.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
