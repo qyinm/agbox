@@ -368,23 +368,20 @@ fn contract_contains_absolute_path(contract: &WorkContractRevision) -> bool {
 }
 
 fn contains_absolute_path(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    let windows_drive_path = bytes.windows(3).any(|bytes| {
-        bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/')
+    let characters = value.chars().collect::<Vec<_>>();
+    let windows_drive_path = characters.windows(3).any(|characters| {
+        characters[0].is_ascii_alphabetic()
+            && matches!(characters[1], ':' | '：')
+            && matches!(characters[2], '\\' | '/')
     });
-    let unix_absolute_path = bytes.iter().enumerate().any(|(index, byte)| {
-        *byte == b'/'
-            && (index == 0
-                || bytes[index - 1].is_ascii_whitespace()
-                || bytes[index - 1].is_ascii_punctuation())
+    let rooted_path = characters.iter().enumerate().any(|(index, character)| {
+        matches!(character, '\\' | '/') && (index == 0 || is_path_delimiter(characters[index - 1]))
     });
-    let rooted_backslash = bytes.iter().enumerate().any(|(index, byte)| {
-        *byte == b'\\'
-            && (index == 0
-                || bytes[index - 1].is_ascii_whitespace()
-                || bytes[index - 1].is_ascii_punctuation())
-    });
-    windows_drive_path || unix_absolute_path || rooted_backslash
+    windows_drive_path || rooted_path
+}
+
+fn is_path_delimiter(character: char) -> bool {
+    character.is_whitespace() || (character != '_' && !character.is_alphanumeric())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -765,6 +762,8 @@ mod tests {
             "C:\\Users\\alice\\private.rs",
             "\\\\server\\share\\private.rs",
             "\\Users\\alice\\private.rs",
+            "“/Users/alice/private.rs",
+            "경로：\\server\\share\\private.rs",
         ] {
             assert!(contains_absolute_path(path));
         }
