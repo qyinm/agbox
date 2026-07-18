@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
-use agbox_core::{ContractId, EventId, ProjectId, Provider, WorkId};
+use agbox_core::{ContractId, EventId, ProjectId, Provider, SessionId, WorkId};
 use agbox_ingest::{
     IngestionCoordinator, WorkPublicationRequest, graph_write_batch, test_support::FixtureRuntime,
     work_write_batch,
@@ -267,11 +267,12 @@ async fn same_project_artifact_continuity_crosses_agents_and_writes_next_revisio
     assert_eq!(replay_report.revision, 1);
 
     let second = &events[1];
+    let second_session = SessionId::parse_wire("claude-distinct-session").unwrap();
     let second_mutation = GraphMutation {
         facts: vec![
             ReducedFact::SessionContext {
                 project_id: second.event.project_id().clone(),
-                session_id: second.event.session_id().clone(),
+                session_id: second_session.clone(),
                 provider: Provider::Claude,
                 branch_hash: Some("b3:main".into()),
                 observed_at: second.event.observed_at(),
@@ -279,7 +280,7 @@ async fn same_project_artifact_continuity_crosses_agents_and_writes_next_revisio
             },
             ReducedFact::Artifact {
                 project_id: second.event.project_id().clone(),
-                session_id: second.event.session_id().clone(),
+                session_id: second_session,
                 path_hash: "b3:shared".into(),
                 project_relative_path: Some("src/lib.rs".into()),
                 operation: "update".into(),
@@ -297,6 +298,59 @@ async fn same_project_artifact_continuity_crosses_agents_and_writes_next_revisio
         .apply_graph(graph_write_batch(second_mutation.clone()).unwrap())
         .await
         .unwrap();
+    let placeholder_work_id: String = Connection::open(fixture.database_path())
+        .unwrap()
+        .query_row(
+            "SELECT artifacts.work_id
+             FROM artifacts
+             WHERE artifacts.path_hash = 'b3:shared'
+               AND NOT EXISTS(
+                   SELECT 1 FROM work_contract_revisions
+                   WHERE work_contract_revisions.work_id = artifacts.work_id
+               )
+             ORDER BY artifacts.observed_at DESC
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_ne!(placeholder_work_id, first_report.work_id.as_str());
+    let explicit_placeholder = fixture
+        .writer()
+        .load_work_candidates(WorkCandidateQuery {
+            project_id: second.event.project_id().clone(),
+            explicit_work_id: Some(WorkId::parse_wire(&placeholder_work_id).unwrap()),
+            continuation_work_id: None,
+            artifact_hashes: Vec::new(),
+            command_hashes: Vec::new(),
+            observed_at: second.event.observed_at(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        explicit_placeholder.candidates[0].work_id.as_str(),
+        placeholder_work_id
+    );
+    let candidates = fixture
+        .writer()
+        .load_work_candidates(WorkCandidateQuery {
+            project_id: second.event.project_id().clone(),
+            explicit_work_id: None,
+            continuation_work_id: None,
+            artifact_hashes: vec!["b3:shared".into()],
+            command_hashes: Vec::new(),
+            observed_at: second.event.observed_at(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(candidates.candidates.len(), 1);
+    assert_eq!(candidates.candidates[0].work_id, first_report.work_id);
+    assert!(
+        candidates
+            .candidates
+            .iter()
+            .all(|candidate| candidate.work_id.as_str() != placeholder_work_id)
+    );
     let mut second_request = WorkPublicationRequest::new(Provider::Claude);
     second_request.repository_hash = Some(repository_hash);
     second_request.branch_hash = Some("b3:main".into());

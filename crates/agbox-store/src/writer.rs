@@ -1946,6 +1946,10 @@ fn load_work_candidates(
              FROM artifacts
              INNER JOIN work_items USING(work_id)
              WHERE work_items.project_id = ?1 AND artifacts.path_hash = ?2
+               AND EXISTS(
+                   SELECT 1 FROM work_contract_revisions
+                   WHERE work_contract_revisions.work_id = artifacts.work_id
+               )
              ORDER BY work_items.updated_at DESC, artifacts.work_id
              LIMIT 65",
             query.project_id.as_str(),
@@ -1968,6 +1972,10 @@ fn load_work_candidates(
              WHERE action_facts.project_id = ?1
                AND action_facts.input_hash = ?2
                AND work_items.project_id = ?1
+               AND EXISTS(
+                   SELECT 1 FROM work_contract_revisions
+                   WHERE work_contract_revisions.work_id = work_evidence.work_id
+               )
              ORDER BY work_items.updated_at DESC, work_evidence.work_id
              LIMIT 65",
             query.project_id.as_str(),
@@ -1980,6 +1988,10 @@ fn load_work_candidates(
         let mut recent = connection.prepare_cached(
             "SELECT work_id FROM work_items
              WHERE project_id = ?1 AND status IN ('active', 'blocked')
+               AND EXISTS(
+                   SELECT 1 FROM work_contract_revisions
+                   WHERE work_contract_revisions.work_id = work_items.work_id
+               )
              ORDER BY updated_at DESC, work_id
              LIMIT 65",
         )?;
