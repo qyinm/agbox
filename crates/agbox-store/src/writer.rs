@@ -264,6 +264,213 @@ pub struct GraphApplyReceipt {
     pub replayed: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkEdgeRow {
+    pub from_work_id: WorkId,
+    pub to_work_id: WorkId,
+    pub kind: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct WorkContractRow {
+    pub contract_id: agbox_core::ContractId,
+    pub revision: u64,
+    pub contract_json: String,
+    pub extractor_version: String,
+    pub objective: Option<String>,
+    pub summary: String,
+    pub completed_steps: Vec<String>,
+    pub next_actions: Vec<String>,
+    pub blockers: Vec<String>,
+    pub artifacts: Vec<String>,
+    pub verification: Vec<String>,
+}
+
+impl fmt::Debug for WorkContractRow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkContractRow")
+            .field("contract_id", &self.contract_id)
+            .field("revision", &self.revision)
+            .field("contract_json_bytes", &self.contract_json.len())
+            .field("extractor_version", &self.extractor_version)
+            .field(
+                "objective_bytes",
+                &self.objective.as_ref().map_or(0, String::len),
+            )
+            .field("summary_bytes", &self.summary.len())
+            .field("completed_steps", &self.completed_steps.len())
+            .field("next_actions", &self.next_actions.len())
+            .field("blockers", &self.blockers.len())
+            .field("artifacts", &self.artifacts.len())
+            .field("verification", &self.verification.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize)]
+pub struct WorkWriteBatch {
+    pub visibility_name: String,
+    pub expected_event_seq: u64,
+    pub next_event_seq: u64,
+    pub next_event_id: EventId,
+    pub project_id: ProjectId,
+    pub work_id: WorkId,
+    pub status: String,
+    pub observed_at: OffsetDateTime,
+    pub evidence_event_ids: Vec<EventId>,
+    pub artifact_ids: Vec<String>,
+    pub edges: Vec<WorkEdgeRow>,
+    pub contract: WorkContractRow,
+}
+
+impl fmt::Debug for WorkWriteBatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkWriteBatch")
+            .field("visibility_name", &self.visibility_name)
+            .field("expected_event_seq", &self.expected_event_seq)
+            .field("next_event_seq", &self.next_event_seq)
+            .field("project_id", &self.project_id)
+            .field("work_id", &self.work_id)
+            .field("status", &self.status)
+            .field("evidence_event_ids", &self.evidence_event_ids.len())
+            .field("artifact_ids", &self.artifact_ids.len())
+            .field("edges", &self.edges.len())
+            .field("contract", &self.contract)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WorkWriteBatch {
+    /// Revalidates the bounded store-owned publication DTO.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidBatch`] for invalid identifiers, bounds,
+    /// watermark state, status values, or serialized contract content.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if !bounded_identifier(&self.visibility_name)
+            || !bounded_identifier(self.project_id.as_str())
+            || !bounded_identifier(self.work_id.as_str())
+            || !bounded_identifier(self.next_event_id.as_str())
+            || self.next_event_seq == 0
+            || self.next_event_seq < self.expected_event_seq
+            || self.next_event_seq > i64::MAX as u64
+            || self.expected_event_seq > i64::MAX as u64
+            || !matches!(
+                self.status.as_str(),
+                "observed" | "active" | "blocked" | "completed" | "abandoned"
+            )
+            || self.evidence_event_ids.len() > MAX_BATCH_RECORDS
+            || self.artifact_ids.len() > MAX_BATCH_RECORDS
+            || self.edges.len() > MAX_BATCH_RECORDS
+            || self.contract.revision == 0
+            || self.contract.revision > i64::MAX as u64
+            || !bounded_identifier(self.contract.contract_id.as_str())
+            || !bounded_metadata(&self.contract.extractor_version)
+            || self.contract.contract_json.len() > agbox_core::limits::MAX_CONTRACT_SERIALIZED_BYTES
+        {
+            return Err(StoreError::InvalidBatch);
+        }
+        let _ = format_timestamp(self.observed_at)?;
+        if self
+            .evidence_event_ids
+            .iter()
+            .any(|event_id| !bounded_identifier(event_id.as_str()))
+            || self
+                .artifact_ids
+                .iter()
+                .any(|artifact_id| !bounded_identifier(artifact_id))
+            || self.edges.iter().any(|edge| {
+                !bounded_identifier(edge.from_work_id.as_str())
+                    || !bounded_identifier(edge.to_work_id.as_str())
+                    || !matches!(
+                        edge.kind.as_str(),
+                        "continues"
+                            | "depends_on"
+                            | "blocked_by"
+                            | "produces"
+                            | "validated_by"
+                            | "supersedes"
+                    )
+                    || edge.from_work_id == edge.to_work_id
+            })
+        {
+            return Err(StoreError::InvalidBatch);
+        }
+        for value in self
+            .contract
+            .objective
+            .iter()
+            .chain(std::iter::once(&self.contract.summary))
+            .chain(self.contract.completed_steps.iter())
+            .chain(self.contract.next_actions.iter())
+            .chain(self.contract.blockers.iter())
+            .chain(self.contract.artifacts.iter())
+            .chain(self.contract.verification.iter())
+        {
+            if value.len() > agbox_core::limits::MAX_INLINE_BYTES {
+                return Err(StoreError::InvalidBatch);
+            }
+        }
+        let encoded: serde_json::Value = serde_json::from_str(&self.contract.contract_json)?;
+        if encoded.get("work_id").and_then(serde_json::Value::as_str) != Some(self.work_id.as_str())
+            || encoded
+                .get("project_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.project_id.as_str())
+            || encoded.get("revision").and_then(serde_json::Value::as_u64)
+                != Some(self.contract.revision)
+            || encoded
+                .get("material_content_hash")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|hash| !bounded_metadata(hash))
+        {
+            return Err(StoreError::InvalidBatch);
+        }
+        if serde_json::to_vec(self)?.len() > MAX_BATCH_BYTES {
+            return Err(StoreError::InvalidBatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkApplyReceipt {
+    pub through_event_seq: u64,
+    pub replayed: bool,
+    pub revision_inserted: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkCandidateQuery {
+    pub project_id: ProjectId,
+    pub explicit_work_id: Option<WorkId>,
+    pub continuation_work_id: Option<WorkId>,
+    pub artifact_hashes: Vec<String>,
+    pub command_hashes: Vec<String>,
+    pub observed_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredWorkCandidate {
+    pub work_id: WorkId,
+    pub project_id: ProjectId,
+    pub provider: Option<String>,
+    pub repository_hash: Option<String>,
+    pub branch_hash: Option<String>,
+    pub artifact_hashes: Vec<String>,
+    pub command_hashes: Vec<String>,
+    pub minutes_since_activity: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkCandidatePage {
+    pub candidates: Vec<StoredWorkCandidate>,
+    pub truncated: bool,
+}
+
 #[derive(Clone)]
 pub struct SourceRegistration {
     pub project_id: ProjectId,
@@ -786,6 +993,19 @@ pub(crate) enum WriteCommand {
         batch: Box<GraphWriteBatch>,
         reply: oneshot::Sender<Result<GraphApplyReceipt, StoreError>>,
     },
+    ApplyWork {
+        batch: Box<WorkWriteBatch>,
+        reply: oneshot::Sender<Result<WorkApplyReceipt, StoreError>>,
+    },
+    LoadWorkCandidates {
+        query: Box<WorkCandidateQuery>,
+        reply: oneshot::Sender<Result<WorkCandidatePage, StoreError>>,
+    },
+    LoadLatestWorkContract {
+        project_id: ProjectId,
+        work_id: WorkId,
+        reply: oneshot::Sender<Result<Option<String>, StoreError>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -913,6 +1133,74 @@ impl WriterHandle {
         receive.await.map_err(|_| StoreError::WriterStopped)?
     }
 
+    /// Publishes one provisional work revision and advances its visibility
+    /// watermark in the same immediate transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, project-scoping, immutable-row, watermark, writer,
+    /// or database errors without partially publishing work.
+    pub async fn apply_work(&self, batch: WorkWriteBatch) -> Result<WorkApplyReceipt, StoreError> {
+        batch.validate()?;
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(WriteCommand::ApplyWork {
+                batch: Box::new(batch),
+                reply,
+            })
+            .await
+            .map_err(|_| StoreError::WriterStopped)?;
+        receive.await.map_err(|_| StoreError::WriterStopped)?
+    }
+
+    /// Loads at most 64 same-project correlation candidates in explicit,
+    /// continuation, artifact, command, and recent priority order.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, writer, or database errors. Truncation is reported
+    /// explicitly in the returned page.
+    pub async fn load_work_candidates(
+        &self,
+        query: WorkCandidateQuery,
+    ) -> Result<WorkCandidatePage, StoreError> {
+        validate_work_candidate_query(&query)?;
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(WriteCommand::LoadWorkCandidates {
+                query: Box::new(query),
+                reply,
+            })
+            .await
+            .map_err(|_| StoreError::WriterStopped)?;
+        receive.await.map_err(|_| StoreError::WriterStopped)?
+    }
+
+    /// Loads the latest immutable contract JSON for a same-project work item.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, writer, project-scope, or database errors.
+    pub async fn latest_work_contract(
+        &self,
+        project_id: ProjectId,
+        work_id: WorkId,
+    ) -> Result<Option<String>, StoreError> {
+        if !bounded_identifier(project_id.as_str()) || !bounded_identifier(work_id.as_str()) {
+            return Err(StoreError::InvalidBatch);
+        }
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(WriteCommand::LoadLatestWorkContract {
+                project_id,
+                work_id,
+                reply,
+            })
+            .await
+            .map_err(|_| StoreError::WriterStopped)?;
+        receive.await.map_err(|_| StoreError::WriterStopped)?
+    }
+
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     #[must_use]
@@ -959,6 +1247,22 @@ pub(crate) fn run_writer(
             }
             WriteCommand::ApplyGraph { batch, reply } => {
                 let result = apply_graph(&mut connection, &vault, &batch);
+                let _ = reply.send(result);
+            }
+            WriteCommand::ApplyWork { batch, reply } => {
+                let result = apply_work(&mut connection, &batch);
+                let _ = reply.send(result);
+            }
+            WriteCommand::LoadWorkCandidates { query, reply } => {
+                let result = load_work_candidates(&connection, &query);
+                let _ = reply.send(result);
+            }
+            WriteCommand::LoadLatestWorkContract {
+                project_id,
+                work_id,
+                reply,
+            } => {
+                let result = latest_work_contract(&connection, &project_id, &work_id);
                 let _ = reply.send(result);
             }
             WriteCommand::Shutdown { reply } => {
@@ -1433,6 +1737,518 @@ fn apply_graph(
         through_event_seq: batch.next_event_seq,
         replayed,
     })
+}
+
+#[allow(clippy::too_many_lines)]
+fn apply_work(
+    connection: &mut rusqlite::Connection,
+    batch: &WorkWriteBatch,
+) -> Result<WorkApplyReceipt, StoreError> {
+    batch.validate()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: Option<(i64, String)> = transaction
+        .query_row(
+            "SELECT through_event_seq, through_event_id
+             FROM reducer_watermarks
+             WHERE reducer_name = ?1",
+            [batch.visibility_name.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let current_seq = current
+        .as_ref()
+        .map(|(sequence, _)| u64::try_from(*sequence).map_err(|_| StoreError::InvalidBatch))
+        .transpose()?
+        .unwrap_or(0);
+    let replayed = current.as_ref().is_some_and(|(sequence, event_id)| {
+        u64::try_from(*sequence).ok() == Some(batch.next_event_seq)
+            && event_id == batch.next_event_id.as_str()
+    });
+    if !replayed && current_seq != batch.expected_event_seq {
+        return Err(StoreError::ReducerWatermarkConflict);
+    }
+    verify_watermark_event(&transaction, batch.next_event_seq, &batch.next_event_id)?;
+    for event_id in &batch.evidence_event_ids {
+        verify_graph_event(&transaction, &batch.project_id, event_id)?;
+    }
+    verify_work_batch_audit(&transaction, batch, replayed)?;
+
+    let observed_at = format_timestamp(batch.observed_at)?;
+    transaction.execute(
+        "INSERT INTO work_items(work_id, project_id, status, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?4)
+         ON CONFLICT(work_id) DO NOTHING",
+        params![
+            batch.work_id.as_str(),
+            batch.project_id.as_str(),
+            batch.status,
+            observed_at
+        ],
+    )?;
+    if !exists(
+        &transaction,
+        "SELECT EXISTS(
+             SELECT 1 FROM work_items WHERE work_id = ?1 AND project_id = ?2
+         )",
+        params![batch.work_id.as_str(), batch.project_id.as_str()],
+    )? {
+        return Err(StoreError::ImmutableConflict);
+    }
+    transaction.execute(
+        "UPDATE work_items SET status = ?1, updated_at = ?2 WHERE work_id = ?3",
+        params![batch.status, observed_at, batch.work_id.as_str()],
+    )?;
+
+    for event_id in &batch.evidence_event_ids {
+        transaction.execute(
+            "INSERT OR IGNORE INTO work_evidence(
+                 work_id, assertion_id, event_id, evidence_id
+             )
+             SELECT ?1, NULL, event_id, evidence_id
+             FROM event_evidence
+             WHERE event_id = ?2",
+            params![batch.work_id.as_str(), event_id.as_str()],
+        )?;
+        transaction.execute(
+            "UPDATE verification_facts SET work_id = ?1
+             WHERE project_id = ?2 AND event_id = ?3
+               AND (work_id IS NULL OR work_id = ?1)",
+            params![
+                batch.work_id.as_str(),
+                batch.project_id.as_str(),
+                event_id.as_str()
+            ],
+        )?;
+        if exists(
+            &transaction,
+            "SELECT EXISTS(
+                 SELECT 1 FROM verification_facts
+                 WHERE project_id = ?1 AND event_id = ?2
+                   AND work_id IS NOT NULL AND work_id <> ?3
+             )",
+            params![
+                batch.project_id.as_str(),
+                event_id.as_str(),
+                batch.work_id.as_str()
+            ],
+        )? {
+            return Err(StoreError::ImmutableConflict);
+        }
+    }
+
+    for artifact_id in &batch.artifact_ids {
+        let changed = transaction.execute(
+            "UPDATE artifacts SET work_id = ?1
+             WHERE artifact_id = ?2
+               AND EXISTS(
+                   SELECT 1 FROM work_items AS prior
+                   WHERE prior.work_id = artifacts.work_id
+                     AND prior.project_id = ?3
+               )",
+            params![
+                batch.work_id.as_str(),
+                artifact_id,
+                batch.project_id.as_str()
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::InvalidReference);
+        }
+    }
+
+    for edge in &batch.edges {
+        if !work_exists_in_project(&transaction, edge.from_work_id.as_str(), &batch.project_id)?
+            || !work_exists_in_project(&transaction, edge.to_work_id.as_str(), &batch.project_id)?
+        {
+            return Err(StoreError::InvalidReference);
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO work_edges(
+                 from_work_id, to_work_id, kind, created_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                edge.from_work_id.as_str(),
+                edge.to_work_id.as_str(),
+                edge.kind,
+                observed_at
+            ],
+        )?;
+    }
+
+    let revision_inserted = insert_work_contract_revision(&transaction, batch, &observed_at)?;
+    replace_work_search(&transaction, batch)?;
+    transaction.execute(
+        "INSERT INTO reducer_watermarks(
+             reducer_name, through_event_seq, through_event_id, updated_at
+         ) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(reducer_name) DO UPDATE SET
+             through_event_seq = excluded.through_event_seq,
+             through_event_id = excluded.through_event_id,
+             updated_at = excluded.updated_at",
+        params![
+            batch.visibility_name,
+            to_i64(batch.next_event_seq)?,
+            batch.next_event_id.as_str(),
+            observed_at
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(WorkApplyReceipt {
+        through_event_seq: batch.next_event_seq,
+        replayed,
+        revision_inserted,
+    })
+}
+
+fn validate_work_candidate_query(query: &WorkCandidateQuery) -> Result<(), StoreError> {
+    if !bounded_identifier(query.project_id.as_str())
+        || query.artifact_hashes.len() > 64
+        || query.command_hashes.len() > 32
+        || query
+            .artifact_hashes
+            .iter()
+            .chain(&query.command_hashes)
+            .any(|value| !bounded_metadata(value))
+    {
+        return Err(StoreError::InvalidBatch);
+    }
+    let _ = format_timestamp(query.observed_at)?;
+    Ok(())
+}
+
+fn load_work_candidates(
+    connection: &rusqlite::Connection,
+    query: &WorkCandidateQuery,
+) -> Result<WorkCandidatePage, StoreError> {
+    validate_work_candidate_query(query)?;
+    let mut work_ids = Vec::<String>::new();
+    let mut seen = HashSet::<String>::new();
+    for work_id in [
+        query.explicit_work_id.as_ref(),
+        query.continuation_work_id.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if work_exists_in_project(connection, work_id.as_str(), &query.project_id)?
+            && seen.insert(work_id.as_str().to_owned())
+        {
+            work_ids.push(work_id.as_str().to_owned());
+        }
+    }
+    for path_hash in &query.artifact_hashes {
+        if work_ids.len() > 64 {
+            break;
+        }
+        append_candidate_ids(
+            connection,
+            "SELECT DISTINCT artifacts.work_id
+             FROM artifacts
+             INNER JOIN work_items USING(work_id)
+             WHERE work_items.project_id = ?1 AND artifacts.path_hash = ?2
+             ORDER BY work_items.updated_at DESC, artifacts.work_id
+             LIMIT 65",
+            query.project_id.as_str(),
+            path_hash,
+            &mut work_ids,
+            &mut seen,
+        )?;
+    }
+    for input_hash in &query.command_hashes {
+        if work_ids.len() > 64 {
+            break;
+        }
+        append_candidate_ids(
+            connection,
+            "SELECT DISTINCT work_evidence.work_id
+             FROM action_facts INDEXED BY action_facts_project_input
+             INNER JOIN work_evidence
+                 ON work_evidence.event_id = action_facts.request_event_id
+             INNER JOIN work_items ON work_items.work_id = work_evidence.work_id
+             WHERE action_facts.project_id = ?1
+               AND action_facts.input_hash = ?2
+               AND work_items.project_id = ?1
+             ORDER BY work_items.updated_at DESC, work_evidence.work_id
+             LIMIT 65",
+            query.project_id.as_str(),
+            input_hash,
+            &mut work_ids,
+            &mut seen,
+        )?;
+    }
+    if work_ids.len() <= 64 {
+        let mut recent = connection.prepare_cached(
+            "SELECT work_id FROM work_items
+             WHERE project_id = ?1 AND status IN ('active', 'blocked')
+             ORDER BY updated_at DESC, work_id
+             LIMIT 65",
+        )?;
+        let rows = recent.query_map([query.project_id.as_str()], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let work_id = row?;
+            if seen.insert(work_id.clone()) {
+                work_ids.push(work_id);
+                if work_ids.len() > 64 {
+                    break;
+                }
+            }
+        }
+    }
+    let truncated = work_ids.len() > 64;
+    work_ids.truncate(64);
+    let candidates = work_ids
+        .into_iter()
+        .map(|work_id| load_work_candidate(connection, query, &work_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(WorkCandidatePage {
+        candidates,
+        truncated,
+    })
+}
+
+fn append_candidate_ids(
+    connection: &rusqlite::Connection,
+    sql: &str,
+    project_id: &str,
+    hash: &str,
+    work_ids: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) -> Result<(), StoreError> {
+    if work_ids.len() > 64 {
+        return Ok(());
+    }
+    let mut statement = connection.prepare_cached(sql)?;
+    let rows = statement.query_map(params![project_id, hash], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let work_id = row?;
+        if seen.insert(work_id.clone()) {
+            work_ids.push(work_id);
+            if work_ids.len() > 64 {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_work_candidate(
+    connection: &rusqlite::Connection,
+    query: &WorkCandidateQuery,
+    work_id: &str,
+) -> Result<StoredWorkCandidate, StoreError> {
+    let (repository_hash, updated_at): (String, String) = connection.query_row(
+        "SELECT projects.repository_identity, work_items.updated_at
+         FROM work_items
+         INNER JOIN projects USING(project_id)
+         WHERE work_items.work_id = ?1 AND work_items.project_id = ?2",
+        params![work_id, query.project_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let mut artifact_statement = connection.prepare_cached(
+        "SELECT DISTINCT path_hash FROM artifacts
+         WHERE work_id = ?1 ORDER BY path_hash LIMIT 65",
+    )?;
+    let artifact_hashes = artifact_statement
+        .query_map([work_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut command_statement = connection.prepare_cached(
+        "SELECT DISTINCT action_facts.input_hash
+         FROM work_evidence
+         INNER JOIN action_facts
+             ON action_facts.request_event_id = work_evidence.event_id
+         WHERE work_evidence.work_id = ?1
+         ORDER BY action_facts.input_hash LIMIT 33",
+    )?;
+    let command_hashes = command_statement
+        .query_map([work_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let run: Option<(String, Option<String>)> = connection
+        .query_row(
+            "SELECT agent_runs.provider, agent_runs.branch_hash
+             FROM agent_runs
+             WHERE agent_runs.project_id = ?1
+               AND EXISTS(
+                   SELECT 1 FROM work_evidence
+                   INNER JOIN activity_events
+                       ON activity_events.event_id = work_evidence.event_id
+                   WHERE work_evidence.work_id = ?2
+                     AND activity_events.project_id = ?1
+                     AND activity_events.session_id = agent_runs.native_session_id
+               )
+             ORDER BY agent_runs.started_at DESC, agent_runs.run_id
+             LIMIT 1",
+            params![query.project_id.as_str(), work_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let updated_at =
+        OffsetDateTime::parse(&updated_at, &Rfc3339).map_err(|_| StoreError::InvalidBatch)?;
+    let elapsed = query.observed_at - updated_at;
+    let minutes_since_activity = if elapsed.is_negative() {
+        0
+    } else {
+        u32::try_from(elapsed.whole_minutes()).unwrap_or(u32::MAX)
+    };
+    Ok(StoredWorkCandidate {
+        work_id: WorkId::parse_wire(work_id).ok_or(StoreError::InvalidBatch)?,
+        project_id: query.project_id.clone(),
+        provider: run.as_ref().map(|(provider, _)| provider.clone()),
+        repository_hash: Some(repository_hash),
+        branch_hash: run.and_then(|(_, branch)| branch),
+        artifact_hashes,
+        command_hashes,
+        minutes_since_activity,
+    })
+}
+
+fn latest_work_contract(
+    connection: &rusqlite::Connection,
+    project_id: &ProjectId,
+    work_id: &WorkId,
+) -> Result<Option<String>, StoreError> {
+    connection
+        .query_row(
+            "SELECT work_contract_revisions.contract_json
+             FROM work_contract_revisions
+             INNER JOIN work_items USING(work_id)
+             WHERE work_contract_revisions.work_id = ?1
+               AND work_items.project_id = ?2
+             ORDER BY revision DESC
+             LIMIT 1",
+            params![work_id.as_str(), project_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::from)
+}
+
+fn verify_work_batch_audit(
+    transaction: &Transaction<'_>,
+    batch: &WorkWriteBatch,
+    replayed: bool,
+) -> Result<(), StoreError> {
+    let digest = blake3::hash(&serde_json::to_vec(batch)?)
+        .to_hex()
+        .to_string();
+    let audit_id = stable_audit_id(
+        b"agbox.work.batch-audit.v1",
+        &batch.visibility_name,
+        batch.next_event_seq,
+        &batch.next_event_id,
+    );
+    let detail = format!(r#"{{"batch_digest":"{digest}"}}"#);
+    if replayed {
+        let stored: Option<String> = transaction
+            .query_row(
+                "SELECT detail_json FROM audit_events WHERE audit_id = ?1",
+                [audit_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if stored.as_deref() != Some(detail.as_str()) {
+            return Err(StoreError::ReducerWatermarkConflict);
+        }
+        return Ok(());
+    }
+    let changed = transaction.execute(
+        "INSERT OR IGNORE INTO audit_events(
+             audit_id, kind, project_id, work_id, actor, detail_json, created_at
+         ) VALUES (?1, 'work.publication_batch', ?2, ?3, 'system', ?4,
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        params![
+            audit_id,
+            batch.project_id.as_str(),
+            batch.work_id.as_str(),
+            detail
+        ],
+    )?;
+    if changed == 0 {
+        return Err(StoreError::ReducerWatermarkConflict);
+    }
+    Ok(())
+}
+
+fn stable_audit_id(domain: &[u8], name: &str, event_seq: u64, event_id: &EventId) -> String {
+    let mut identity = blake3::Hasher::new();
+    identity.update(domain);
+    identity.update(name.as_bytes());
+    identity.update(&event_seq.to_le_bytes());
+    identity.update(event_id.as_str().as_bytes());
+    format!("audit_work_{}", &identity.finalize().to_hex()[..24])
+}
+
+fn insert_work_contract_revision(
+    transaction: &Transaction<'_>,
+    batch: &WorkWriteBatch,
+    observed_at: &str,
+) -> Result<bool, StoreError> {
+    let stored: Option<String> = transaction
+        .query_row(
+            "SELECT contract_json
+             FROM work_contract_revisions
+             WHERE work_id = ?1 AND revision = ?2",
+            params![batch.work_id.as_str(), to_i64(batch.contract.revision)?],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(stored) = stored {
+        if stored == batch.contract.contract_json {
+            return Ok(false);
+        }
+        return Err(StoreError::ImmutableConflict);
+    }
+    let maximum: i64 = transaction.query_row(
+        "SELECT coalesce(max(revision), 0)
+         FROM work_contract_revisions WHERE work_id = ?1",
+        [batch.work_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if to_i64(batch.contract.revision)? != maximum + 1 {
+        return Err(StoreError::ImmutableConflict);
+    }
+    transaction.execute(
+        "INSERT INTO work_contract_revisions(
+             contract_id, work_id, revision, contract_json,
+             extractor_version, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            batch.contract.contract_id.as_str(),
+            batch.work_id.as_str(),
+            to_i64(batch.contract.revision)?,
+            batch.contract.contract_json,
+            batch.contract.extractor_version,
+            observed_at
+        ],
+    )?;
+    Ok(true)
+}
+
+fn replace_work_search(
+    transaction: &Transaction<'_>,
+    batch: &WorkWriteBatch,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "DELETE FROM work_search WHERE work_id = ?1 AND project_id = ?2",
+        params![batch.work_id.as_str(), batch.project_id.as_str()],
+    )?;
+    transaction.execute(
+        "INSERT INTO work_search(
+             work_id, project_id, objective, summary, completed_steps,
+             next_actions, blockers, artifacts, verification
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            batch.work_id.as_str(),
+            batch.project_id.as_str(),
+            batch.contract.objective.as_deref().unwrap_or_default(),
+            batch.contract.summary,
+            batch.contract.completed_steps.join("\n"),
+            batch.contract.next_actions.join("\n"),
+            batch.contract.blockers.join("\n"),
+            batch.contract.artifacts.join("\n"),
+            batch.contract.verification.join("\n")
+        ],
+    )?;
+    Ok(())
 }
 
 fn verify_graph_batch_audit(

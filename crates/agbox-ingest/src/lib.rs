@@ -404,5 +404,6 @@ pub mod test_support {
 pub use coordinator::{
     CoordinatorSource, GRAPH_REDUCER_NAME, GraphPageReport, IngestError, IngestionCoordinator,
     IngestionRuntime, ProcessReport, RetryClass, RetryClock, RetryPolicy, SourceHealth,
-    TokioRetryClock, WorkLease, graph_write_batch, reducer_events_after,
+    TokioRetryClock, WORK_VISIBILITY_REDUCER_NAME, WorkLease, WorkPublicationReport,
+    WorkPublicationRequest, graph_write_batch, reducer_events_after, work_write_batch,
 };

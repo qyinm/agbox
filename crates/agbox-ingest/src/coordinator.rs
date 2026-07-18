@@ -16,15 +16,21 @@ use agbox_adapters::{
     DecodeContext, DecodeDisposition, DecodeError, DecodedRecord, DecoderState, DiscoveredSource,
     SourceAdapter,
 };
-use agbox_core::{ContentRef, EventPayload, PrivacyLabel, ProjectId, Provider, SourceObservation};
+use agbox_core::{
+    ContentRef, EventPayload, PrivacyLabel, ProjectId, Provider, SourceObservation, WorkId,
+    WorkStatus,
+};
 use agbox_store::{
     ContentRefWrite, CursorState, EvidenceLink, EvidenceOwner, EvidenceWrite, GraphActionRow,
     GraphArtifactRow, GraphFinishRow, GraphObservedFinishRow, GraphRunRow, GraphSessionContextRow,
     GraphWriteBatch, IngestionChunk, IngestionFault, MAX_BATCH_BYTES, MAX_BATCH_RECORDS, ReadStore,
-    SchemaFingerprintUpdate, StoreError, WriterHandle, stable_content_ref_id,
+    SchemaFingerprintUpdate, StoreError, WorkApplyReceipt, WorkCandidateQuery, WorkContractRow,
+    WorkEdgeRow, WorkWriteBatch, WriterHandle, stable_content_ref_id,
 };
 use agbox_workgraph::{
-    CommittedEvent, DeterministicReducer, GraphMutation, ReduceError, ReducedFact,
+    CommittedEvent, ContractBuildError, CorrelationDecision, CorrelationInput, CorrelationOutcome,
+    Correlator, DeterministicReducer, GraphMutation, ProvisionalContract,
+    ProvisionalContractBuilder, ReduceError, ReducedFact, WorkCandidate,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Notify;
@@ -35,6 +41,7 @@ use crate::{
 };
 
 pub const GRAPH_REDUCER_NAME: &str = "deterministic-facts-v1";
+pub const WORK_VISIBILITY_REDUCER_NAME: &str = "work-visibility-v1";
 const GRAPH_REDUCER_CONFLICT_RETRIES: usize = 3;
 
 /// Immutable source facts needed to decode one registered generation.
@@ -100,6 +107,10 @@ pub enum IngestError {
     InvalidGraphMutation,
     #[error("graph reduction failed")]
     Reduce(#[from] ReduceError),
+    #[error("provisional contract build failed")]
+    Contract(#[from] ContractBuildError),
+    #[error("stored provisional contract is invalid")]
+    InvalidStoredContract,
 }
 
 impl fmt::Debug for IngestError {
@@ -119,8 +130,49 @@ impl fmt::Debug for IngestError {
             Self::InjectedRetry(_) => "InjectedRetry",
             Self::InvalidGraphMutation => "InvalidGraphMutation",
             Self::Reduce(_) => "Reduce",
+            Self::Contract(_) => "Contract",
+            Self::InvalidStoredContract => "InvalidStoredContract",
         })
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkPublicationRequest {
+    pub provider: Provider,
+    pub explicit_work_id: Option<WorkId>,
+    pub continuation_work_id: Option<WorkId>,
+    pub repository_hash: Option<String>,
+    pub branch_hash: Option<String>,
+    pub artifact_hashes: Vec<String>,
+    pub command_hashes: Vec<String>,
+    pub semantic_similarity_basis_points: u16,
+    pub extractor_version: String,
+}
+
+impl WorkPublicationRequest {
+    #[must_use]
+    pub fn new(provider: Provider) -> Self {
+        Self {
+            provider,
+            explicit_work_id: None,
+            continuation_work_id: None,
+            repository_hash: None,
+            branch_hash: None,
+            artifact_hashes: Vec::new(),
+            command_hashes: Vec::new(),
+            semantic_similarity_basis_points: 0,
+            extractor_version: "deterministic-v1".into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkPublicationReport {
+    pub receipt: WorkApplyReceipt,
+    pub work_id: WorkId,
+    pub revision: u64,
+    pub correlation: CorrelationOutcome,
+    pub candidate_truncated: bool,
 }
 
 /// Translates a pure workgraph mutation into the store-owned persistence DTO.
@@ -322,6 +374,131 @@ pub fn graph_write_batch(mutation: GraphMutation) -> Result<GraphWriteBatch, Ing
     }
     batch.validate()?;
     Ok(batch)
+}
+
+/// Translates pure correlation and contract outputs into a store-owned batch.
+///
+/// `WorkAssociation` values are persisted only as provenance edges; this
+/// boundary never schedules, assigns, accepts, or executes work.
+///
+/// # Errors
+///
+/// Returns [`IngestError::InvalidGraphMutation`] for mismatched or missing
+/// committed publication state.
+pub fn work_write_batch(
+    mutation: &GraphMutation,
+    work_id: WorkId,
+    correlation: &CorrelationOutcome,
+    contract: &ProvisionalContract,
+) -> Result<WorkWriteBatch, IngestError> {
+    let next_event_seq = mutation
+        .through_event_seq
+        .ok_or(IngestError::InvalidGraphMutation)?;
+    let next_event_id = mutation
+        .through_event_id
+        .clone()
+        .ok_or(IngestError::InvalidGraphMutation)?;
+    if contract.work_id != work_id || mutation.facts.is_empty() {
+        return Err(IngestError::InvalidGraphMutation);
+    }
+    let mut evidence_event_ids = mutation
+        .facts
+        .iter()
+        .map(|fact| fact.evidence_id().clone())
+        .collect::<Vec<_>>();
+    evidence_event_ids.sort();
+    evidence_event_ids.dedup();
+    let artifact_ids = mutation
+        .facts
+        .iter()
+        .filter_map(|fact| {
+            if let ReducedFact::Artifact {
+                path_hash,
+                evidence,
+                ..
+            } = fact
+            {
+                Some(stable_graph_id(
+                    "artifact",
+                    &[evidence.as_str(), path_hash.as_str()],
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let edges = correlation
+        .proposals
+        .iter()
+        .filter(|association| association.proposal_only && association.work_id != work_id)
+        .map(|association| WorkEdgeRow {
+            from_work_id: work_id.clone(),
+            to_work_id: association.work_id.clone(),
+            kind: "continues".into(),
+        })
+        .collect();
+    let contract_json =
+        serde_json::to_string(contract).map_err(|_| IngestError::InvalidGraphMutation)?;
+    Ok(WorkWriteBatch {
+        visibility_name: WORK_VISIBILITY_REDUCER_NAME.into(),
+        expected_event_seq: mutation.expected_event_seq,
+        next_event_seq,
+        next_event_id,
+        project_id: contract.project_id.clone(),
+        work_id,
+        status: work_status_name(contract.status).into(),
+        observed_at: contract.created_at,
+        evidence_event_ids,
+        artifact_ids,
+        edges,
+        contract: WorkContractRow {
+            contract_id: contract.contract_id.clone(),
+            revision: contract.revision,
+            contract_json,
+            extractor_version: contract.extractor_version.clone(),
+            objective: contract.objective.clone(),
+            summary: contract.summary.clone(),
+            completed_steps: contract.completed_steps.clone(),
+            next_actions: contract.next_actions.clone(),
+            blockers: contract.blockers.clone(),
+            artifacts: contract.artifacts.clone(),
+            verification: contract.verification.clone(),
+        },
+    })
+}
+
+fn work_status_name(status: WorkStatus) -> &'static str {
+    match status {
+        WorkStatus::Observed => "observed",
+        WorkStatus::Active => "active",
+        WorkStatus::Blocked => "blocked",
+        WorkStatus::Completed => "completed",
+        WorkStatus::Abandoned => "abandoned",
+    }
+}
+
+fn fact_observed_at(fact: &ReducedFact) -> OffsetDateTime {
+    match fact {
+        ReducedFact::AgentRunStarted { observed_at, .. }
+        | ReducedFact::AgentRunFinished { observed_at, .. }
+        | ReducedFact::SessionContext { observed_at, .. }
+        | ReducedFact::Artifact { observed_at, .. }
+        | ReducedFact::ActionFinishedObserved { observed_at, .. }
+        | ReducedFact::EligibleVerificationObserved { observed_at, .. }
+        | ReducedFact::Verification { observed_at, .. }
+        | ReducedFact::HumanObjective { observed_at, .. }
+        | ReducedFact::HumanConstraint { observed_at, .. }
+        | ReducedFact::AgentStatement { observed_at, .. } => *observed_at,
+        ReducedFact::ActionRequested { .. } => OffsetDateTime::UNIX_EPOCH,
+    }
+}
+
+fn parse_store_provider(value: &str) -> Option<Provider> {
+    match value {
+        "codex" => Some(Provider::Codex),
+        "claude" => Some(Provider::Claude),
+        _ => None,
+    }
 }
 
 /// Loads one bounded store page and translates it into the workgraph's pure
@@ -632,6 +809,154 @@ impl IngestionCoordinator {
             }
         }
         Err(IngestError::Store(StoreError::ReducerWatermarkConflict))
+    }
+
+    /// Correlates one reduced fact page, builds its immediate provisional
+    /// contract, and atomically publishes the store-owned work batch.
+    ///
+    /// The caller supplies only bounded correlation context. Candidate loading
+    /// is same-project, indexed, priority ordered, and capped by the store.
+    /// This provenance boundary never executes tools or assigns agents.
+    ///
+    /// # Errors
+    ///
+    /// Returns bounded correlation, contract, store, reference, or visibility
+    /// watermark errors. Visibility advances only after the full publication
+    /// transaction commits.
+    #[allow(clippy::too_many_lines)]
+    pub async fn publish_work(
+        &self,
+        mutation: GraphMutation,
+        request: WorkPublicationRequest,
+    ) -> Result<WorkPublicationReport, IngestError> {
+        let project_id = mutation
+            .facts
+            .first()
+            .map(ReducedFact::project_id)
+            .cloned()
+            .ok_or(IngestError::InvalidGraphMutation)?;
+        if mutation
+            .facts
+            .iter()
+            .any(|fact| fact.project_id() != &project_id)
+        {
+            return Err(IngestError::InvalidGraphMutation);
+        }
+        let observed_at = mutation
+            .facts
+            .iter()
+            .map(fact_observed_at)
+            .max()
+            .ok_or(IngestError::InvalidGraphMutation)?;
+        let mut artifact_hashes = request.artifact_hashes;
+        let mut command_hashes = request.command_hashes;
+        for fact in &mutation.facts {
+            match fact {
+                ReducedFact::Artifact { path_hash, .. } => {
+                    artifact_hashes.push(path_hash.clone());
+                }
+                ReducedFact::ActionRequested { input_hash, .. } => {
+                    command_hashes.push(input_hash.clone());
+                }
+                _ => {}
+            }
+        }
+        artifact_hashes.sort();
+        artifact_hashes.dedup();
+        command_hashes.sort();
+        command_hashes.dedup();
+        let artifact_truncated = artifact_hashes.len() > agbox_workgraph::MAX_ARTIFACT_HASHES;
+        let command_truncated = command_hashes.len() > agbox_workgraph::MAX_COMMAND_HASHES;
+        artifact_hashes.truncate(agbox_workgraph::MAX_ARTIFACT_HASHES);
+        command_hashes.truncate(agbox_workgraph::MAX_COMMAND_HASHES);
+
+        let page = self
+            .writer
+            .load_work_candidates(WorkCandidateQuery {
+                project_id: project_id.clone(),
+                explicit_work_id: request.explicit_work_id.clone(),
+                continuation_work_id: request.continuation_work_id.clone(),
+                artifact_hashes: artifact_hashes.clone(),
+                command_hashes: command_hashes.clone(),
+                observed_at,
+            })
+            .await?;
+        let page_truncated = page.truncated;
+        let evidence_refs = mutation
+            .facts
+            .iter()
+            .map(|fact| fact.evidence_id().clone())
+            .collect();
+        let mut input = CorrelationInput::new(project_id.clone(), request.provider, evidence_refs)
+            .artifact_hashes(artifact_hashes)
+            .command_hashes(command_hashes)
+            .semantic_similarity_basis_points(request.semantic_similarity_basis_points);
+        if let Some(work_id) = request.explicit_work_id {
+            input = input.explicit_work_id(work_id);
+        }
+        if let Some(work_id) = request.continuation_work_id {
+            input = input.continuation_work_id(work_id);
+        }
+        if let Some(repository_hash) = request.repository_hash {
+            input = input.repository(repository_hash);
+        }
+        if let Some(branch_hash) = request.branch_hash {
+            input = input.branch_hash(branch_hash);
+        }
+        for stored in page.candidates {
+            let mut candidate = WorkCandidate::new(stored.work_id, stored.project_id)
+                .artifact_hashes(stored.artifact_hashes)
+                .command_hashes(stored.command_hashes)
+                .recent_minutes(stored.minutes_since_activity);
+            candidate.provider = stored.provider.as_deref().and_then(parse_store_provider);
+            if let Some(repository_hash) = stored.repository_hash {
+                candidate = candidate.repository(repository_hash);
+            }
+            if let Some(branch_hash) = stored.branch_hash {
+                candidate = candidate.branch_hash(branch_hash);
+            }
+            input = input.candidate(candidate);
+        }
+        let correlation = Correlator.correlate(&input);
+        let work_id = match &correlation.decision {
+            CorrelationDecision::Continue { work_id, .. } => work_id.clone(),
+            CorrelationDecision::Create => WorkId::parse_wire(&stable_graph_id(
+                "work",
+                &[
+                    project_id.as_str(),
+                    mutation
+                        .through_event_id
+                        .as_ref()
+                        .ok_or(IngestError::InvalidGraphMutation)?
+                        .as_str(),
+                ],
+            ))
+            .ok_or(IngestError::InvalidGraphMutation)?,
+        };
+        let previous = self
+            .writer
+            .latest_work_contract(project_id, work_id.clone())
+            .await?
+            .map(|encoded| {
+                serde_json::from_str::<ProvisionalContract>(&encoded)
+                    .map_err(|_| IngestError::InvalidStoredContract)
+            })
+            .transpose()?;
+        let contract = ProvisionalContractBuilder::new(request.extractor_version)
+            .for_work(work_id.clone())
+            .build(previous.as_ref(), &mutation.facts)?;
+        let batch = work_write_batch(&mutation, work_id.clone(), &correlation, &contract)?;
+        let receipt = self.writer.apply_work(batch).await?;
+        Ok(WorkPublicationReport {
+            receipt,
+            work_id,
+            revision: contract.revision,
+            candidate_truncated: page_truncated
+                || artifact_truncated
+                || command_truncated
+                || correlation.truncation.candidates,
+            correlation,
+        })
     }
 
     /// Registers immutable decode facts for an already store-registered source.
