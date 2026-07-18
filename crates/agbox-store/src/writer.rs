@@ -442,6 +442,7 @@ impl ExtractorWriteBatch {
                 .bounded_error
                 .as_ref()
                 .is_some_and(|error| error.len() > agbox_core::limits::MAX_PREVIEW_BYTES)
+            || (self.status == "failed") != self.bounded_error.is_some()
             || (self.status == "failed" && self.refined_contract.is_some())
             || (self.status == "succeeded" && self.refined_contract.is_none())
         {

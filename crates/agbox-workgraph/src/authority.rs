@@ -64,6 +64,11 @@ pub struct SemanticPolicy {
 }
 
 impl SemanticPolicy {
+    /// Builds an evidence policy without a project scope.
+    ///
+    /// Use [`Self::for_project`] at the coordinator boundary; an unscoped
+    /// policy is useful for pure filtering tests but is intentionally rejected
+    /// by semantic publication.
     #[must_use]
     pub fn with_evidence<I>(evidence: I) -> Self
     where
