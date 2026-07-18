@@ -281,6 +281,128 @@ async fn inconsistent_contract_projections_fail_closed_before_any_rows_are_visib
 }
 
 #[tokio::test]
+async fn contract_evidence_references_allow_more_than_one_field_item_bound() {
+    let fixture = FixtureRuntime::codex_records(1).await;
+    fixture.drain().await.unwrap();
+    let event = &fixture
+        .read_store()
+        .events_after(0, 1, 1024 * 1024)
+        .await
+        .unwrap()[0];
+    let project_id = event.event.project_id().clone();
+    let observed_at = event.event.observed_at();
+    let evidence_refs = (0..65)
+        .map(|index| EventId::parse_wire(&format!("evt-projection-{index:03}")).unwrap())
+        .collect::<Vec<_>>();
+    let mut encoded: serde_json::Value = serde_json::from_str(&contract_json(
+        "contract-evidence-refs",
+        "work-evidence-refs",
+        project_id.as_str(),
+        "active",
+        Some("Evidence refs"),
+        "Evidence ref bounds",
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        observed_at,
+        "deterministic-v1",
+        "b3:evidence-refs",
+    ))
+    .unwrap();
+    encoded["evidence_refs"] = serde_json::json!(evidence_refs);
+    encoded["field_evidence"]["objective"] = serde_json::json!(evidence_refs);
+
+    fixture
+        .writer()
+        .apply_work(WorkWriteBatch {
+            visibility_name: "work-evidence-refs".into(),
+            expected_event_seq: 0,
+            next_event_seq: event.event_seq,
+            next_event_id: event.event.event_id().clone(),
+            project_id: project_id.clone(),
+            work_id: work_id("work-evidence-refs"),
+            status: "active".into(),
+            observed_at,
+            evidence_event_ids: vec![event.event.event_id().clone()],
+            artifact_ids: Vec::new(),
+            edges: Vec::new(),
+            contract: WorkContractRow {
+                contract_id: contract_id("contract-evidence-refs"),
+                revision: 1,
+                contract_json: encoded.to_string(),
+                extractor_version: "deterministic-v1".into(),
+                objective: Some("Evidence refs".into()),
+                summary: "Evidence ref bounds".into(),
+                completed_steps: Vec::new(),
+                next_actions: Vec::new(),
+                blockers: Vec::new(),
+                artifacts: Vec::new(),
+                verification: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn sixty_five_facts_publish_with_bounded_field_evidence() {
+    let fixture = FixtureRuntime::codex_records(65).await;
+    fixture.drain().await.unwrap();
+    let events = fixture
+        .read_store()
+        .events_after(0, 65, 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 65);
+    let project_id = events[0].event.project_id().clone();
+    let work_id = work_id("work-sixty-five-facts");
+    let facts = events
+        .iter()
+        .enumerate()
+        .map(|(index, committed)| ReducedFact::ActionRequested {
+            project_id: project_id.clone(),
+            session_id: committed.event.session_id().clone(),
+            native_action_id: format!("action-{index:03}"),
+            tool_name: "shell".into(),
+            input_hash: format!("b3:input-{index:03}"),
+            redacted_input: Some(format!("run bounded action {index}")),
+            observed_at: committed.event.observed_at(),
+            evidence: committed.event.event_id().clone(),
+        })
+        .collect::<Vec<_>>();
+    let mutation = GraphMutation {
+        facts,
+        expected_event_seq: 0,
+        through_event_seq: Some(events.last().unwrap().event_seq),
+        through_event_id: Some(events.last().unwrap().event.event_id().clone()),
+    };
+    let contract = ProvisionalContractBuilder::new("deterministic-v1")
+        .for_work(work_id.clone())
+        .build(None, &mutation.facts)
+        .unwrap();
+    let correlation = Correlator.correlate(&CorrelationInput::new(
+        project_id.clone(),
+        Provider::Codex,
+        vec![events[0].event.event_id().clone()],
+    ));
+    let batch = work_write_batch(&mutation, work_id.clone(), &correlation, &contract).unwrap();
+    assert_eq!(batch.evidence_event_ids.len(), 65);
+    fixture.writer().apply_work(batch).await.unwrap();
+
+    let connection = Connection::open(fixture.database_path()).unwrap();
+    let evidence_count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM work_evidence WHERE work_id = ?1",
+            [work_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(evidence_count, 65);
+}
+
+#[tokio::test]
 async fn request_only_publication_preserves_observation_time_for_recency() {
     let fixture = FixtureRuntime::codex_records(1).await;
     fixture.drain().await.unwrap();

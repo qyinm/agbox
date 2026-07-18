@@ -487,7 +487,7 @@ fn validate_contract_projection(batch: &WorkWriteBatch) -> Result<(), StoreError
             .any(|event_id| !bounded_identifier(event_id.as_str()))
         || contract.field_evidence.len() > 10
         || contract.field_evidence.values().any(|references| {
-            references.len() > agbox_core::limits::MAX_CONTRACT_ITEMS_PER_FIELD
+            references.len() > agbox_core::limits::MAX_CONTRACT_EVIDENCE_REFS
                 || references
                     .iter()
                     .any(|event_id| !bounded_identifier(event_id.as_str()))
