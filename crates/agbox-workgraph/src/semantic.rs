@@ -252,23 +252,17 @@ impl ExtractionInput {
 }
 
 fn contains_absolute_path(value: &str) -> bool {
-    let windows_drive_path = value.as_bytes().windows(3).any(|bytes| {
+    let bytes = value.as_bytes();
+    let windows_drive_path = bytes.windows(3).any(|bytes| {
         bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/')
     });
-    windows_drive_path
-        || value
-            .split(|character: char| {
-                character.is_ascii_whitespace()
-                    || matches!(
-                        character,
-                        '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '=' | ':'
-                    )
-            })
-            .any(|token| {
-                token.starts_with('/')
-                    || token.starts_with("~/")
-                    || token.as_bytes().get(1).is_some_and(|byte| *byte == b':')
-            })
+    let unix_absolute_path = bytes.iter().enumerate().any(|(index, byte)| {
+        *byte == b'/'
+            && (index == 0
+                || bytes[index - 1].is_ascii_whitespace()
+                || bytes[index - 1].is_ascii_punctuation())
+    });
+    windows_drive_path || unix_absolute_path
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -647,7 +641,7 @@ mod tests {
                 authority: Authority::AgentStatement,
                 disclosure_class: DisclosureClass::AgentStatement,
                 privacy: PrivacyLabel::PrivateLocal,
-                text: Some("changed /Users/alice/private.rs".into()),
+                text: Some("changed,/Users/alice/private.rs".into()),
             }],
             vec![BoundedEvidence {
                 project_id: project_id.clone(),
