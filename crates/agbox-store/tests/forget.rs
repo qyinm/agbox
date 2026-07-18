@@ -23,6 +23,18 @@ fn seed_project(connection: &rusqlite::Connection, project: &str, work: &str) {
     connection.execute("INSERT INTO work_items(work_id,project_id,status,created_at,updated_at) VALUES (?1,?2,'active','now','now')", params![work, project]).unwrap();
 }
 
+fn seed_contract(connection: &rusqlite::Connection, project: &str, work: &str) {
+    let contract = serde_json::json!({
+        "contract_id":"contract_test", "work_id":work, "revision":1, "project_id":project,
+        "objective":"old objective", "status":"active", "summary":"old summary",
+        "completed_steps":[], "next_actions":[], "blockers":[], "constraints":[], "completion_criteria":[], "artifacts":[], "verification":[],
+        "evidence_refs":["evt_test"], "field_evidence":{"status":["evt_test"]}, "evidence_truncated":false,
+        "confidence_basis_points":10000, "created_at":"2026-01-01T00:00:00Z", "extractor_version":"fixture",
+        "fact_set_digest":"fixture", "material_content_hash":"b3:fixture", "projection_state":{}
+    });
+    connection.execute("INSERT INTO work_contract_revisions(contract_id,work_id,revision,contract_json,extractor_version,created_at) VALUES ('contract_test',?1,1,?2,'fixture','2026-01-01T00:00:00Z')", params![work, contract.to_string()]).unwrap();
+}
+
 #[test]
 fn hostile_fts_syntax_becomes_bounded_literal_terms() {
     let expression = fts_literal_query("alpha OR beta* \"quoted\"").unwrap();
@@ -93,4 +105,69 @@ async fn scoped_forget_rejects_a_guessed_foreign_work_id_and_project_forget_remo
         .unwrap();
     assert_eq!(content, 0);
     assert_eq!(foreign_work, 1);
+}
+
+#[tokio::test]
+async fn human_correction_preserves_the_prior_revision_and_rejects_cross_project() {
+    let directory = private_tempdir();
+    let database = directory.path().join("state.db");
+    let store = Store::open_new(&database).unwrap();
+    drop(store);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    seed_project(&connection, "project_a", "work_a");
+    seed_project(&connection, "project_b", "work_b");
+    seed_contract(&connection, "project_a", "work_a");
+    let before: String = connection.query_row("SELECT contract_json FROM work_contract_revisions WHERE work_id='work_a' AND revision=1", [], |row| row.get(0)).unwrap();
+    drop(connection);
+    let runtime = StoreRuntime::start_with_key_provider(
+        &database,
+        Arc::new(MemoryKeyProvider::fixed([82; 32])),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        runtime
+            .writer()
+            .apply_human_correction(
+                ProjectId::for_test("project_b"),
+                WorkId::for_test("work_a"),
+                "summary".into(),
+                "foreign".into(),
+                OffsetDateTime::now_utc()
+            )
+            .await,
+        Err(StoreError::InvalidReference)
+    ));
+    let receipt = runtime
+        .writer()
+        .apply_human_correction(
+            ProjectId::for_test("project_a"),
+            WorkId::for_test("work_a"),
+            "summary".into(),
+            "new summary".into(),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.revision, 2);
+    runtime.shutdown().await.unwrap();
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM work_contract_revisions WHERE work_id='work_a'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let prior: String = connection.query_row("SELECT contract_json FROM work_contract_revisions WHERE work_id='work_a' AND revision=1", [], |row| row.get(0)).unwrap();
+    let current: String = connection.query_row("SELECT contract_json FROM work_contract_revisions WHERE work_id='work_a' AND revision=2", [], |row| row.get(0)).unwrap();
+    assert_eq!(count, 2);
+    assert_eq!(prior, before);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&current).unwrap()["summary"],
+        "new summary"
+    );
 }

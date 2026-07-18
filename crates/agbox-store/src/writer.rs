@@ -6,7 +6,7 @@ use std::{
 
 use agbox_core::{
     ActivityEventV1, ContentRef, DisclosureClass, EventId, EvidenceId, PrivacyLabel, ProjectId,
-    Provider, SessionId, SourceObservation, WorkId, WorkStatus,
+    Provider, RedactionPolicy, SessionId, SourceObservation, WorkId, WorkStatus,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -413,6 +413,15 @@ pub struct SemanticEvidenceRow {
     pub privacy: PrivacyLabel,
     pub disclosure_class: DisclosureClass,
     pub redacted_excerpt: String,
+}
+
+/// Receipt for a new immutable, human-authored correction revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HumanCorrectionReceipt {
+    pub evidence_id: EvidenceId,
+    pub assertion_id: String,
+    pub contract_id: agbox_core::ContractId,
+    pub revision: u64,
 }
 
 type ExistingExtractorRun = (
@@ -1272,6 +1281,14 @@ pub(crate) enum WriteCommand {
         batch: Box<ExtractorWriteBatch>,
         reply: oneshot::Sender<Result<ExtractorApplyReceipt, StoreError>>,
     },
+    ApplyHumanCorrection {
+        project_id: ProjectId,
+        work_id: WorkId,
+        field: String,
+        value: String,
+        observed_at: OffsetDateTime,
+        reply: oneshot::Sender<Result<HumanCorrectionReceipt, StoreError>>,
+    },
     LoadWorkCandidates {
         query: Box<WorkCandidateQuery>,
         reply: oneshot::Sender<Result<WorkCandidatePage, StoreError>>,
@@ -1472,6 +1489,44 @@ impl WriterHandle {
         self.sender
             .send(WriteCommand::ApplyExtractor {
                 batch: Box::new(batch),
+                reply,
+            })
+            .await
+            .map_err(|_| StoreError::WriterStopped)?;
+        receive.await.map_err(|_| StoreError::WriterStopped)?
+    }
+
+    /// Applies one bounded human correction as new evidence, assertion, and
+    /// immutable contract revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an ownership, validation, redaction, vault, database, or writer
+    /// error without modifying prior revisions.
+    pub async fn apply_human_correction(
+        &self,
+        project_id: ProjectId,
+        work_id: WorkId,
+        field: String,
+        value: String,
+        observed_at: OffsetDateTime,
+    ) -> Result<HumanCorrectionReceipt, StoreError> {
+        if !bounded_identifier(project_id.as_str())
+            || !bounded_identifier(work_id.as_str())
+            || value.is_empty()
+            || value.len() > agbox_core::limits::MAX_INLINE_BYTES
+            || !correction_field(&field).is_some()
+        {
+            return Err(StoreError::InvalidBatch);
+        }
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(WriteCommand::ApplyHumanCorrection {
+                project_id,
+                work_id,
+                field,
+                value,
+                observed_at,
                 reply,
             })
             .await
@@ -1718,6 +1773,24 @@ pub(crate) fn run_writer(
             WriteCommand::ApplyExtractor { batch, reply } => {
                 let result = apply_extractor(&mut connection, &batch);
                 let _ = reply.send(result);
+            }
+            WriteCommand::ApplyHumanCorrection {
+                project_id,
+                work_id,
+                field,
+                value,
+                observed_at,
+                reply,
+            } => {
+                let _ = reply.send(apply_human_correction(
+                    &mut connection,
+                    &vault,
+                    &project_id,
+                    &work_id,
+                    &field,
+                    &value,
+                    observed_at,
+                ));
             }
             WriteCommand::LoadWorkCandidates { query, reply } => {
                 let result = load_work_candidates(&connection, &query);
@@ -2608,6 +2681,144 @@ fn validate_extractor_parent(
     Ok(())
 }
 
+fn correction_field(value: &str) -> Option<(&'static str, bool)> {
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "objective" => Some(("objective", false)),
+        "summary" => Some(("summary", false)),
+        "next_action" | "next_actions" => Some(("next_actions", true)),
+        "blocker" | "blockers" => Some(("blockers", true)),
+        "constraint" | "constraints" => Some(("constraints", true)),
+        "completion_criterion" | "completion_criteria" => Some(("completion_criteria", true)),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn apply_human_correction(
+    connection: &mut rusqlite::Connection,
+    vault: &EvidenceVault,
+    project_id: &ProjectId,
+    work_id: &WorkId,
+    field: &str,
+    value: &str,
+    observed_at: OffsetDateTime,
+) -> Result<HumanCorrectionReceipt, StoreError> {
+    let Some((json_field, list)) = correction_field(field) else {
+        return Err(StoreError::InvalidBatch);
+    };
+    if value.is_empty() || value.len() > agbox_core::limits::MAX_INLINE_BYTES {
+        return Err(StoreError::InvalidBatch);
+    }
+    let redacted = RedactionPolicy::new()
+        .and_then(|policy| policy.redact(value, None, DisclosureClass::HumanIntent))
+        .map_err(|_| StoreError::InvalidBatch)?;
+    let evidence_id = EvidenceId::parse_wire(&format!("corr_{}", uuid::Uuid::new_v4().simple()))
+        .ok_or(StoreError::InvalidBatch)?;
+    let assertion_id = format!("assert_{}", uuid::Uuid::new_v4().simple());
+    // The encrypted original is written first. If the following transaction
+    // loses a race, bounded orphan cleanup is responsible for the lone blob.
+    vault.put(
+        &evidence_id,
+        EvidenceContext {
+            project_id,
+            owner: EvidenceOwnerRef::Work(work_id),
+        },
+        value.as_bytes(),
+    )?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let latest: Option<(String, String, i64)> = transaction.query_row(
+        "SELECT r.contract_json,r.contract_id,r.revision FROM work_items w INNER JOIN work_contract_revisions r ON r.work_id=w.work_id WHERE w.project_id=?1 AND w.work_id=?2 ORDER BY r.revision DESC LIMIT 1",
+        params![project_id.as_str(), work_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))
+    ).optional()?;
+    let (previous_json, contract_id_raw, previous_revision) =
+        latest.ok_or(StoreError::InvalidReference)?;
+    let mut contract: serde_json::Value = serde_json::from_str(&previous_json)?;
+    let object = contract.as_object_mut().ok_or(StoreError::InvalidBatch)?;
+    let redacted_value = redacted.value().to_owned();
+    if list {
+        object.insert(json_field.into(), serde_json::json!([redacted_value]));
+    } else {
+        object.insert(json_field.into(), serde_json::Value::String(redacted_value));
+    }
+    let revision = u64::try_from(previous_revision)
+        .map_err(|_| StoreError::InvalidBatch)?
+        .checked_add(1)
+        .ok_or(StoreError::InvalidBatch)?;
+    let timestamp = format_timestamp(observed_at)?;
+    object.insert("revision".into(), serde_json::json!(revision));
+    object.insert(
+        "created_at".into(),
+        serde_json::Value::String(timestamp.clone()),
+    );
+    object.insert(
+        "extractor_version".into(),
+        serde_json::Value::String("human-correction-v1".into()),
+    );
+    let material = serde_json::json!({
+        "objective": object.get("objective"), "status": object.get("status"), "summary": object.get("summary"),
+        "completed_steps": object.get("completed_steps"), "next_actions": object.get("next_actions"), "blockers": object.get("blockers"), "constraints": object.get("constraints"), "completion_criteria": object.get("completion_criteria"), "artifacts": object.get("artifacts"), "verification": object.get("verification")
+    });
+    let digest = blake3::hash(serde_json::to_string(&material)?.as_bytes())
+        .to_hex()
+        .to_string();
+    object.insert(
+        "material_content_hash".into(),
+        serde_json::Value::String(format!("b3:human-{digest}")),
+    );
+    let previous_fact_set = object
+        .get("fact_set_digest")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    object.insert(
+        "fact_set_digest".into(),
+        serde_json::Value::String(format!("{previous_fact_set}:human-{digest}")),
+    );
+    let contract_json = serde_json::to_string(&contract)?;
+    if contract_json.len() > agbox_core::limits::MAX_CONTRACT_SERIALIZED_BYTES {
+        return Err(StoreError::InvalidBatch);
+    }
+    let contract_id =
+        agbox_core::ContractId::parse_wire(&contract_id_raw).ok_or(StoreError::InvalidBatch)?;
+    let content_hash = format!("b3:{}", blake3::hash(value.as_bytes()).to_hex());
+    transaction.execute("INSERT INTO evidence_objects(evidence_id,project_id,owner_kind,owner_id,content_hash,media_type,privacy,byte_length,redacted_excerpt,disclosure_class,blob_state,created_at,expires_at,retired_at) VALUES (?1,?2,'work',?3,?4,'text/plain','private_local',?5,?6,'human_intent','available',?7,NULL,NULL)", params![evidence_id.as_str(), project_id.as_str(), work_id.as_str(), content_hash, i64::try_from(value.len()).map_err(|_| StoreError::InvalidBatch)?, redacted.value(), timestamp])?;
+    transaction.execute("INSERT INTO work_assertions(assertion_id,work_id,field,value,authority,privacy,disclosure_class,confidence_basis_points,created_at,supersedes_assertion_id) VALUES (?1,?2,?3,?4,'human_intent','private_local','human_intent',10000,?5,NULL)", params![assertion_id, work_id.as_str(), field, redacted.value(), timestamp])?;
+    transaction.execute("INSERT INTO work_contract_revisions(contract_id,work_id,revision,contract_json,extractor_version,created_at) VALUES (?1,?2,?3,?4,'human-correction-v1',?5)", params![contract_id.as_str(), work_id.as_str(), i64::try_from(revision).map_err(|_| StoreError::InvalidBatch)?, contract_json, timestamp])?;
+    let field_text = |name: &str| {
+        contract.get(name).map_or_else(String::new, |value| {
+            if value.is_array() {
+                value
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default()
+            } else {
+                value.as_str().unwrap_or_default().to_owned()
+            }
+        })
+    };
+    transaction.execute(
+        "DELETE FROM work_search WHERE work_id=?1 AND project_id=?2",
+        params![work_id.as_str(), project_id.as_str()],
+    )?;
+    transaction.execute("INSERT INTO work_search(work_id,project_id,objective,summary,completed_steps,next_actions,blockers,artifacts,verification) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![work_id.as_str(), project_id.as_str(), field_text("objective"), field_text("summary"), field_text("completed_steps"), field_text("next_actions"), field_text("blockers"), field_text("artifacts"), field_text("verification")])?;
+    transaction.execute(
+        "UPDATE work_items SET updated_at=?3 WHERE project_id=?1 AND work_id=?2",
+        params![project_id.as_str(), work_id.as_str(), timestamp],
+    )?;
+    transaction.commit()?;
+    Ok(HumanCorrectionReceipt {
+        evidence_id,
+        assertion_id,
+        contract_id,
+        revision,
+    })
+}
+
 fn extractor_audit_id(run_id: &str) -> String {
     let digest = blake3::hash(run_id.as_bytes()).to_hex();
     format!("audit_extractor_{}", &digest[..24])
@@ -2882,7 +3093,13 @@ fn record_audit(
 ) -> Result<(), StoreError> {
     let observed_at = format_timestamp(record.observed_at)?;
     let audit_id = format!("audit_app_{}", uuid::Uuid::new_v4().simple());
-    connection.execute("INSERT INTO audit_events(audit_id,kind,project_id,work_id,actor,detail_json,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![audit_id, record.kind, record.project_id.as_str(), record.work_id.as_ref().map(WorkId::as_str), record.actor, format!(r#"{{"result":"{}"}}"#, record.result), observed_at])?;
+    let detail = serde_json::json!({
+        "result": record.result,
+        "contract_id": record.contract_id.as_ref().map(agbox_core::ContractId::as_str),
+        "revision": record.revision,
+        "provider": record.provider,
+    });
+    connection.execute("INSERT INTO audit_events(audit_id,kind,project_id,work_id,actor,detail_json,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![audit_id, record.kind, record.project_id.as_str(), record.work_id.as_ref().map(WorkId::as_str), record.actor, detail.to_string(), observed_at])?;
     Ok(())
 }
 
