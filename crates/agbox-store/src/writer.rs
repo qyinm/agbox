@@ -2742,11 +2742,33 @@ fn apply_human_correction(
         latest.ok_or(StoreError::InvalidReference)?;
     let mut contract: serde_json::Value = serde_json::from_str(&previous_json)?;
     let object = contract.as_object_mut().ok_or(StoreError::InvalidBatch)?;
+    let event_id = object
+        .get("evidence_refs")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|values| values.first())
+        .and_then(serde_json::Value::as_str)
+        .and_then(EventId::parse_wire)
+        .ok_or(StoreError::InvalidReference)?;
     let redacted_value = redacted.value().to_owned();
     if list {
         object.insert(json_field.into(), serde_json::json!([redacted_value]));
     } else {
         object.insert(json_field.into(), serde_json::Value::String(redacted_value));
+    }
+    let field_evidence = object
+        .get_mut("field_evidence")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or(StoreError::InvalidBatch)?;
+    let references = field_evidence
+        .entry(json_field)
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or(StoreError::InvalidBatch)?;
+    if !references
+        .iter()
+        .any(|value| value.as_str() == Some(event_id.as_str()))
+    {
+        references.push(serde_json::Value::String(event_id.as_str().to_owned()));
     }
     let revision = u64::try_from(previous_revision)
         .map_err(|_| StoreError::InvalidBatch)?
@@ -2790,6 +2812,15 @@ fn apply_human_correction(
     let content_hash = format!("b3:{}", blake3::hash(value.as_bytes()).to_hex());
     transaction.execute("INSERT INTO evidence_objects(evidence_id,project_id,owner_kind,owner_id,content_hash,media_type,privacy,byte_length,redacted_excerpt,disclosure_class,blob_state,created_at,expires_at,retired_at) VALUES (?1,?2,'work',?3,?4,'text/plain','private_local',?5,?6,'human_intent','available',?7,NULL,NULL)", params![evidence_id.as_str(), project_id.as_str(), work_id.as_str(), content_hash, i64::try_from(value.len()).map_err(|_| StoreError::InvalidBatch)?, redacted.value(), timestamp])?;
     transaction.execute("INSERT INTO work_assertions(assertion_id,work_id,field,value,authority,privacy,disclosure_class,confidence_basis_points,created_at,supersedes_assertion_id) VALUES (?1,?2,?3,?4,'human_intent','private_local','human_intent',10000,?5,NULL)", params![assertion_id, work_id.as_str(), field, redacted.value(), timestamp])?;
+    transaction.execute(
+        "INSERT INTO work_evidence(work_id,assertion_id,event_id,evidence_id) VALUES (?1,?2,?3,?4)",
+        params![
+            work_id.as_str(),
+            assertion_id,
+            event_id.as_str(),
+            evidence_id.as_str()
+        ],
+    )?;
     transaction.execute("INSERT INTO work_contract_revisions(contract_id,work_id,revision,contract_json,extractor_version,created_at) VALUES (?1,?2,?3,?4,'human-correction-v1',?5)", params![contract_id.as_str(), work_id.as_str(), i64::try_from(revision).map_err(|_| StoreError::InvalidBatch)?, contract_json, timestamp])?;
     let field_text = |name: &str| {
         contract.get(name).map_or_else(String::new, |value| {

@@ -122,6 +122,7 @@ async fn human_correction_preserves_the_prior_revision_and_rejects_cross_project
         .unwrap();
     seed_project(&connection, "project_a", "work_a");
     seed_project(&connection, "project_b", "work_b");
+    connection.execute("INSERT INTO activity_events(event_id,semantic_key,schema_version,occurred_at,observed_at,project_id,session_id,actor,source_json,payload_json,privacy) VALUES ('evt_test','correction',1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','project_a','session_test','human','{}','{\"type\":\"session.started\",\"context\":null}','private_local')", []).unwrap();
     seed_contract(&connection, "project_a", "work_a");
     let before: String = connection.query_row("SELECT contract_json FROM work_contract_revisions WHERE work_id='work_a' AND revision=1", [], |row| row.get(0)).unwrap();
     drop(connection);
