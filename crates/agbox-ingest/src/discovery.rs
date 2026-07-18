@@ -19,6 +19,7 @@ pub const DISCOVERY_ENTRIES_PER_YIELD: usize = 256;
 pub const MAX_DISCOVERY_CURSOR_BYTES: usize = 32 * 1024;
 const MAX_DISCOVERY_FAULTS: usize = 32;
 const MAX_DIRECTORY_RETRIES: u8 = 3;
+const MAX_LIVE_DIRECTORY_STREAMS: usize = 32;
 
 #[derive(Clone)]
 pub struct DiscoveryCursor {
@@ -195,6 +196,7 @@ pub struct DiscoveryWalker {
     root: File,
     cursor: DiscoveryCursor,
     active: Vec<ActiveDirectory>,
+    restored: bool,
 }
 
 impl fmt::Debug for DiscoveryWalker {
@@ -227,7 +229,6 @@ struct DirectoryPage {
 
 struct ActiveDirectory {
     cursor: DirectoryCursor,
-    directory: File,
     iterator: Dir,
     recovery_remaining: u64,
 }
@@ -249,13 +250,7 @@ impl DiscoveryWalker {
             .path
             .canonicalize()
             .map_err(|_| DiscoveryError::RootUnavailable)?;
-        let root = rustix::fs::open(
-            &canonical,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
-            Mode::empty(),
-        )
-        .map(File::from)
-        .map_err(|_| DiscoveryError::RootUnavailable)?;
+        let root = open_root_nofollow(&canonical)?;
         let stat = rustix::fs::fstat(&root).map_err(|_| DiscoveryError::RootUnavailable)?;
         if !FileType::from_raw_mode(stat.st_mode).is_dir() {
             return Err(DiscoveryError::RootUnavailable);
@@ -291,6 +286,7 @@ impl DiscoveryWalker {
             root,
             cursor,
             active: Vec::new(),
+            restored: false,
         })
     }
 
@@ -313,6 +309,7 @@ impl DiscoveryWalker {
             return Err(DiscoveryError::InvalidCursor);
         }
         walker.cursor = cursor;
+        walker.restored = true;
         Ok(walker)
     }
 
@@ -344,7 +341,7 @@ impl DiscoveryWalker {
                 .last()
                 .is_none_or(|active| active.cursor != directory_cursor)
             {
-                let directory = match self.open_directory(&directory_cursor) {
+                let directory = match self.open_directory(&directory_cursor, self.restored) {
                     Ok(directory) => directory,
                     Err(OpenDirectoryError::Unavailable) => {
                         bounded_fault(&mut faults, DiscoveryFaultClass::DirectoryUnavailable);
@@ -356,18 +353,24 @@ impl DiscoveryWalker {
                         return Err(DiscoveryError::InvalidCursor);
                     }
                 };
-                let Ok(iterator) = Dir::read_from(&directory) else {
+                let Ok(iterator) = Dir::new(directory) else {
                     bounded_fault(&mut faults, DiscoveryFaultClass::DirectoryUnavailable);
                     retry_or_quarantine(&mut self.cursor, &mut directory_cursor);
                     self.active.clear();
                     continue;
                 };
+                if self.active.len() >= MAX_LIVE_DIRECTORY_STREAMS {
+                    let _ = self.active.remove(0);
+                }
                 self.active.push(ActiveDirectory {
                     recovery_remaining: directory_cursor.entries_consumed,
                     cursor: directory_cursor.clone(),
-                    directory,
                     iterator,
                 });
+            }
+            if self.open_directory(&directory_cursor, false).is_err() {
+                self.active.clear();
+                return Err(DiscoveryError::InvalidCursor);
             }
             let mut page_start = directory_cursor.clone();
             let page = {
@@ -378,6 +381,10 @@ impl DiscoveryWalker {
                 read_page(active, hard_limit - visited_entries, &mut faults)
             };
             visited_entries = visited_entries.saturating_add(page.reads);
+            if self.open_directory(&directory_cursor, false).is_err() {
+                self.active.clear();
+                return Err(DiscoveryError::InvalidCursor);
+            }
             if page.invalid_cursor {
                 self.active.clear();
                 return Err(DiscoveryError::InvalidCursor);
@@ -486,12 +493,15 @@ impl DiscoveryWalker {
         })
     }
 
-    fn open_directory(&self, cursor: &DirectoryCursor) -> Result<File, OpenDirectoryError> {
+    fn open_directory(
+        &self,
+        cursor: &DirectoryCursor,
+        check_snapshot: bool,
+    ) -> Result<File, OpenDirectoryError> {
         let mut directory = self
             .root
             .try_clone()
             .map_err(|_| OpenDirectoryError::Unavailable)?;
-        let mut links = Vec::new();
         for component in &cursor.components {
             let name = OsStr::from_bytes(component);
             let parent = directory
@@ -505,13 +515,17 @@ impl DiscoveryWalker {
             )
             .map(File::from)
             .map_err(|_| OpenDirectoryError::Unavailable)?;
-            links.push((
-                parent,
-                component.clone(),
-                directory
-                    .try_clone()
-                    .map_err(|_| OpenDirectoryError::Unavailable)?,
-            ));
+            let rebound = rustix::fs::openat(
+                &parent,
+                name,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|_| OpenDirectoryError::Unavailable)?;
+            if !same_file_identity(&directory, &rebound)? {
+                return Err(OpenDirectoryError::InvalidCursor);
+            }
         }
         let stat = rustix::fs::fstat(&directory).map_err(|_| OpenDirectoryError::Unavailable)?;
         let (device, inode) =
@@ -519,27 +533,22 @@ impl DiscoveryWalker {
         if !FileType::from_raw_mode(stat.st_mode).is_dir()
             || device != cursor.device
             || inode != cursor.inode
-            || stat.st_mtime != cursor.mtime_seconds
-            || stat.st_mtime_nsec != cursor.mtime_nanoseconds
-            || stat.st_ctime != cursor.ctime_seconds
-            || stat.st_ctime_nsec != cursor.ctime_nanoseconds
+            || (check_snapshot
+                && (stat.st_mtime != cursor.mtime_seconds
+                    || stat.st_mtime_nsec != cursor.mtime_nanoseconds
+                    || stat.st_ctime != cursor.ctime_seconds
+                    || stat.st_ctime_nsec != cursor.ctime_nanoseconds))
         {
             return Err(OpenDirectoryError::InvalidCursor);
         }
-        for (parent, name, expected) in links {
-            let rebound = rustix::fs::openat(
-                &parent,
-                OsStr::from_bytes(&name),
-                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
-                Mode::empty(),
-            )
-            .map(File::from)
-            .map_err(|_| OpenDirectoryError::Unavailable)?;
-            if !same_file_identity(&expected, &rebound)? {
-                return Err(OpenDirectoryError::InvalidCursor);
-            }
-        }
         Ok(directory)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn live_stream_count_for_test(&self) -> usize {
+        self.active.len()
     }
 }
 
@@ -547,6 +556,33 @@ fn same_file_identity(left: &File, right: &File) -> Result<bool, OpenDirectoryEr
     let left = rustix::fs::fstat(left).map_err(|_| OpenDirectoryError::Unavailable)?;
     let right = rustix::fs::fstat(right).map_err(|_| OpenDirectoryError::Unavailable)?;
     Ok(left.st_dev == right.st_dev && left.st_ino == right.st_ino)
+}
+
+fn open_root_nofollow(path: &Path) -> Result<File, DiscoveryError> {
+    if !path.is_absolute() {
+        return Err(DiscoveryError::RootUnavailable);
+    }
+    let mut directory = rustix::fs::open(
+        "/",
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|_| DiscoveryError::RootUnavailable)?;
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        directory = rustix::fs::openat(
+            &directory,
+            name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|_| DiscoveryError::RootUnavailable)?;
+    }
+    Ok(directory)
 }
 
 /// Collapses overlapping-root sightings by provider and filesystem identity,
@@ -605,8 +641,13 @@ fn read_page(
         if matches!(name.as_slice(), b"." | b"..") {
             continue;
         }
+        let Ok(directory_fd) = active.iterator.fd() else {
+            bounded_fault(faults, DiscoveryFaultClass::DirectoryUnavailable);
+            fault = true;
+            break;
+        };
         let Ok(stat) = rustix::fs::statat(
-            &active.directory,
+            directory_fd,
             OsStr::from_bytes(&name),
             AtFlags::SYMLINK_NOFOLLOW,
         ) else {

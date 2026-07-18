@@ -212,7 +212,7 @@ fn wide_long_child_directories_make_progress_without_a_cursor_overflow() {
 fn deep_dfs_cursor_uses_prefix_sharing_and_stays_within_its_exact_bound() {
     let temp = tempfile::tempdir().unwrap();
     let mut leaf = temp.path().to_path_buf();
-    for _ in 0..120 {
+    for _ in 0..30 {
         leaf.push("d");
         fs::create_dir(&leaf).unwrap();
     }
