@@ -3608,6 +3608,18 @@ cursor. Sorting is deliberately limited to each bounded page; a global sort
 would require unbounded materialization. This requires neither `unsafe` code
 nor direct `libc` calls.
 
+**Adversarial review amendment:** source snapshots also carry ctime with
+nanosecond precision, so an equal-size same-inode rewrite with a restored mtime
+cannot be accepted. Descriptor-bound opens retain and revalidate every
+root-to-parent identity relationship, including `..` parent reachability and a
+fresh no-follow lexical root binding immediately before and after the final
+open/return. The frontier is depth-first and commits no more than one newly
+discovered child directory per page; each `Dir::next` result, including dot
+entries, consumes budget. Persistent directory failures receive bounded retry
+and quarantine treatment so later work remains schedulable. A v1 database with
+more than one generation for a source is rejected atomically rather than
+inventing unknown historical file identities.
+
 - [ ] **Step 4: Implement verified open and generation reconciliation**
 
 On Unix, walk from an already-open canonical root directory and open each component with safe `rustix::fs::openat`; use `OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW` for the file, then compare `st_dev` and `st_ino` with the discovered identity. Reject any symlink component, identity change, or root escape. Do not add direct `libc` calls or relax workspace `unsafe_code = "forbid"`.

@@ -79,13 +79,7 @@ impl ProjectResolver {
         let canonical_root = supplied_root
             .canonicalize()
             .map_err(|_| ProjectError::Unavailable)?;
-        let root = rustix::fs::open(
-            &canonical_root,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
-            Mode::empty(),
-        )
-        .map(File::from)
-        .map_err(|_| ProjectError::Unavailable)?;
+        let root = open_absolute_directory(&canonical_root)?;
         let stat = rustix::fs::fstat(&root).map_err(|_| ProjectError::Unavailable)?;
         if !FileType::from_raw_mode(stat.st_mode).is_dir() {
             return Err(ProjectError::Unavailable);
@@ -118,6 +112,7 @@ impl ProjectResolver {
             let repository = self.open_components(repository_components)?;
             match self.validate_git_marker(&repository, repository_components)? {
                 MarkerResult::Valid => {
+                    self.verify_repository_return(repository_components, &repository)?;
                     let stat =
                         rustix::fs::fstat(&repository).map_err(|_| ProjectError::Unavailable)?;
                     let (device, inode) = stat_identity(&stat)?;
@@ -139,6 +134,7 @@ impl ProjectResolver {
         if !FileType::from_raw_mode(stat.st_mode).is_dir()
             || device != self.root_device
             || inode != self.root_inode
+            || !same_identity(&self.root, &open_absolute_directory(&self.canonical_root)?)?
         {
             return Err(ProjectError::Unavailable);
         }
@@ -154,10 +150,21 @@ impl ProjectResolver {
     }
 
     fn open_components(&self, components: &[Vec<u8>]) -> Result<File, ProjectError> {
+        self.open_component_chain(components)?
+            .pop()
+            .ok_or(ProjectError::Unavailable)
+    }
+
+    fn open_component_chain(&self, components: &[Vec<u8>]) -> Result<Vec<File>, ProjectError> {
         let mut directory = self
             .root
             .try_clone()
             .map_err(|_| ProjectError::Unavailable)?;
+        let mut chain = vec![
+            directory
+                .try_clone()
+                .map_err(|_| ProjectError::Unavailable)?,
+        ];
         for component in components {
             directory = rustix::fs::openat(
                 &directory,
@@ -167,8 +174,42 @@ impl ProjectResolver {
             )
             .map(File::from)
             .map_err(|_| ProjectError::Symlink)?;
+            chain.push(
+                directory
+                    .try_clone()
+                    .map_err(|_| ProjectError::Unavailable)?,
+            );
         }
-        Ok(directory)
+        Ok(chain)
+    }
+
+    fn verify_repository_return(
+        &self,
+        components: &[Vec<u8>],
+        repository: &File,
+    ) -> Result<(), ProjectError> {
+        self.verify_root()?;
+        let chain = self.open_component_chain(components)?;
+        let Some(rebound) = chain.last() else {
+            return Err(ProjectError::Unavailable);
+        };
+        if !same_identity(repository, rebound)? {
+            return Err(ProjectError::RootEscape);
+        }
+        for pair in chain.windows(2) {
+            let observed_parent = rustix::fs::openat(
+                &pair[1],
+                "..",
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|_| ProjectError::Unavailable)?;
+            if !same_identity(&pair[0], &observed_parent)? {
+                return Err(ProjectError::RootEscape);
+            }
+        }
+        Ok(())
     }
 
     fn validate_git_marker(
@@ -312,6 +353,39 @@ fn valid_component(component: &[u8]) -> bool {
         && component != b".."
         && !component.contains(&0)
         && !component.contains(&b'/')
+}
+
+fn open_absolute_directory(path: &Path) -> Result<File, ProjectError> {
+    if !path.is_absolute() {
+        return Err(ProjectError::RootEscape);
+    }
+    let mut directory = rustix::fs::open(
+        "/",
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|_| ProjectError::Unavailable)?;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        directory = rustix::fs::openat(
+            &directory,
+            name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|_| ProjectError::Symlink)?;
+    }
+    Ok(directory)
+}
+
+fn same_identity(left: &File, right: &File) -> Result<bool, ProjectError> {
+    let left = rustix::fs::fstat(left).map_err(|_| ProjectError::Unavailable)?;
+    let right = rustix::fs::fstat(right).map_err(|_| ProjectError::Unavailable)?;
+    Ok(left.st_dev == right.st_dev && left.st_ino == right.st_ino)
 }
 
 fn parse_gitdir_marker(contents: &[u8]) -> Result<&[u8], ProjectError> {

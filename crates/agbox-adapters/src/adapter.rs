@@ -58,6 +58,7 @@ pub struct DiscoveredSource {
     pub generation: u64,
     pub size: u64,
     pub mtime: OffsetDateTime,
+    pub ctime: OffsetDateTime,
     pub session_time: Option<OffsetDateTime>,
 }
 

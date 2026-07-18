@@ -104,7 +104,7 @@ fn discovery_yields_at_256_and_resumes_deterministically_without_opening_content
     let mut walker = DiscoveryWalker::new(Provider::Codex, root_spec(temp.path())).unwrap();
     let first = walker.next_batch(usize::MAX).unwrap();
     assert_eq!(first.visited_entries, DISCOVERY_ENTRIES_PER_YIELD);
-    assert_eq!(first.sources.len(), DISCOVERY_ENTRIES_PER_YIELD);
+    assert_eq!(first.sources.len(), DISCOVERY_ENTRIES_PER_YIELD - 2);
     assert!(first.cursor.is_some());
     let serialized_cursor = serde_json::to_vec(first.cursor.as_ref().unwrap()).unwrap();
     assert!(serialized_cursor.len() < 32 * 1024);
@@ -115,8 +115,8 @@ fn discovery_yields_at_256_and_resumes_deterministically_without_opening_content
     );
 
     let second = walker.next_batch(usize::MAX).unwrap();
-    assert_eq!(second.visited_entries, 44);
-    assert_eq!(second.sources.len(), 44);
+    assert_eq!(second.visited_entries, 46);
+    assert_eq!(second.sources.len(), 46);
     assert!(second.cursor.is_none());
 
     let first_names = first
@@ -150,7 +150,7 @@ fn discovery_yields_at_256_and_resumes_deterministically_without_opening_content
     assert_eq!(recovery.visited_entries, 256);
     assert!(recovery.cursor.is_some());
     let resumed_tail = resumed.next_batch(256).unwrap();
-    assert_eq!(resumed_tail.sources.len(), 44);
+    assert_eq!(resumed_tail.sources.len(), 46);
     assert!(resumed_tail.visited_entries <= 256);
 
     let mut restarted_recovery = DiscoveryWalker::from_cursor(
@@ -166,7 +166,7 @@ fn discovery_yields_at_256_and_resumes_deterministically_without_opening_content
     assert!(continued_recovery.sources.is_empty());
     assert_eq!(continued_recovery.visited_entries, 128);
     let restarted_tail = restarted_recovery.next_batch(256).unwrap();
-    assert_eq!(restarted_tail.sources.len(), 44);
+    assert_eq!(restarted_tail.sources.len(), 46);
 }
 
 #[test]
@@ -179,12 +179,70 @@ fn worst_case_256_long_entries_finish_with_a_bounded_cursor() {
     let mut walker = DiscoveryWalker::new(Provider::Codex, root_spec(temp.path())).unwrap();
     let batch = walker.next_batch(256).unwrap();
     assert_eq!(batch.visited_entries, 256);
-    assert_eq!(batch.sources.len(), 256);
+    assert_eq!(batch.sources.len(), 254);
     assert!(batch.cursor.is_some());
     assert!(batch.faults.is_empty());
     let terminal = walker.next_batch(256).unwrap();
-    assert_eq!(terminal.visited_entries, 0);
+    assert_eq!(terminal.visited_entries, 2);
+    assert_eq!(terminal.sources.len(), 2);
     assert!(terminal.cursor.is_none());
+}
+
+#[test]
+fn wide_long_child_directories_make_progress_without_a_cursor_overflow() {
+    let temp = tempfile::tempdir().unwrap();
+    for index in 0..256 {
+        let child = temp.path().join(format!("{index:03}-{}", "d".repeat(180)));
+        fs::create_dir(&child).unwrap();
+        fs::write(child.join("source.jsonl"), b"record").unwrap();
+    }
+    let mut walker = DiscoveryWalker::new(Provider::Codex, root_spec(temp.path())).unwrap();
+    let mut found = 0;
+    for _ in 0..1024 {
+        let batch = walker.next_batch(256).unwrap();
+        found += batch.sources.len();
+        if batch.cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(found, 256);
+}
+
+#[test]
+fn cursor_debug_redacts_reversible_components() {
+    let temp = tempfile::tempdir().unwrap();
+    let secret = "SECRET_CURSOR_COMPONENT";
+    fs::create_dir(temp.path().join(secret)).unwrap();
+    let mut walker = DiscoveryWalker::new(Provider::Codex, root_spec(temp.path())).unwrap();
+    let cursor = walker.next_batch(3).unwrap().cursor.unwrap();
+    assert!(!format!("{cursor:?}").contains(secret));
+}
+
+#[test]
+fn persistent_deleted_directory_is_quarantined_without_blocking_later_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let bad = temp.path().join("bad");
+    let good = temp.path().join("good");
+    fs::create_dir(&bad).unwrap();
+    fs::create_dir(&good).unwrap();
+    fs::write(good.join("source.jsonl"), b"record").unwrap();
+    let mut walker = DiscoveryWalker::new(Provider::Codex, root_spec(temp.path())).unwrap();
+    let first = walker.next_batch(256).unwrap();
+    fs::remove_dir_all(&bad).unwrap();
+
+    let mut sources = first.sources;
+    for _ in 0..16 {
+        let batch = walker.next_batch(256).unwrap();
+        sources.extend(batch.sources);
+        if batch.cursor.is_none() {
+            break;
+        }
+    }
+    assert!(
+        sources
+            .iter()
+            .any(|source| source.path.ends_with("good/source.jsonl"))
+    );
 }
 
 #[test]
@@ -259,7 +317,7 @@ fn discovery_isolates_metadata_disappearance_without_exposing_names() {
     fs::write(temp.path().join("a.jsonl"), b"a").unwrap();
     fs::write(temp.path().join("z_SECRET_ATTACKER_NAME.jsonl"), b"b").unwrap();
     let mut walker = DiscoveryWalker::new(Provider::Codex, root_spec(temp.path())).unwrap();
-    let first = walker.next_batch(1).unwrap();
+    let first = walker.next_batch(3).unwrap();
     assert_eq!(first.sources.len(), 1);
     let remaining = if first.sources[0].path.ends_with("a.jsonl") {
         "z_SECRET_ATTACKER_NAME.jsonl"
@@ -308,6 +366,30 @@ fn verified_open_rejects_symlink_components_and_replacement_races() {
         opener.open(source).unwrap_err(),
         VerifiedOpenError::IdentityChanged
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn verified_open_rejects_an_intermediate_directory_renamed_out_of_its_bound_root() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let nested = root.path().join("nested");
+    fs::create_dir(&nested).unwrap();
+    fs::write(nested.join("source.jsonl"), b"record").unwrap();
+    let opener = VerifiedSourceOpener::new(root.path()).unwrap();
+    let mut walker = DiscoveryWalker::new(Provider::Codex, root_spec(root.path())).unwrap();
+    let source = walker
+        .next_batch(256)
+        .unwrap()
+        .sources
+        .into_iter()
+        .next()
+        .unwrap();
+    fs::rename(&nested, outside.path().join("nested")).unwrap();
+    assert!(matches!(
+        opener.open(&source),
+        Err(VerifiedOpenError::IdentityChanged)
+    ));
 }
 
 #[test]
@@ -374,6 +456,18 @@ fn project_resolution_rejects_a_component_swapped_to_a_symlink_after_binding() {
 
     fs::rename(&repository, allowed.path().join("old-repo")).unwrap();
     std::os::unix::fs::symlink(outside.path(), &repository).unwrap();
+    assert!(resolver.resolve(repository.join("nested")).is_err());
+}
+
+#[test]
+fn project_resolution_rejects_repository_renamed_outside_the_bound_root() {
+    let allowed = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let repository = allowed.path().join("repo");
+    fs::create_dir_all(repository.join("nested")).unwrap();
+    fs::create_dir(repository.join(".git")).unwrap();
+    let resolver = ProjectResolver::new(allowed.path()).unwrap();
+    fs::rename(&repository, outside.path().join("repo")).unwrap();
     assert!(resolver.resolve(repository.join("nested")).is_err());
 }
 

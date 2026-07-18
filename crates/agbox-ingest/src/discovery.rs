@@ -18,15 +18,16 @@ use crate::identity::unix_identity;
 pub const DISCOVERY_ENTRIES_PER_YIELD: usize = 256;
 pub const MAX_DISCOVERY_CURSOR_BYTES: usize = 32 * 1024;
 const MAX_DISCOVERY_FAULTS: usize = 32;
+const MAX_DIRECTORY_RETRIES: u8 = 3;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct DiscoveryCursor {
     root_device: u64,
     root_inode: u64,
     pending_directories: VecDeque<DirectoryCursor>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 struct DirectoryCursor {
     components: Vec<Vec<u8>>,
     entries_consumed: u64,
@@ -36,6 +37,16 @@ struct DirectoryCursor {
     mtime_nanoseconds: i64,
     ctime_seconds: i64,
     ctime_nanoseconds: i64,
+    retry_attempts: u8,
+}
+
+impl fmt::Debug for DiscoveryCursor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiscoveryCursor")
+            .field("pending_directories", &self.pending_directories.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -157,6 +168,7 @@ impl DiscoveryWalker {
             mtime_nanoseconds: stat.st_mtime_nsec,
             ctime_seconds: stat.st_ctime,
             ctime_nanoseconds: stat.st_ctime_nsec,
+            retry_attempts: 0,
         };
         let cursor = DiscoveryCursor {
             root_device,
@@ -212,11 +224,13 @@ impl DiscoveryWalker {
         let mut sources = Vec::new();
         let mut faults = Vec::new();
         let mut visited_entries = 0;
+        let mut operations = 0;
 
-        while visited_entries < hard_limit {
-            let Some(directory_cursor) = self.cursor.pending_directories.pop_front() else {
+        while visited_entries < hard_limit && operations < hard_limit {
+            let Some(mut directory_cursor) = self.cursor.pending_directories.pop_front() else {
                 break;
             };
+            operations += 1;
             if self
                 .active
                 .as_ref()
@@ -226,8 +240,9 @@ impl DiscoveryWalker {
                     Ok(directory) => directory,
                     Err(OpenDirectoryError::Unavailable) => {
                         bounded_fault(&mut faults, DiscoveryFaultClass::DirectoryUnavailable);
-                        self.cursor.pending_directories.push_front(directory_cursor);
-                        break;
+                        retry_or_quarantine(&mut self.cursor, &mut directory_cursor);
+                        self.active = None;
+                        continue;
                     }
                     Err(OpenDirectoryError::InvalidCursor) => {
                         return Err(DiscoveryError::InvalidCursor);
@@ -235,8 +250,9 @@ impl DiscoveryWalker {
                 };
                 let Ok(iterator) = Dir::read_from(&directory) else {
                     bounded_fault(&mut faults, DiscoveryFaultClass::DirectoryUnavailable);
-                    self.cursor.pending_directories.push_front(directory_cursor);
-                    break;
+                    retry_or_quarantine(&mut self.cursor, &mut directory_cursor);
+                    self.active = None;
+                    continue;
                 };
                 self.active = Some(ActiveDirectory {
                     recovery_remaining: directory_cursor.entries_consumed,
@@ -245,7 +261,7 @@ impl DiscoveryWalker {
                     iterator,
                 });
             }
-            let page_start = directory_cursor.clone();
+            let mut page_start = directory_cursor.clone();
             let page = {
                 let Some(active) = self.active.as_mut() else {
                     bounded_fault(&mut faults, DiscoveryFaultClass::DirectoryUnavailable);
@@ -259,11 +275,9 @@ impl DiscoveryWalker {
                 return Err(DiscoveryError::InvalidCursor);
             }
             if page.fault {
-                let mut rollback = self.cursor.clone();
-                rollback.pending_directories.push_front(page_start);
-                self.cursor = rollback;
+                retry_or_quarantine(&mut self.cursor, &mut page_start);
                 self.active = None;
-                break;
+                continue;
             }
 
             let mut next_cursor = self.cursor.clone();
@@ -275,7 +289,7 @@ impl DiscoveryWalker {
                 next_cursor.pending_directories.push_front(active_cursor);
             }
 
-            let mut child_directories = Vec::new();
+            let mut child_directory = None;
             let mut page_sources = Vec::new();
             for entry in page.entries {
                 let relative = join_components(&directory_cursor.components, &entry.name);
@@ -285,7 +299,7 @@ impl DiscoveryWalker {
                 let file_type = FileType::from_raw_mode(entry.stat.st_mode);
                 if file_type.is_dir() && self.spec.recursive {
                     let (device, inode) = stat_identity(&entry.stat)?;
-                    child_directories.push(DirectoryCursor {
+                    child_directory = Some(DirectoryCursor {
                         components: relative,
                         entries_consumed: 0,
                         device,
@@ -294,6 +308,7 @@ impl DiscoveryWalker {
                         mtime_nanoseconds: entry.stat.st_mtime_nsec,
                         ctime_seconds: entry.stat.st_ctime,
                         ctime_nanoseconds: entry.stat.st_ctime_nsec,
+                        retry_attempts: 0,
                     });
                     continue;
                 }
@@ -307,6 +322,7 @@ impl DiscoveryWalker {
                 let (device, inode) = stat_identity(&entry.stat)?;
                 let file_identity = unix_identity(device, inode);
                 let mtime = stat_time(&entry.stat).ok_or(DiscoveryError::RootUnavailable)?;
+                let ctime = stat_ctime(&entry.stat).ok_or(DiscoveryError::RootUnavailable)?;
                 let size = u64::try_from(entry.stat.st_size)
                     .map_err(|_| DiscoveryError::RootUnavailable)?;
                 let session_time =
@@ -327,12 +343,13 @@ impl DiscoveryWalker {
                     generation: 1,
                     size,
                     mtime,
+                    ctime,
                     session_time,
                 });
             }
 
-            for child in child_directories {
-                next_cursor.pending_directories.push_back(child);
+            if let Some(child) = child_directory {
+                next_cursor.pending_directories.push_front(child);
             }
             if ensure_cursor_size(&next_cursor).is_err() {
                 let mut rollback = self.cursor.clone();
@@ -430,16 +447,12 @@ fn read_page(
             invalid_cursor = active.recovery_remaining != 0;
             break;
         };
+        reads += 1;
         let Ok(entry) = result else {
             bounded_fault(faults, DiscoveryFaultClass::DirectoryUnavailable);
             fault = true;
             break;
         };
-        let name = entry.file_name().to_bytes().to_vec();
-        if matches!(name.as_slice(), b"." | b"..") {
-            continue;
-        }
-        reads += 1;
         if active.recovery_remaining > 0 {
             active.recovery_remaining -= 1;
             continue;
@@ -450,6 +463,10 @@ fn read_page(
             break;
         };
         active.cursor.entries_consumed = consumed;
+        let name = entry.file_name().to_bytes().to_vec();
+        if matches!(name.as_slice(), b"." | b"..") {
+            continue;
+        }
         let Ok(stat) = rustix::fs::statat(
             &active.directory,
             OsStr::from_bytes(&name),
@@ -458,7 +475,11 @@ fn read_page(
             bounded_fault(faults, DiscoveryFaultClass::MetadataUnavailable);
             continue;
         };
+        let is_directory = FileType::from_raw_mode(stat.st_mode).is_dir();
         entries.push(PageEntry { name, stat });
+        if is_directory {
+            break;
+        }
     }
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     DirectoryPage {
@@ -477,6 +498,7 @@ fn validate_cursor(cursor: &DiscoveryCursor) -> Result<(), DiscoveryError> {
             .components
             .iter()
             .all(|component| valid_component(component))
+            && directory.retry_attempts <= MAX_DIRECTORY_RETRIES
     }) {
         Ok(())
     } else {
@@ -545,6 +567,13 @@ fn bounded_fault(faults: &mut Vec<DiscoveryFault>, class: DiscoveryFaultClass) {
     }
 }
 
+fn retry_or_quarantine(cursor: &mut DiscoveryCursor, directory: &mut DirectoryCursor) {
+    directory.retry_attempts = directory.retry_attempts.saturating_add(1);
+    if directory.retry_attempts <= MAX_DIRECTORY_RETRIES {
+        cursor.pending_directories.push_back(directory.clone());
+    }
+}
+
 fn stat_identity(stat: &rustix::fs::Stat) -> Result<(u64, u64), DiscoveryError> {
     let device = u64::try_from(stat.st_dev).map_err(|_| DiscoveryError::RootUnavailable)?;
     Ok((device, stat.st_ino))
@@ -554,6 +583,13 @@ fn stat_time(stat: &rustix::fs::Stat) -> Option<OffsetDateTime> {
     i128::from(stat.st_mtime)
         .checked_mul(1_000_000_000)
         .and_then(|value| value.checked_add(i128::from(stat.st_mtime_nsec)))
+        .and_then(|value| OffsetDateTime::from_unix_timestamp_nanos(value).ok())
+}
+
+fn stat_ctime(stat: &rustix::fs::Stat) -> Option<OffsetDateTime> {
+    i128::from(stat.st_ctime)
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(i128::from(stat.st_ctime_nsec)))
         .and_then(|value| OffsetDateTime::from_unix_timestamp_nanos(value).ok())
 }
 
@@ -597,6 +633,7 @@ mod tests {
                 mtime_nanoseconds: 6,
                 ctime_seconds: 7,
                 ctime_nanoseconds: 8,
+                retry_attempts: 0,
             }]),
         };
         let encoded = serde_json::to_vec(&cursor).unwrap();

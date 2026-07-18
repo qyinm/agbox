@@ -141,6 +141,42 @@ fn migrates_v1_generation_identities_before_opening_writer() {
 }
 
 #[test]
+fn rejects_ambiguous_multi_generation_v1_without_mutating_history() {
+    let home = tempfile::tempdir().unwrap();
+    set_mode(home.path(), 0o700);
+    let database = home.path().join("state.db");
+    let store = Store::open_new(&database).unwrap();
+    drop(store);
+
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO projects(project_id, repository_identity, encrypted_root_path, created_at, updated_at)
+                 VALUES ('project', 'repo-fs-v1:1:1', X'00', 'now', 'now');
+             INSERT INTO sources(source_id, project_id, provider, root_class, encrypted_path, file_identity, created_at, updated_at)
+                 VALUES ('source_11111111111111111111111111111111', 'project', 'codex', 'active', X'00', 'unix:1:1', 'now', 'now');
+             INSERT INTO source_generations(source_id, generation, size_bytes, mtime, session_time, schema_fingerprint, status)
+                 VALUES ('source_11111111111111111111111111111111', 1, 1, 'now', NULL, NULL, 'active'),
+                        ('source_11111111111111111111111111111111', 2, 2, 'now', NULL, NULL, 'active');
+             INSERT INTO source_cursors(source_id, generation, cursor_offset, parser_state, last_commit_digest, updated_at)
+                 VALUES ('source_11111111111111111111111111111111', 1, 0, X'', '0000000000000000000000000000000000000000000000000000000000000000', 'now'),
+                        ('source_11111111111111111111111111111111', 2, 0, X'', '0000000000000000000000000000000000000000000000000000000000000000', 'now');
+             DROP TABLE source_generation_identities;
+             DELETE FROM schema_migrations WHERE version = 2;
+             PRAGMA user_version = 1;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+    drop(connection);
+    let bytes_before = fs::read(&database).unwrap();
+
+    let error = Store::open_new(&database).unwrap_err();
+    assert!(matches!(error, StoreError::IncompatibleSchema));
+    assert_eq!(fs::read(&database).unwrap(), bytes_before);
+    assert_eq!(read_user_version(&database), 1);
+}
+
+#[test]
 fn rejects_the_reserved_legacy_database_without_changing_it() {
     let home = tempfile::tempdir().unwrap();
     let legacy = home.path().join("agbox.db");

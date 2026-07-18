@@ -130,6 +130,9 @@ pub(crate) fn open_writer(path: &Path) -> Result<OpenedWriter, StoreError> {
         validate_v2_schema(&connection)?;
     } else if version == 1 {
         let transaction = connection.transaction()?;
+        if v1_has_ambiguous_generation_history(&transaction)? {
+            return Err(StoreError::IncompatibleSchema);
+        }
         transaction.execute_batch(MIGRATION_2)?;
         transaction.pragma_update(None, "user_version", 2)?;
         transaction.execute(
@@ -150,6 +153,18 @@ pub(crate) fn open_writer(path: &Path) -> Result<OpenedWriter, StoreError> {
         connection,
         directory,
     })
+}
+
+fn v1_has_ambiguous_generation_history(connection: &Connection) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM source_generations
+             GROUP BY source_id
+             HAVING count(*) > 1
+         )",
+        [],
+        |row| row.get(0),
+    )
 }
 
 fn validate_existing_database(path: &Path) -> Result<i64, StoreError> {
