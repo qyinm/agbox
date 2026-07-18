@@ -258,7 +258,7 @@ impl ProvisionalContractBuilder {
         })?;
         let created_at = facts
             .iter()
-            .filter_map(ReducedFact::observed_at)
+            .map(ReducedFact::observed_at)
             .max()
             .or_else(|| previous.map(|contract| contract.created_at))
             .unwrap_or(OffsetDateTime::UNIX_EPOCH);
@@ -1042,7 +1042,7 @@ impl ReducedFact {
         }
     }
 
-    fn observed_at(&self) -> Option<OffsetDateTime> {
+    fn observed_at(&self) -> OffsetDateTime {
         match self {
             Self::AgentRunStarted { observed_at, .. }
             | Self::AgentRunFinished { observed_at, .. }
@@ -1053,8 +1053,8 @@ impl ReducedFact {
             | Self::Verification { observed_at, .. }
             | Self::HumanObjective { observed_at, .. }
             | Self::HumanConstraint { observed_at, .. }
-            | Self::AgentStatement { observed_at, .. } => Some(*observed_at),
-            Self::ActionRequested { .. } => None,
+            | Self::AgentStatement { observed_at, .. }
+            | Self::ActionRequested { observed_at, .. } => *observed_at,
         }
     }
 }

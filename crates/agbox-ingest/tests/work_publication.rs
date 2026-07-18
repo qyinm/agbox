@@ -11,7 +11,7 @@ use agbox_workgraph::{
     ReducedFact, WorkCandidate,
 };
 use rusqlite::{Connection, params};
-use time::macros::datetime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339, macros::datetime};
 
 fn work_id(value: &str) -> WorkId {
     WorkId::parse_wire(value).unwrap()
@@ -134,6 +134,71 @@ async fn provisional_revision_fts_and_visibility_commit_atomically_and_replay_ex
         )
         .unwrap();
     assert_eq!(hit, 1);
+}
+
+#[tokio::test]
+async fn request_only_publication_preserves_observation_time_for_recency() {
+    let fixture = FixtureRuntime::codex_records(1).await;
+    fixture.drain().await.unwrap();
+    let event = &fixture
+        .read_store()
+        .events_after(0, 1, 1024 * 1024)
+        .await
+        .unwrap()[0];
+    let observed_at = event.event.observed_at();
+    let mutation = GraphMutation {
+        facts: vec![ReducedFact::ActionRequested {
+            project_id: event.event.project_id().clone(),
+            session_id: event.event.session_id().clone(),
+            native_action_id: "request-only".into(),
+            tool_name: "shell".into(),
+            input_hash: "b3:request-only".into(),
+            redacted_input: Some("cargo test".into()),
+            observed_at,
+            evidence: event.event.event_id().clone(),
+        }],
+        expected_event_seq: 0,
+        through_event_seq: Some(event.event_seq),
+        through_event_id: Some(event.event.event_id().clone()),
+    };
+    fixture
+        .writer()
+        .apply_graph(graph_write_batch(mutation.clone()).unwrap())
+        .await
+        .unwrap();
+    let coordinator =
+        IngestionCoordinator::new(fixture.read_store().clone(), fixture.writer().clone(), 1);
+    let report = coordinator
+        .publish_work(mutation, WorkPublicationRequest::new(Provider::Codex))
+        .await
+        .unwrap();
+
+    let connection = Connection::open(fixture.database_path()).unwrap();
+    let updated_at: String = connection
+        .query_row(
+            "SELECT updated_at FROM work_items WHERE work_id = ?1",
+            [report.work_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let persisted = OffsetDateTime::parse(&updated_at, &Rfc3339).unwrap();
+    assert_eq!(persisted, observed_at);
+
+    let candidates = fixture
+        .writer()
+        .load_work_candidates(WorkCandidateQuery {
+            project_id: event.event.project_id().clone(),
+            explicit_work_id: None,
+            continuation_work_id: None,
+            artifact_hashes: Vec::new(),
+            command_hashes: vec!["b3:request-only".into()],
+            observed_at: observed_at + time::Duration::minutes(2),
+        })
+        .await
+        .unwrap();
+    assert_eq!(candidates.candidates.len(), 1);
+    assert_eq!(candidates.candidates[0].work_id, report.work_id);
+    assert_eq!(candidates.candidates[0].minutes_since_activity, 2);
 }
 
 #[tokio::test]

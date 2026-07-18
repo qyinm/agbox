@@ -87,6 +87,7 @@ fn action_request(action_id: &str, input: &str, evidence: &str) -> ReducedFact {
         tool_name: "shell".into(),
         input_hash: format!("hash-{evidence}"),
         redacted_input: Some(input.into()),
+        observed_at: datetime!(2026-07-17 12:00 UTC),
         evidence: event_id(evidence),
     }
 }
@@ -122,6 +123,7 @@ fn hash_only_action_request(evidence: &str) -> ReducedFact {
         tool_name: "shell".into(),
         input_hash: format!("hash-{evidence}"),
         redacted_input: None,
+        observed_at: datetime!(2026-07-17 12:00 UTC),
         evidence: event_id(evidence),
     }
 }

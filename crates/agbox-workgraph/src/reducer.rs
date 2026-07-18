@@ -59,6 +59,7 @@ pub enum ReducedFact {
         tool_name: String,
         input_hash: String,
         redacted_input: Option<String>,
+        observed_at: OffsetDateTime,
         evidence: EventId,
     },
     ActionFinishedObserved {
@@ -260,6 +261,7 @@ impl DeterministicReducer {
                         tool_name: tool_name.clone(),
                         input_hash: input.hash().to_owned(),
                         redacted_input: nonempty(input.redacted_excerpt()),
+                        observed_at,
                         evidence,
                     });
                 }

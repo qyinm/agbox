@@ -45,6 +45,7 @@ async fn graph_translation_and_writer_retry_are_exact_once() {
                 tool_name: "shell".into(),
                 input_hash: "b3:command".into(),
                 redacted_input: Some("cargo test".into()),
+                observed_at: event.observed_at(),
                 evidence: evidence.clone(),
             },
             ReducedFact::Verification {
@@ -103,6 +104,7 @@ async fn observed_finish_on_same_page_never_creates_verification() {
                 tool_name: "shell".into(),
                 input_hash: "b3:same-page".into(),
                 redacted_input: Some("cargo check".into()),
+                observed_at: committed.event.observed_at(),
                 evidence: committed.event.event_id().clone(),
             },
             ReducedFact::ActionFinishedObserved {
@@ -148,6 +150,7 @@ async fn observed_finish_across_pages_never_creates_verification_and_stale_water
             tool_name: "shell".into(),
             input_hash: "b3:cross".into(),
             redacted_input: Some("cargo check".into()),
+            observed_at: first.event.observed_at(),
             evidence: first.event.event_id().clone(),
         }],
         expected_event_seq: 0,

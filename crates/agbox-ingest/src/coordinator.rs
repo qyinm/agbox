@@ -313,6 +313,7 @@ pub fn graph_write_batch(mutation: GraphMutation) -> Result<GraphWriteBatch, Ing
                 tool_name,
                 input_hash,
                 redacted_input,
+                observed_at: _,
                 evidence,
             } => batch.actions.push(GraphActionRow {
                 project_id,
@@ -488,8 +489,8 @@ fn fact_observed_at(fact: &ReducedFact) -> OffsetDateTime {
         | ReducedFact::Verification { observed_at, .. }
         | ReducedFact::HumanObjective { observed_at, .. }
         | ReducedFact::HumanConstraint { observed_at, .. }
-        | ReducedFact::AgentStatement { observed_at, .. } => *observed_at,
-        ReducedFact::ActionRequested { .. } => OffsetDateTime::UNIX_EPOCH,
+        | ReducedFact::AgentStatement { observed_at, .. }
+        | ReducedFact::ActionRequested { observed_at, .. } => *observed_at,
     }
 }
 

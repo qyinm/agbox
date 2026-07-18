@@ -58,6 +58,7 @@ pub mod test_support {
                 tool_name: "shell".into(),
                 input_hash: "b3:test".into(),
                 redacted_input: Some("cargo test parser".into()),
+                observed_at: datetime!(2026-07-17 12:00 UTC),
                 evidence: event_id("evt-next-action"),
             },
             ReducedFact::AgentStatement {
