@@ -320,10 +320,21 @@ impl KeyedQueue {
         processed_offset: u64,
         force_requeue: bool,
     ) -> bool {
+        self.finish_lease_after_progress(key, processed_offset, force_requeue, true)
+    }
+
+    /// Completes a lease while distinguishing durable progress from idle work.
+    pub(crate) fn finish_lease_after_progress(
+        &mut self,
+        key: &SourceKey,
+        processed_offset: u64,
+        force_requeue: bool,
+        allow_target_gap: bool,
+    ) -> bool {
         let Some(item) = self.in_flight.remove(key) else {
             return false;
         };
-        if force_requeue || processed_offset < item.target_offset {
+        if force_requeue || (allow_target_gap && processed_offset < item.target_offset) {
             self.push_pending(item);
             true
         } else {

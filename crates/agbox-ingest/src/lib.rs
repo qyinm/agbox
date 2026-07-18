@@ -113,6 +113,20 @@ pub mod test_support {
             I: IntoIterator<Item = S>,
             S: AsRef<str>,
         {
+            let mut bytes = Vec::new();
+            for record in records {
+                bytes.extend_from_slice(record.as_ref().as_bytes());
+                bytes.push(b'\n');
+            }
+            Self::try_source_bytes_with_retry(bytes, queue_capacity, retry_policy, clock).await
+        }
+
+        pub async fn try_source_bytes_with_retry(
+            bytes: Vec<u8>,
+            queue_capacity: usize,
+            retry_policy: RetryPolicy,
+            clock: Arc<dyn RetryClock>,
+        ) -> Result<Self, IngestError> {
             let directory = tempfile::tempdir().map_err(IngestError::Io)?;
             #[cfg(unix)]
             std::fs::set_permissions(
@@ -121,11 +135,6 @@ pub mod test_support {
             )
             .map_err(IngestError::Io)?;
             let source_path = directory.path().join("source.jsonl");
-            let mut bytes = Vec::new();
-            for record in records {
-                bytes.extend_from_slice(record.as_ref().as_bytes());
-                bytes.push(b'\n');
-            }
             std::fs::write(&source_path, &bytes).map_err(IngestError::Io)?;
             let root = directory.path().canonicalize().map_err(IngestError::Io)?;
             let source_path = source_path.canonicalize().map_err(IngestError::Io)?;
@@ -306,6 +315,11 @@ pub mod test_support {
             IngestionRuntime::new(Arc::clone(&self.coordinator))
                 .run(receiver)
                 .await
+        }
+
+        #[must_use]
+        pub fn production_runtime(&self) -> IngestionRuntime {
+            IngestionRuntime::new(Arc::clone(&self.coordinator))
         }
     }
 

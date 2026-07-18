@@ -170,6 +170,36 @@ async fn one_malformed_record_is_quarantined_without_losing_neighbors() {
 }
 
 #[tokio::test]
+async fn unterminated_tail_is_idle_without_cursor_advance_or_hot_requeue() {
+    let tail = br#"{"type":"event_msg","payload":{"type":"user_message","message":"tail"}}"#;
+    let runtime = FixtureRuntime::try_source_bytes_with_retry(
+        tail.to_vec(),
+        1,
+        RetryPolicy::default(),
+        Arc::new(ScriptClock::new([], false)),
+    )
+    .await
+    .unwrap();
+    let (input, receiver) = tokio::sync::mpsc::channel(1);
+    drop(input);
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.production_runtime().run(receiver),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(runtime.read().cursor_offset().await.unwrap(), 0);
+    assert_eq!(runtime.read().event_count().await.unwrap(), 0);
+    assert!(matches!(
+        runtime.process_one().await,
+        Err(IngestError::NoProgress)
+    ));
+}
+
+#[tokio::test]
 async fn first_oversized_complete_record_commits_one_fault_then_neighbor() {
     let changes = (0..=agbox_adapters::MAX_EVENTS_PER_RECORD)
         .map(|index| format!(r#"{{"path":"src/{index}.rs","kind":"update"}}"#))
@@ -335,6 +365,55 @@ async fn cancellation_after_submission_requeues_committed_remainder() {
     let remainder = runtime.process_one().await.unwrap();
     assert_eq!(remainder.committed_records, 250);
     assert_eq!(runtime.read().event_count().await.unwrap(), 1_250);
+}
+
+#[tokio::test]
+async fn explicit_shutdown_drains_multichunk_work_and_joins_workers() {
+    let clock = Arc::new(ScriptClock::new([], true));
+    let runtime = FixtureRuntime::try_records_with_retry(
+        (0..1_250).map(|index| {
+            format!(
+                r#"{{"type":"event_msg","ordinal":{},"payload":{{"type":"user_message","message":"message-{}"}}}}"#,
+                index + 1,
+                index + 1
+            )
+        }),
+        1,
+        RetryPolicy::default(),
+        clock.clone(),
+    )
+    .await
+    .unwrap();
+    let (input, receiver) = tokio::sync::mpsc::channel(1);
+    let (shutdown, receive_shutdown) = tokio::sync::watch::channel(false);
+
+    let run = runtime
+        .production_runtime()
+        .run_until(receiver, receive_shutdown);
+    let signal = async {
+        clock.wait_submitted().await;
+        shutdown.send(true).unwrap();
+        clock.release_submission();
+    };
+    let (result, ()) =
+        tokio::time::timeout(Duration::from_mins(1), async { tokio::join!(run, signal) })
+            .await
+            .unwrap();
+    result.unwrap();
+
+    assert!(
+        input.is_closed(),
+        "runtime must have returned and dropped input"
+    );
+    assert_eq!(runtime.read().event_count().await.unwrap(), 1_250);
+    assert_eq!(
+        runtime.read().cursor_offset().await.unwrap(),
+        runtime.source_size()
+    );
+    assert!(matches!(
+        runtime.process_one().await,
+        Err(IngestError::NoProgress)
+    ));
 }
 
 #[tokio::test]

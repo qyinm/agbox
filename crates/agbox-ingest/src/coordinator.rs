@@ -220,12 +220,22 @@ impl WorkLease {
         &self.item
     }
 
-    fn finish(mut self, processed_offset: u64, force_requeue: bool) -> Result<bool, IngestError> {
+    fn finish(
+        mut self,
+        processed_offset: u64,
+        force_requeue: bool,
+        allow_target_gap: bool,
+    ) -> Result<bool, IngestError> {
         let requeued = self
             .queue
             .lock()
             .map_err(|_| IngestError::StateUnavailable)?
-            .finish_lease(&self.item.key, processed_offset, force_requeue);
+            .finish_lease_after_progress(
+                &self.item.key,
+                processed_offset,
+                force_requeue,
+                allow_target_gap,
+            );
         self.active = false;
         self.notify.notify_waiters();
         Ok(requeued)
@@ -398,8 +408,11 @@ impl IngestionCoordinator {
             match attempt_result {
                 Ok(attempt) => {
                     self.set_health(&item.key, SourceHealth::Healthy)?;
-                    let requeued =
-                        lease.finish(attempt.cursor_offset, attempt.needs_continuation)?;
+                    let requeued = lease.finish(
+                        attempt.cursor_offset,
+                        attempt.needs_continuation,
+                        attempt.committed_records != 0,
+                    )?;
                     return Ok(ProcessReport {
                         key: item.key,
                         committed_records: attempt.committed_records,
@@ -446,6 +459,9 @@ impl IngestionCoordinator {
     }
 
     async fn process_attempt(&self, item: &QueueItem) -> Result<AttemptReport, IngestError> {
+        // Reload both the registered source facts and durable cursor on every
+        // retry. A caller may atomically re-register refreshed facts for this
+        // key while the injected backoff is pending.
         let source = self
             .sources
             .read()
@@ -1210,7 +1226,30 @@ impl IngestionRuntime {
     /// have been joined.
     pub async fn run(
         self,
+        input: tokio::sync::mpsc::Receiver<QueueItem>,
+    ) -> Result<(), IngestError> {
+        let (shutdown, receive_shutdown) = tokio::sync::watch::channel(false);
+        let result = self.run_until(input, receive_shutdown).await;
+        drop(shutdown);
+        result
+    }
+
+    /// Runs exactly four workers until input closes or explicit shutdown is signaled.
+    ///
+    /// A `true` shutdown value stops accepting new input. Work already in the
+    /// shared keyed queue, including durable partial-commit continuations, is
+    /// drained before all four worker tasks are joined and this method returns.
+    /// Blocking decode jobs are awaited; shutdown never aborts a worker or
+    /// detaches a `spawn_blocking` continuation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first worker or coordinator failure after all worker tasks
+    /// have been joined.
+    pub async fn run_until(
+        self,
         mut input: tokio::sync::mpsc::Receiver<QueueItem>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), IngestError> {
         let closed = Arc::new(AtomicBool::new(false));
         let mut workers = tokio::task::JoinSet::new();
@@ -1241,7 +1280,24 @@ impl IngestionRuntime {
             });
         }
 
-        while let Some(item) = input.recv().await {
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+            let item = tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    match changed {
+                        Ok(()) if *shutdown.borrow() => None,
+                        Ok(()) => continue,
+                        Err(_) => None,
+                    }
+                }
+                item = input.recv() => item,
+            };
+            let Some(item) = item else {
+                break;
+            };
             loop {
                 let notified = self.coordinator.notify.notified();
                 tokio::pin!(notified);
@@ -1264,10 +1320,18 @@ impl IngestionRuntime {
         }
         closed.store(true, Ordering::Release);
         self.coordinator.notify.notify_waiters();
+        let mut worker_error = None;
         while let Some(result) = workers.join_next().await {
-            result.map_err(|_| IngestError::WorkerStopped)??;
+            let error = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(_) => Some(IngestError::WorkerStopped),
+            };
+            if worker_error.is_none() {
+                worker_error = error;
+            }
         }
-        Ok(())
+        worker_error.map_or(Ok(()), Err)
     }
 }
 
