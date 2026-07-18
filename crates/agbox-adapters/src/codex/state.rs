@@ -12,6 +12,7 @@ use crate::{DecodeError, DecoderState, MAX_DECODER_STATE_BYTES};
 
 const MAX_CALLS: usize = 128;
 const MAX_COMPLETED_KEYS: usize = 128;
+const MAX_AGENT_LIFECYCLES: usize = 128;
 const MAX_CALL_ID_BYTES: usize = 48;
 const MAX_EVENT_ID_BYTES: usize = 128;
 const MAX_COMPACT_HASH_BYTES: usize = 43;
@@ -36,6 +37,7 @@ pub(super) struct CodexStateV1 {
     unresolved_calls: VecDeque<CallLink>,
     pending_results: VecDeque<PendingResult>,
     completed_semantic_keys: VecDeque<RankedKey>,
+    agent_lifecycle: VecDeque<AgentLifecycle>,
     last_ordinal: Option<u64>,
     continuation: Option<Continuation>,
 }
@@ -48,6 +50,7 @@ impl fmt::Debug for CodexStateV1 {
             .field("unresolved_call_count", &self.unresolved_calls.len())
             .field("pending_result_count", &self.pending_results.len())
             .field("completed_key_count", &self.completed_semantic_keys.len())
+            .field("agent_lifecycle_count", &self.agent_lifecycle.len())
             .field("has_last_ordinal", &self.last_ordinal.is_some())
             .field("has_continuation", &self.continuation.is_some())
             .finish()
@@ -110,6 +113,9 @@ impl fmt::Debug for CallLink {
 
 #[derive(Clone, Deserialize, Serialize)]
 struct RankedKey(String, u8);
+
+#[derive(Clone, Deserialize, Serialize)]
+struct AgentLifecycle(String, Option<PendingOutcome>);
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Continuation(
@@ -276,6 +282,70 @@ impl CodexStateV1 {
         Ok(true)
     }
 
+    pub fn observe_agent(&mut self, agent_id: &str) -> Result<bool, DecodeError> {
+        if !opaque_graph_identifier(agent_id) {
+            return Err(DecodeError::Malformed("invalid-codex-agent-id".to_owned()));
+        }
+        if self
+            .agent_lifecycle
+            .iter()
+            .any(|candidate| candidate.0 == agent_id)
+        {
+            return Ok(false);
+        }
+        self.agent_lifecycle
+            .push_back(AgentLifecycle(agent_id.to_owned(), None));
+        while self.agent_lifecycle.len() > MAX_AGENT_LIFECYCLES {
+            let _ = self.agent_lifecycle.pop_front();
+        }
+        self.fit_serialized_bound()?;
+        Ok(self
+            .agent_lifecycle
+            .iter()
+            .any(|candidate| candidate.0 == agent_id))
+    }
+
+    pub fn finish_agent(
+        &mut self,
+        agent_id: &str,
+        outcome: ActionOutcome,
+    ) -> Result<bool, DecodeError> {
+        if !opaque_graph_identifier(agent_id) {
+            return Err(DecodeError::Malformed("invalid-codex-agent-id".to_owned()));
+        }
+        let Some(candidate) = self
+            .agent_lifecycle
+            .iter_mut()
+            .find(|candidate| candidate.0 == agent_id)
+        else {
+            return Ok(false);
+        };
+        if candidate.1.is_some() {
+            return Ok(false);
+        }
+        candidate.1 = Some(outcome.into());
+        self.fit_serialized_bound()?;
+        Ok(self.finished_agent_outcome(agent_id) == Some(outcome))
+    }
+
+    pub fn retains_agent_lifecycle(&self, agent_id: &str) -> bool {
+        self.agent_lifecycle
+            .iter()
+            .any(|candidate| candidate.0 == agent_id)
+    }
+
+    pub fn finished_agent_outcome(&self, agent_id: &str) -> Option<ActionOutcome> {
+        self.agent_lifecycle
+            .iter()
+            .find(|candidate| candidate.0 == agent_id)
+            .and_then(|candidate| candidate.1)
+            .map(Into::into)
+    }
+
+    pub fn finalize_record(&mut self) -> Result<(), DecodeError> {
+        self.fit_serialized_bound()
+    }
+
     pub fn continuation(&self) -> Option<&Continuation> {
         self.continuation.as_ref()
     }
@@ -300,6 +370,7 @@ impl CodexStateV1 {
             .checked_add(self.pending_results.len())
             .is_none_or(|count| count > MAX_CALLS)
             || self.completed_semantic_keys.len() > MAX_COMPLETED_KEYS
+            || self.agent_lifecycle.len() > MAX_AGENT_LIFECYCLES
         {
             return Err(DecodeError::Malformed(
                 "invalid-codex-state-count".to_owned(),
@@ -318,6 +389,15 @@ impl CodexStateV1 {
                 "invalid-codex-ranked-key".to_owned(),
             ));
         }
+        if self
+            .agent_lifecycle
+            .iter()
+            .any(|candidate| !opaque_graph_identifier(&candidate.0))
+        {
+            return Err(DecodeError::Malformed(
+                "invalid-codex-agent-lifecycle".to_owned(),
+            ));
+        }
         if let Some(continuation) = &self.continuation {
             continuation.validate()?;
         }
@@ -327,6 +407,9 @@ impl CodexStateV1 {
     fn fit_serialized_bound(&mut self) -> Result<(), DecodeError> {
         while serialized_len(self)? > MAX_DECODER_STATE_BYTES {
             if self.completed_semantic_keys.pop_front().is_some() {
+                continue;
+            }
+            if self.agent_lifecycle.pop_front().is_some() {
                 continue;
             }
             return Err(DecodeError::StateTooLarge);
@@ -422,6 +505,15 @@ pub(super) fn bounded_identifier(value: &str, max_bytes: usize) -> bool {
     !value.is_empty()
         && value.len() <= max_bytes
         && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+fn opaque_graph_identifier(value: &str) -> bool {
+    value.strip_prefix("codex_graph_").is_some_and(|suffix| {
+        suffix.len() == 48
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
 }
 
 fn serialized_len<T: Serialize>(value: &T) -> Result<usize, DecodeError> {

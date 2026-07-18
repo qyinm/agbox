@@ -222,13 +222,12 @@ impl SourceAdapter for CodexAdapter {
 
         let mut state = progression_state;
         let mut output = Output::default();
+        let mut lifecycle = LifecycleCandidates::default();
         let mut retained = RetainedBudget::default();
-        let mut terminal_timestamp = None;
         let terminal_boundary = is_terminal_boundary(&top_type, nested_type.as_deref());
         let result = (|| {
             observe_known_history_mode(record, &top_type, declared_mode, &mut state)?;
             let timestamp = capture_timestamp(record)?.unwrap_or(context.observed_at);
-            terminal_timestamp = Some(timestamp);
             let mut scope = Scope {
                 context,
                 source: &source,
@@ -249,6 +248,7 @@ impl SourceAdapter for CodexAdapter {
                     &mut state,
                     &mut output,
                     &mut retained,
+                    &mut lifecycle,
                 ),
                 "event_msg" => decode_event_message(
                     record,
@@ -257,27 +257,29 @@ impl SourceAdapter for CodexAdapter {
                     &mut state,
                     &mut output,
                     &mut retained,
+                    &mut lifecycle,
                 ),
                 _ => Ok(()),
+            }?;
+            if terminal_boundary && state.pending_result_count() > 0 {
+                state.set_continuation(Some(Continuation(
+                    record.record_hash().to_owned(),
+                    record.start(),
+                    record.end(),
+                    top_type.clone(),
+                    ordinal,
+                    schema_fingerprint.clone(),
+                    timestamp.unix_timestamp_nanos().to_string(),
+                    output.next_event_ordinal,
+                    continuation_context_digest(context),
+                )));
             }
+            state.finalize_record()?;
+            lifecycle.finalize(&state, &mut output)
         })();
 
         match result {
             Ok(()) => {
-                if terminal_boundary && state.pending_result_count() > 0 {
-                    let timestamp = terminal_timestamp.unwrap_or(context.observed_at);
-                    state.set_continuation(Some(Continuation(
-                        record.record_hash().to_owned(),
-                        record.start(),
-                        record.end(),
-                        top_type.clone(),
-                        ordinal,
-                        schema_fingerprint.clone(),
-                        timestamp.unix_timestamp_nanos().to_string(),
-                        output.next_event_ordinal,
-                        continuation_context_digest(context),
-                    )));
-                }
                 let observation = make_observation(
                     record,
                     context,
@@ -413,6 +415,15 @@ impl Output {
         Ok(())
     }
 
+    fn prepend_events(&mut self, mut events: Vec<ActivityEventV1>) -> Result<(), DecodeError> {
+        if self.events.len().saturating_add(events.len()) > MAX_EVENTS_PER_RECORD {
+            return Err(DecodeError::OutputTooLarge);
+        }
+        events.append(&mut self.events);
+        self.events = events;
+        Ok(())
+    }
+
     fn push_evidence(&mut self, evidence: DecodedEvidence) -> Result<(), DecodeError> {
         if self.evidence.len() >= MAX_EVIDENCE_PER_RECORD {
             return Err(DecodeError::OutputTooLarge);
@@ -437,6 +448,64 @@ impl Output {
             .checked_add(1)
             .ok_or(DecodeError::OutputTooLarge)?;
         Ok(ordinal)
+    }
+}
+
+#[derive(Default)]
+struct LifecycleCandidates {
+    starts: Vec<StagedAgentStart>,
+    finishes: Vec<StagedAgentFinish>,
+}
+
+struct StagedAgentStart {
+    agent_id: String,
+    event: ActivityEventV1,
+}
+
+struct StagedAgentFinish {
+    agent_id: String,
+    outcome: ActionOutcome,
+    event: ActivityEventV1,
+}
+
+impl LifecycleCandidates {
+    fn push_start(&mut self, agent_id: String, event: ActivityEventV1) {
+        if !self
+            .starts
+            .iter()
+            .any(|candidate| candidate.agent_id == agent_id)
+        {
+            self.starts.push(StagedAgentStart { agent_id, event });
+        }
+    }
+
+    fn push_finish(&mut self, agent_id: String, outcome: ActionOutcome, event: ActivityEventV1) {
+        if !self
+            .finishes
+            .iter()
+            .any(|candidate| candidate.agent_id == agent_id)
+        {
+            self.finishes.push(StagedAgentFinish {
+                agent_id,
+                outcome,
+                event,
+            });
+        }
+    }
+
+    fn finalize(&mut self, state: &CodexStateV1, output: &mut Output) -> Result<(), DecodeError> {
+        let starts = std::mem::take(&mut self.starts)
+            .into_iter()
+            .filter(|candidate| state.retains_agent_lifecycle(&candidate.agent_id))
+            .map(|candidate| candidate.event)
+            .collect();
+        output.prepend_events(starts)?;
+        for candidate in std::mem::take(&mut self.finishes) {
+            if state.finished_agent_outcome(&candidate.agent_id) == Some(candidate.outcome) {
+                output.push_event(candidate.event)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -604,6 +673,7 @@ fn decode_response_item(
     state: &mut CodexStateV1,
     output: &mut Output,
     retained: &mut RetainedBudget,
+    lifecycle: &mut LifecycleCandidates,
 ) -> Result<(), DecodeError> {
     match item_type {
         "message" | "agent_message" => {
@@ -666,6 +736,10 @@ fn decode_response_item(
         "compaction" => {
             reconcile_pending_results(*scope, state, output, 1)?;
             decode_compaction(record, *scope, output)
+        }
+        "inter_agent_communication" => decode_inter_agent_message(record, *scope, output, retained),
+        "inter_agent_communication_metadata" => {
+            decode_agent_lifecycle(record, *scope, state, output, lifecycle)
         }
         _ => Ok(()),
     }
@@ -764,6 +838,7 @@ fn decode_action_request(
     ))
 }
 
+#[allow(clippy::too_many_lines)]
 fn decode_event_message(
     record: &dyn RecordSource,
     scope: &mut Scope<'_>,
@@ -771,6 +846,7 @@ fn decode_event_message(
     state: &mut CodexStateV1,
     output: &mut Output,
     retained: &mut RetainedBudget,
+    lifecycle: &mut LifecycleCandidates,
 ) -> Result<(), DecodeError> {
     match event_type {
         "task_started" => {
@@ -869,7 +945,10 @@ fn decode_event_message(
                 Some(changes),
             )
         }
-        "sub_agent_activity" => decode_sub_agent(record, *scope, output),
+        "sub_agent_activity" | "inter_agent_communication_metadata" => {
+            decode_agent_lifecycle(record, *scope, state, output, lifecycle)
+        }
+        "inter_agent_communication" => decode_inter_agent_message(record, *scope, output, retained),
         _ => Ok(()),
     }
 }
@@ -1231,49 +1310,236 @@ fn emit_turn_finished(
     )
 }
 
-fn decode_sub_agent(
+fn decode_agent_lifecycle(
+    record: &dyn RecordSource,
+    scope: Scope<'_>,
+    state: &mut CodexStateV1,
+    output: &mut Output,
+    lifecycle: &mut LifecycleCandidates,
+) -> Result<(), DecodeError> {
+    let agent_ids = capture_graph_ids(
+        record,
+        &[
+            &["payload", "agent_id"],
+            &["payload", "agentId"],
+            &["payload", "thread_id"],
+            &["payload", "threadId"],
+            &["payload", "new_thread_id"],
+            &["payload", "receiver_thread_id"],
+            &["payload", "metadata", "agent_id"],
+            &["payload", "metadata", "agentId"],
+            &["payload", "metadata", "thread_id"],
+        ],
+        "agent",
+        scope.session_id,
+    )?;
+    if agent_ids.is_empty() {
+        return Ok(());
+    }
+    let Some(causation_id) = capture_graph_causation(record, scope.session_id)? else {
+        return Ok(());
+    };
+    let status = capture_unique_plain(
+        record,
+        &[
+            &["payload", "status"],
+            &["payload", "action"],
+            &["payload", "metadata", "status"],
+            &["payload", "metadata", "action"],
+        ],
+        MAX_ID_BYTES,
+    )?;
+    match status.as_deref() {
+        Some("started" | "running" | "spawned" | "start") => {
+            stage_agent_starts(scope, &agent_ids, &causation_id, state, output, lifecycle)
+        }
+        Some("completed" | "succeeded" | "success" | "finished" | "end") => stage_agent_finishes(
+            scope,
+            &agent_ids,
+            &causation_id,
+            ActionOutcome::Succeeded,
+            state,
+            output,
+            lifecycle,
+        ),
+        Some("failed" | "error") => stage_agent_finishes(
+            scope,
+            &agent_ids,
+            &causation_id,
+            ActionOutcome::Failed,
+            state,
+            output,
+            lifecycle,
+        ),
+        Some("cancelled" | "aborted") => stage_agent_finishes(
+            scope,
+            &agent_ids,
+            &causation_id,
+            ActionOutcome::Cancelled,
+            state,
+            output,
+            lifecycle,
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn stage_agent_starts(
+    scope: Scope<'_>,
+    agent_ids: &[String],
+    causation_id: &str,
+    state: &mut CodexStateV1,
+    output: &mut Output,
+    lifecycle: &mut LifecycleCandidates,
+) -> Result<(), DecodeError> {
+    let previously_seen = agent_ids
+        .iter()
+        .map(|agent_id| state.retains_agent_lifecycle(agent_id))
+        .collect::<Vec<_>>();
+    for (agent_id, was_seen) in agent_ids.iter().zip(previously_seen) {
+        if !state.observe_agent(agent_id)? || was_seen {
+            continue;
+        }
+        let event_id = output.event_id(scope)?;
+        let event = make_event(
+            scope,
+            event_id,
+            Actor::System,
+            Some(agent_id.clone()),
+            Some(causation_id.to_owned()),
+            SemanticKey::from_native(
+                Provider::Codex,
+                scope.session_id,
+                "codex.agent.started",
+                agent_id,
+            ),
+            EventPayload::AgentStarted {
+                native_agent_id: agent_id.clone(),
+            },
+            PrivacyLabel::SyncEligible,
+        )?;
+        lifecycle.push_start(agent_id.clone(), event);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_agent_finishes(
+    scope: Scope<'_>,
+    agent_ids: &[String],
+    causation_id: &str,
+    outcome: ActionOutcome,
+    state: &mut CodexStateV1,
+    output: &mut Output,
+    lifecycle: &mut LifecycleCandidates,
+) -> Result<(), DecodeError> {
+    let previously_finished = agent_ids
+        .iter()
+        .map(|agent_id| state.finished_agent_outcome(agent_id).is_some())
+        .collect::<Vec<_>>();
+    for (agent_id, was_finished) in agent_ids.iter().zip(previously_finished) {
+        if !state.finish_agent(agent_id, outcome)? || was_finished {
+            continue;
+        }
+        let event_id = output.event_id(scope)?;
+        let event = make_event(
+            scope,
+            event_id,
+            Actor::System,
+            Some(agent_id.clone()),
+            Some(causation_id.to_owned()),
+            SemanticKey::from_native(
+                Provider::Codex,
+                scope.session_id,
+                "codex.agent.finished",
+                agent_id,
+            ),
+            EventPayload::AgentFinished {
+                native_agent_id: agent_id.clone(),
+                outcome,
+            },
+            PrivacyLabel::SyncEligible,
+        )?;
+        lifecycle.push_finish(agent_id.clone(), outcome, event);
+    }
+    Ok(())
+}
+
+fn decode_inter_agent_message(
     record: &dyn RecordSource,
     scope: Scope<'_>,
     output: &mut Output,
+    retained: &mut RetainedBudget,
 ) -> Result<(), DecodeError> {
-    let Some(agent_id) = capture_optional_digest_identifier(
+    let agent_ids = capture_graph_ids(
         record,
-        &["payload", "agent_id"],
+        &[
+            &["payload", "agent_id"],
+            &["payload", "agentId"],
+            &["payload", "to_agent_id"],
+            &["payload", "toAgentId"],
+            &["payload", "receiver_agent_id"],
+            &["payload", "thread_id"],
+            &["payload", "threadId"],
+            &["payload", "receiver_thread_id"],
+        ],
         "agent",
-        MAX_ID_BYTES,
-    )?
-    else {
+        scope.session_id,
+    )?;
+    if agent_ids.len() > 1 {
+        return Err(DecodeError::Malformed(
+            "ambiguous-codex-agent-message".to_owned(),
+        ));
+    }
+    let Some(agent_id) = agent_ids.first() else {
         return Ok(());
     };
-    let status = capture_optional_plain(record, &["payload", "status"], MAX_ID_BYTES)?;
-    let payload = match status.as_deref() {
-        Some("started" | "running") => EventPayload::AgentStarted {
-            native_agent_id: agent_id.clone(),
-        },
-        Some("completed" | "succeeded") => EventPayload::AgentFinished {
-            native_agent_id: agent_id.clone(),
-            outcome: ActionOutcome::Succeeded,
-        },
-        Some("failed") => EventPayload::AgentFinished {
-            native_agent_id: agent_id.clone(),
-            outcome: ActionOutcome::Failed,
-        },
-        Some("cancelled" | "aborted") => EventPayload::AgentFinished {
-            native_agent_id: agent_id.clone(),
-            outcome: ActionOutcome::Cancelled,
-        },
-        _ => return Ok(()),
+    let Some(causation_id) = capture_graph_causation(record, scope.session_id)? else {
+        return Ok(());
     };
-    emit_event(
-        scope,
-        output,
-        Actor::System,
-        Some(agent_id.clone()),
+    let content = capture_first_graph_message(record, retained)?;
+    let Some(content) = content else {
+        return Ok(());
+    };
+    emit_graph_message(scope, output, agent_id, &causation_id, &content)
+}
+
+fn emit_graph_message(
+    scope: Scope<'_>,
+    output: &mut Output,
+    agent_id: &str,
+    causation_id: &str,
+    content: &SecureCapturedString,
+) -> Result<(), DecodeError> {
+    let event_id = output.event_id(scope)?;
+    let content_ref = ContentRef::bounded(
+        content.hash.clone(),
+        content.total_bytes,
+        "text/plain",
         None,
-        SemanticKey::from_native(Provider::Codex, scope.session_id, "codex.agent", &agent_id),
-        payload,
-        PrivacyLabel::SyncEligible,
+        DisclosureClass::AgentStatement,
+        None,
     )
+    .map_err(|_| DecodeError::Malformed("invalid-codex-agent-message".to_owned()))?;
+    let semantic_id = content_ref.hash().to_owned();
+    let event = make_event(
+        scope,
+        event_id,
+        Actor::Agent,
+        Some(agent_id.to_owned()),
+        Some(causation_id.to_owned()),
+        SemanticKey::from_native(
+            Provider::Codex,
+            scope.session_id,
+            "codex.agent.message",
+            &format!("{agent_id}:{semantic_id}"),
+        ),
+        EventPayload::MessageCreated {
+            content: content_ref,
+        },
+        PrivacyLabel::RestrictedLocal,
+    )?;
+    output.push_event(event)
 }
 
 fn emit_artifact(
@@ -1541,6 +1807,112 @@ fn capture_event_message_content(
         }
     }
     Ok(None)
+}
+
+fn capture_first_graph_message(
+    record: &dyn RecordSource,
+    retained: &mut RetainedBudget,
+) -> Result<Option<SecureCapturedString>, DecodeError> {
+    for path in [
+        &["payload", "message"][..],
+        &["payload", "message", "content"][..],
+        &["payload", "text"][..],
+        &["payload", "content"][..],
+    ] {
+        if let Some(value) = capture_optional_string(record, path, retained.remaining(), true)? {
+            retained.charge(&value)?;
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+fn capture_graph_ids(
+    record: &dyn RecordSource,
+    paths: &[&[&str]],
+    domain: &str,
+    session_id: &str,
+) -> Result<Vec<String>, DecodeError> {
+    let mut output = Vec::new();
+    for path in paths {
+        let Some(value) = capture_optional_string(record, path, MAX_ID_BYTES, false)? else {
+            continue;
+        };
+        if value.total_bytes == 0 {
+            return Err(DecodeError::Malformed(
+                "invalid-codex-graph-identity".to_owned(),
+            ));
+        }
+        let identity = opaque_graph_id(domain, session_id, value.total_bytes, &value.hash);
+        if !output.contains(&identity) {
+            output.push(identity);
+        }
+    }
+    Ok(output)
+}
+
+fn capture_graph_causation(
+    record: &dyn RecordSource,
+    session_id: &str,
+) -> Result<Option<String>, DecodeError> {
+    let explicit = capture_graph_ids(
+        record,
+        &[
+            &["payload", "parent_thread_id"],
+            &["payload", "parentThreadId"],
+            &["payload", "forked_from_id"],
+            &["payload", "forkedFromId"],
+            &["payload", "sender_thread_id"],
+            &["payload", "metadata", "parent_thread_id"],
+            &["payload", "metadata", "forked_from_id"],
+        ],
+        "parent",
+        session_id,
+    )?;
+    if explicit.len() > 1 {
+        return Err(DecodeError::Malformed(
+            "ambiguous-codex-graph-parent".to_owned(),
+        ));
+    }
+    if let Some(parent) = explicit.into_iter().next() {
+        return Ok(Some(parent));
+    }
+    let sender = capture_graph_ids(
+        record,
+        &[
+            &["payload", "from_agent_id"],
+            &["payload", "fromAgentId"],
+            &["payload", "sender_agent_id"],
+        ],
+        "parent",
+        session_id,
+    )?;
+    if sender.len() > 1 {
+        return Err(DecodeError::Malformed(
+            "ambiguous-codex-graph-parent".to_owned(),
+        ));
+    }
+    Ok(sender.into_iter().next())
+}
+
+fn capture_unique_plain(
+    record: &dyn RecordSource,
+    paths: &[&[&str]],
+    limit: usize,
+) -> Result<Option<String>, DecodeError> {
+    let mut selected = None;
+    for path in paths {
+        let Some(value) = capture_optional_plain(record, path, limit)? else {
+            continue;
+        };
+        if selected.as_ref().is_some_and(|existing| existing != &value) {
+            return Err(DecodeError::Malformed(
+                "ambiguous-codex-lifecycle-status".to_owned(),
+            ));
+        }
+        selected = Some(value);
+    }
+    Ok(selected)
 }
 
 fn capture_joined_text(
@@ -2141,6 +2513,19 @@ fn opaque_id(domain: &str, total_bytes: u64, hash: &str) -> String {
     format!("codex_{domain}_{}", &hasher.finalize().to_hex()[..48])
 }
 
+fn opaque_graph_id(domain: &str, session_id: &str, total_bytes: u64, hash: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"agbox-codex-graph-identity-v1");
+    hasher.update(Provider::Codex.as_str().as_bytes());
+    hasher.update(&(session_id.len() as u64).to_le_bytes());
+    hasher.update(session_id.as_bytes());
+    hasher.update(&(domain.len() as u64).to_le_bytes());
+    hasher.update(domain.as_bytes());
+    hasher.update(&total_bytes.to_le_bytes());
+    hasher.update(hash.as_bytes());
+    format!("codex_graph_{}", &hasher.finalize().to_hex()[..48])
+}
+
 fn opaque_call_id(total_bytes: u64, hash: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"agbox-codex-call-identity-v1");
@@ -2523,6 +2908,8 @@ fn known_nested_type(top_type: &str, value: &str) -> bool {
                 | "reasoning"
                 | "compaction"
                 | "world_state"
+                | "inter_agent_communication"
+                | "inter_agent_communication_metadata"
         ),
         "event_msg" => matches!(
             value,
@@ -2536,6 +2923,8 @@ fn known_nested_type(top_type: &str, value: &str) -> bool {
                 | "patch_apply_end"
                 | "exec_command_end"
                 | "sub_agent_activity"
+                | "inter_agent_communication"
+                | "inter_agent_communication_metadata"
                 | "context_compacted"
         ),
         _ => false,
