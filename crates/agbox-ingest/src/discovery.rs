@@ -341,7 +341,8 @@ impl DiscoveryWalker {
                 .last()
                 .is_none_or(|active| active.cursor != directory_cursor)
             {
-                let directory = match self.open_directory(&directory_cursor, self.restored) {
+                let check_snapshot = self.restored || directory_cursor.entries_consumed != 0;
+                let directory = match self.open_directory(&directory_cursor, check_snapshot) {
                     Ok(directory) => directory,
                     Err(OpenDirectoryError::Unavailable) => {
                         bounded_fault(&mut faults, DiscoveryFaultClass::DirectoryUnavailable);
@@ -353,7 +354,20 @@ impl DiscoveryWalker {
                         return Err(DiscoveryError::InvalidCursor);
                     }
                 };
-                let Ok(iterator) = Dir::new(directory) else {
+                let stream = rustix::fs::openat(
+                    &directory,
+                    ".",
+                    OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+                    Mode::empty(),
+                )
+                .map(File::from);
+                let Ok(stream) = stream else {
+                    bounded_fault(&mut faults, DiscoveryFaultClass::DirectoryUnavailable);
+                    retry_or_quarantine(&mut self.cursor, &mut directory_cursor);
+                    self.active.clear();
+                    continue;
+                };
+                let Ok(iterator) = Dir::new(stream) else {
                     bounded_fault(&mut faults, DiscoveryFaultClass::DirectoryUnavailable);
                     retry_or_quarantine(&mut self.cursor, &mut directory_cursor);
                     self.active.clear();
@@ -368,7 +382,10 @@ impl DiscoveryWalker {
                     iterator,
                 });
             }
-            if self.open_directory(&directory_cursor, false).is_err() {
+            if self
+                .open_directory(&directory_cursor, directory_cursor.entries_consumed != 0)
+                .is_err()
+            {
                 self.active.clear();
                 bounded_fault(&mut faults, DiscoveryFaultClass::DirectoryUnavailable);
                 retry_or_quarantine(&mut self.cursor, &mut directory_cursor);
@@ -383,7 +400,10 @@ impl DiscoveryWalker {
                 read_page(active, hard_limit - visited_entries, &mut faults)
             };
             visited_entries = visited_entries.saturating_add(page.reads);
-            if self.open_directory(&directory_cursor, false).is_err() {
+            if self
+                .open_directory(&directory_cursor, directory_cursor.entries_consumed != 0)
+                .is_err()
+            {
                 self.active.clear();
                 bounded_fault(&mut faults, DiscoveryFaultClass::DirectoryUnavailable);
                 retry_or_quarantine(&mut self.cursor, &mut directory_cursor);
@@ -622,7 +642,7 @@ fn read_page(
     while reads < limit {
         let Some(result) = active.iterator.next() else {
             eof = true;
-            invalid_cursor = false;
+            invalid_cursor = active.recovery_remaining != 0;
             break;
         };
         reads += 1;
