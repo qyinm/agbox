@@ -341,6 +341,7 @@ impl DiscoveryWalker {
                 .last()
                 .is_none_or(|active| active.cursor != directory_cursor)
             {
+                self.active.clear();
                 let directory = match self.open_directory(&directory_cursor, self.restored) {
                     Ok(directory) => directory,
                     Err(OpenDirectoryError::Unavailable) => {
@@ -370,7 +371,9 @@ impl DiscoveryWalker {
             }
             if self.open_directory(&directory_cursor, false).is_err() {
                 self.active.clear();
-                return Err(DiscoveryError::InvalidCursor);
+                bounded_fault(&mut faults, DiscoveryFaultClass::DirectoryUnavailable);
+                retry_or_quarantine(&mut self.cursor, &mut directory_cursor);
+                continue;
             }
             let mut page_start = directory_cursor.clone();
             let page = {
@@ -383,7 +386,9 @@ impl DiscoveryWalker {
             visited_entries = visited_entries.saturating_add(page.reads);
             if self.open_directory(&directory_cursor, false).is_err() {
                 self.active.clear();
-                return Err(DiscoveryError::InvalidCursor);
+                bounded_fault(&mut faults, DiscoveryFaultClass::DirectoryUnavailable);
+                retry_or_quarantine(&mut self.cursor, &mut directory_cursor);
+                continue;
             }
             if page.invalid_cursor {
                 self.active.clear();
@@ -618,7 +623,7 @@ fn read_page(
     while reads < limit {
         let Some(result) = active.iterator.next() else {
             eof = true;
-            invalid_cursor = active.recovery_remaining != 0;
+            invalid_cursor = false;
             break;
         };
         reads += 1;

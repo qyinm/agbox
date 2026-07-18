@@ -212,15 +212,18 @@ fn wide_long_child_directories_make_progress_without_a_cursor_overflow() {
 fn deep_dfs_cursor_uses_prefix_sharing_and_stays_within_its_exact_bound() {
     let temp = tempfile::tempdir().unwrap();
     let mut leaf = temp.path().to_path_buf();
-    for _ in 0..30 {
+    for _ in 0..120 {
         leaf.push("d");
         fs::create_dir(&leaf).unwrap();
     }
     fs::write(leaf.join("source.jsonl"), b"record").unwrap();
     let mut walker = DiscoveryWalker::new(Provider::Codex, root_spec(temp.path())).unwrap();
     let mut found = 0;
-    for _ in 0..16 {
-        let batch = walker.next_batch(256).unwrap();
+    for batch_index in 0..16 {
+        let batch = walker
+            .next_batch(256)
+            .unwrap_or_else(|error| panic!("batch {batch_index}: {error:?}"));
+        assert!(walker.live_stream_count_for_test() <= 32);
         found += batch.sources.len();
         if let Some(cursor) = batch.cursor {
             assert!(serde_json::to_vec(&cursor).unwrap().len() <= 32 * 1024);
