@@ -114,6 +114,16 @@ pub struct GraphFinishRow {
     pub observed_at: OffsetDateTime,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GraphObservedFinishRow {
+    pub project_id: ProjectId,
+    pub session_id: SessionId,
+    pub native_action_id: String,
+    pub succeeded: bool,
+    pub finish_event_id: EventId,
+    pub observed_at: OffsetDateTime,
+}
+
 #[derive(Clone, Serialize)]
 pub struct GraphWriteBatch {
     pub reducer_name: String,
@@ -124,6 +134,7 @@ pub struct GraphWriteBatch {
     pub contexts: Vec<GraphSessionContextRow>,
     pub actions: Vec<GraphActionRow>,
     pub artifacts: Vec<GraphArtifactRow>,
+    pub observed_finishes: Vec<GraphObservedFinishRow>,
     pub finishes: Vec<GraphFinishRow>,
 }
 
@@ -138,6 +149,7 @@ impl fmt::Debug for GraphWriteBatch {
             .field("contexts", &self.contexts.len())
             .field("actions", &self.actions.len())
             .field("artifacts", &self.artifacts.len())
+            .field("observed_finishes", &self.observed_finishes.len())
             .field("finishes", &self.finishes.len())
             .finish_non_exhaustive()
     }
@@ -158,6 +170,7 @@ impl GraphWriteBatch {
             .checked_add(self.contexts.len())
             .and_then(|value| value.checked_add(self.actions.len()))
             .and_then(|value| value.checked_add(self.artifacts.len()))
+            .and_then(|value| value.checked_add(self.observed_finishes.len()))
             .and_then(|value| value.checked_add(self.finishes.len()))
             .ok_or(StoreError::InvalidBatch)?;
         if fact_count > MAX_GRAPH_FACTS
@@ -217,6 +230,13 @@ impl GraphWriteBatch {
                     .as_ref()
                     .is_some_and(|value| value.len() > agbox_core::limits::MAX_PREVIEW_BYTES)
             {
+                return Err(StoreError::InvalidBatch);
+            }
+            let _ = format_timestamp(row.observed_at)?;
+        }
+        for row in &self.observed_finishes {
+            validate_graph_identity(&row.project_id, &row.session_id, &row.finish_event_id)?;
+            if !bounded_identifier(&row.native_action_id) {
                 return Err(StoreError::InvalidBatch);
             }
             let _ = format_timestamp(row.observed_at)?;
@@ -1387,6 +1407,9 @@ fn apply_graph(
         verify_graph_event(&transaction, &row.project_id, &row.evidence_event_id)?;
         insert_graph_artifact(&transaction, row, encrypted_path)?;
     }
+    for row in &batch.observed_finishes {
+        verify_graph_event(&transaction, &row.project_id, &row.finish_event_id)?;
+    }
     for row in &batch.finishes {
         verify_graph_event(&transaction, &row.project_id, &row.finish_event_id)?;
         apply_graph_finish(&transaction, row)?;
@@ -1497,10 +1520,15 @@ fn apply_graph_run(transaction: &Transaction<'_>, row: &GraphRunRow) -> Result<(
             "SELECT branch_hash
              FROM agent_runs
              WHERE project_id = ?1 AND native_session_id = ?2
+               AND provider = ?3
                AND run_id LIKE 'context_%'
              ORDER BY started_at DESC, run_id
              LIMIT 1",
-            params![row.project_id.as_str(), row.session_id.as_str()],
+            params![
+                row.project_id.as_str(),
+                row.session_id.as_str(),
+                row.provider.as_str()
+            ],
             |record| record.get(0),
         )
         .optional()?
@@ -1618,11 +1646,12 @@ fn apply_graph_context(
         "UPDATE agent_runs
          SET branch_hash = ?1
          WHERE project_id = ?2 AND native_session_id = ?3
-           AND run_id <> ?4",
+           AND provider = ?4 AND run_id <> ?5",
         params![
             row.branch_hash,
             row.project_id.as_str(),
             row.session_id.as_str(),
+            row.provider.as_str(),
             row.context_run_id
         ],
     )?;
@@ -2903,6 +2932,14 @@ fn graph_semantic_bytes(batch: &GraphWriteBatch) -> Result<usize, StoreError> {
         if let Some(content_hash) = &row.content_hash {
             add_len(&mut total, content_hash.len())?;
         }
+    }
+    for row in &batch.observed_finishes {
+        add_len(&mut total, row.project_id.as_str().len())?;
+        add_len(&mut total, row.session_id.as_str().len())?;
+        add_len(&mut total, row.native_action_id.len())?;
+        add_len(&mut total, row.finish_event_id.as_str().len())?;
+        add_len(&mut total, format_timestamp(row.observed_at)?.len())?;
+        add_len(&mut total, 1)?;
     }
     for row in &batch.finishes {
         add_len(&mut total, row.verification_id.len())?;

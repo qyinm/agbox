@@ -19,8 +19,8 @@ use agbox_adapters::{
 use agbox_core::{ContentRef, EventPayload, PrivacyLabel, ProjectId, Provider, SourceObservation};
 use agbox_store::{
     ContentRefWrite, CursorState, EvidenceLink, EvidenceOwner, EvidenceWrite, GraphActionRow,
-    GraphArtifactRow, GraphFinishRow, GraphRunRow, GraphSessionContextRow, GraphWriteBatch,
-    IngestionChunk, IngestionFault, MAX_BATCH_BYTES, MAX_BATCH_RECORDS, ReadStore,
+    GraphArtifactRow, GraphFinishRow, GraphObservedFinishRow, GraphRunRow, GraphSessionContextRow,
+    GraphWriteBatch, IngestionChunk, IngestionFault, MAX_BATCH_BYTES, MAX_BATCH_RECORDS, ReadStore,
     SchemaFingerprintUpdate, StoreError, WriterHandle, stable_content_ref_id,
 };
 use agbox_workgraph::{
@@ -149,6 +149,7 @@ pub fn graph_write_batch(mutation: GraphMutation) -> Result<GraphWriteBatch, Ing
         contexts: Vec::new(),
         actions: Vec::new(),
         artifacts: Vec::new(),
+        observed_finishes: Vec::new(),
         finishes: Vec::new(),
     };
     for fact in mutation.facts {
@@ -214,7 +215,7 @@ pub fn graph_write_batch(mutation: GraphMutation) -> Result<GraphWriteBatch, Ing
             } => batch.contexts.push(GraphSessionContextRow {
                 context_run_id: stable_graph_id(
                     "context",
-                    &[project_id.as_str(), session_id.as_str()],
+                    &[project_id.as_str(), session_id.as_str(), provider.as_str()],
                 ),
                 project_id,
                 session_id,
@@ -277,12 +278,20 @@ pub fn graph_write_batch(mutation: GraphMutation) -> Result<GraphWriteBatch, Ing
                 succeeded,
                 observed_at,
                 evidence,
-            }
-            | ReducedFact::Verification {
+            } => batch.observed_finishes.push(GraphObservedFinishRow {
                 project_id,
                 session_id,
                 native_action_id,
                 succeeded,
+                finish_event_id: evidence,
+                observed_at,
+            }),
+            ReducedFact::Verification {
+                project_id,
+                session_id,
+                native_action_id,
+                succeeded,
+                basis,
                 observed_at,
                 evidence,
                 ..
@@ -292,7 +301,7 @@ pub fn graph_write_batch(mutation: GraphMutation) -> Result<GraphWriteBatch, Ing
                 session_id,
                 native_action_id,
                 succeeded,
-                basis: "structured_tool_result".to_owned(),
+                basis: basis.to_owned(),
                 finish_event_id: evidence,
                 observed_at,
             }),

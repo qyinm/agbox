@@ -22,8 +22,8 @@ pub use read::{
 pub use writer::{
     CommitReceipt, CommitSubmission, ContentRefWrite, CursorState, EvidenceLink, EvidenceOwner,
     EvidenceWrite, GraphActionRow, GraphApplyReceipt, GraphArtifactRow, GraphFinishRow,
-    GraphRunRow, GraphSessionContextRow, GraphWriteBatch, IngestionChunk, IngestionFault,
-    MAX_BATCH_BYTES, MAX_BATCH_RECORDS, MAX_GRAPH_FACTS, SchemaFingerprintUpdate,
+    GraphObservedFinishRow, GraphRunRow, GraphSessionContextRow, GraphWriteBatch, IngestionChunk,
+    IngestionFault, MAX_BATCH_BYTES, MAX_BATCH_RECORDS, MAX_GRAPH_FACTS, SchemaFingerprintUpdate,
     SourceRegistration, SourceRegistrationReceipt, WRITER_QUEUE_CAPACITY, WriterHandle,
     stable_content_ref_id,
 };

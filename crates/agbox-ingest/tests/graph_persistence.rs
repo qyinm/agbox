@@ -85,7 +85,52 @@ async fn graph_translation_and_writer_retry_are_exact_once() {
 }
 
 #[tokio::test]
-async fn cross_slice_finish_joins_request_and_stale_watermark_is_rejected() {
+async fn observed_finish_on_same_page_never_creates_verification() {
+    let fixture = FixtureRuntime::codex_records(1).await;
+    fixture.drain().await.unwrap();
+    let events = fixture
+        .read_store()
+        .events_after(0, 1_000, 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let committed = &events[0];
+    let mutation = GraphMutation {
+        facts: vec![
+            ReducedFact::ActionRequested {
+                project_id: committed.event.project_id().clone(),
+                session_id: committed.event.session_id().clone(),
+                native_action_id: "same-page".into(),
+                tool_name: "shell".into(),
+                input_hash: "b3:same-page".into(),
+                redacted_input: Some("cargo check".into()),
+                evidence: committed.event.event_id().clone(),
+            },
+            ReducedFact::ActionFinishedObserved {
+                project_id: committed.event.project_id().clone(),
+                session_id: committed.event.session_id().clone(),
+                native_action_id: "same-page".into(),
+                succeeded: true,
+                observed_at: committed.event.observed_at(),
+                evidence: committed.event.event_id().clone(),
+            },
+        ],
+        expected_event_seq: 0,
+        through_event_seq: Some(committed.event_seq),
+        through_event_id: Some(committed.event.event_id().clone()),
+    };
+    fixture
+        .writer()
+        .apply_graph(graph_write_batch(mutation).unwrap())
+        .await
+        .unwrap();
+
+    let counts = fixture.read_store().graph_counts_for_test().await.unwrap();
+    assert_eq!(counts.actions, 1);
+    assert_eq!(counts.verifications, 0);
+}
+
+#[tokio::test]
+async fn observed_finish_across_pages_never_creates_verification_and_stale_watermark_is_rejected() {
     let fixture = FixtureRuntime::codex_records(3).await;
     fixture.drain().await.unwrap();
     let events = fixture
@@ -139,7 +184,7 @@ async fn cross_slice_finish_joins_request_and_stale_watermark_is_rejected() {
             .await
             .unwrap()
             .verifications,
-        1
+        0
     );
 
     let stale = GraphMutation {
@@ -352,5 +397,117 @@ async fn session_context_on_an_earlier_page_is_applied_to_a_later_run() {
             .unwrap()
             .as_deref(),
         Some("b3:branch-main")
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn session_context_is_isolated_by_provider_for_the_same_project_and_session() {
+    let fixture = FixtureRuntime::codex_records(4).await;
+    fixture.drain().await.unwrap();
+    let events = fixture
+        .read_store()
+        .events_after(0, 4, MAX_EVENT_PAGE_BYTES)
+        .await
+        .unwrap();
+
+    let codex_context = GraphMutation {
+        facts: vec![ReducedFact::SessionContext {
+            project_id: events[0].event.project_id().clone(),
+            session_id: events[0].event.session_id().clone(),
+            provider: Provider::Codex,
+            branch_hash: Some("b3:codex-branch".into()),
+            observed_at: events[0].event.observed_at(),
+            evidence: events[0].event.event_id().clone(),
+        }],
+        expected_event_seq: 0,
+        through_event_seq: Some(events[0].event_seq),
+        through_event_id: Some(events[0].event.event_id().clone()),
+    };
+    let codex_context_batch = graph_write_batch(codex_context).unwrap();
+    let codex_context_id = codex_context_batch.contexts[0].context_run_id.clone();
+    fixture
+        .writer()
+        .apply_graph(codex_context_batch)
+        .await
+        .unwrap();
+
+    let claude_context = GraphMutation {
+        facts: vec![ReducedFact::SessionContext {
+            project_id: events[1].event.project_id().clone(),
+            session_id: events[1].event.session_id().clone(),
+            provider: Provider::Claude,
+            branch_hash: Some("b3:claude-branch".into()),
+            observed_at: events[1].event.observed_at(),
+            evidence: events[1].event.event_id().clone(),
+        }],
+        expected_event_seq: events[0].event_seq,
+        through_event_seq: Some(events[1].event_seq),
+        through_event_id: Some(events[1].event.event_id().clone()),
+    };
+    let claude_context_batch = graph_write_batch(claude_context).unwrap();
+    let claude_context_id = claude_context_batch.contexts[0].context_run_id.clone();
+    assert_ne!(codex_context_id, claude_context_id);
+    fixture
+        .writer()
+        .apply_graph(claude_context_batch)
+        .await
+        .unwrap();
+
+    let codex_run = GraphMutation {
+        facts: vec![ReducedFact::AgentRunStarted {
+            project_id: events[2].event.project_id().clone(),
+            session_id: events[2].event.session_id().clone(),
+            provider: Provider::Codex,
+            native_agent_id: "codex-run".into(),
+            observed_at: events[2].event.observed_at(),
+            evidence: events[2].event.event_id().clone(),
+        }],
+        expected_event_seq: events[1].event_seq,
+        through_event_seq: Some(events[2].event_seq),
+        through_event_id: Some(events[2].event.event_id().clone()),
+    };
+    let codex_run_batch = graph_write_batch(codex_run).unwrap();
+    let codex_run_id = codex_run_batch.runs[0].run_id.clone();
+    fixture.writer().apply_graph(codex_run_batch).await.unwrap();
+
+    let claude_run = GraphMutation {
+        facts: vec![ReducedFact::AgentRunStarted {
+            project_id: events[3].event.project_id().clone(),
+            session_id: events[3].event.session_id().clone(),
+            provider: Provider::Claude,
+            native_agent_id: "claude-run".into(),
+            observed_at: events[3].event.observed_at(),
+            evidence: events[3].event.event_id().clone(),
+        }],
+        expected_event_seq: events[2].event_seq,
+        through_event_seq: Some(events[3].event_seq),
+        through_event_id: Some(events[3].event.event_id().clone()),
+    };
+    let claude_run_batch = graph_write_batch(claude_run).unwrap();
+    let claude_run_id = claude_run_batch.runs[0].run_id.clone();
+    fixture
+        .writer()
+        .apply_graph(claude_run_batch)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fixture
+            .read_store()
+            .agent_run_branch_for_test(codex_run_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("b3:codex-branch")
+    );
+    assert_eq!(
+        fixture
+            .read_store()
+            .agent_run_branch_for_test(claude_run_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("b3:claude-branch")
     );
 }
