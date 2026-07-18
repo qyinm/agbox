@@ -10,11 +10,16 @@ test-support = ["agbox-core/test-support"]
 
 [dependencies]
 agbox-core.workspace = true
+async-trait.workspace = true
 blake3.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 agbox-core = { workspace = true, features = ["test-support"] }

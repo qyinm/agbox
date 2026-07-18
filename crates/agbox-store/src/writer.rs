@@ -376,6 +376,135 @@ pub struct WorkWriteBatch {
     pub contract: WorkContractRow,
 }
 
+/// Store-owned semantic extractor publication.  The optional contract is
+/// inserted in the same transaction as the immutable extractor-run record;
+/// failures therefore leave the current provisional revision untouched.
+#[derive(Clone, Serialize)]
+pub struct ExtractorWriteBatch {
+    pub extractor_run_id: String,
+    pub project_id: ProjectId,
+    pub work_id: WorkId,
+    pub extractor_version: String,
+    pub input_event_watermark: String,
+    pub status: String,
+    pub bounded_error: Option<String>,
+    pub observed_at: OffsetDateTime,
+    pub refined_contract: Option<WorkContractRow>,
+}
+
+type ExistingExtractorRun = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+);
+
+impl fmt::Debug for ExtractorWriteBatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExtractorWriteBatch")
+            .field("extractor_run_id", &self.extractor_run_id)
+            .field("project_id", &self.project_id)
+            .field("work_id", &self.work_id)
+            .field("extractor_version", &self.extractor_version)
+            .field(
+                "input_event_watermark_bytes",
+                &self.input_event_watermark.len(),
+            )
+            .field("status", &self.status)
+            .field(
+                "bounded_error_bytes",
+                &self.bounded_error.as_ref().map_or(0, String::len),
+            )
+            .field("refined_contract", &self.refined_contract)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExtractorWriteBatch {
+    /// Revalidates the bounded extractor-run and optional contract payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidBatch`] for invalid identifiers, status,
+    /// payload bounds, or a contract whose immutable projections disagree.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if !bounded_identifier(&self.extractor_run_id)
+            || !bounded_identifier(self.project_id.as_str())
+            || !bounded_identifier(self.work_id.as_str())
+            || !bounded_metadata(&self.extractor_version)
+            || !bounded_metadata(&self.input_event_watermark)
+            || !matches!(self.status.as_str(), "succeeded" | "failed")
+            || self
+                .bounded_error
+                .as_ref()
+                .is_some_and(|error| error.len() > agbox_core::limits::MAX_PREVIEW_BYTES)
+            || (self.status == "failed" && self.refined_contract.is_some())
+            || (self.status == "succeeded" && self.refined_contract.is_none())
+        {
+            return Err(StoreError::InvalidBatch);
+        }
+        let _ = format_timestamp(self.observed_at)?;
+        if let Some(contract) = &self.refined_contract {
+            if !bounded_identifier(contract.contract_id.as_str())
+                || contract.revision == 0
+                || !bounded_metadata(&contract.extractor_version)
+                || contract.contract_json.len() > agbox_core::limits::MAX_CONTRACT_SERIALIZED_BYTES
+            {
+                return Err(StoreError::InvalidBatch);
+            }
+            validate_extractor_contract(self, contract)?;
+        }
+        if serde_json::to_vec(self)?.len() > MAX_BATCH_BYTES {
+            return Err(StoreError::InvalidBatch);
+        }
+        Ok(())
+    }
+}
+
+fn validate_extractor_contract(
+    batch: &ExtractorWriteBatch,
+    row: &WorkContractRow,
+) -> Result<(), StoreError> {
+    let contract: ContractProjectionDto = serde_json::from_str(&row.contract_json)?;
+    if contract.contract_id != row.contract_id
+        || contract.work_id != batch.work_id
+        || contract.revision != row.revision
+        || contract.project_id != batch.project_id
+        || contract.extractor_version != row.extractor_version
+        || contract.created_at != batch.observed_at
+        || contract.objective != row.objective
+        || contract.summary != row.summary
+        || contract.completed_steps != row.completed_steps
+        || contract.next_actions != row.next_actions
+        || contract.blockers != row.blockers
+        || contract.artifacts != row.artifacts
+        || contract.verification != row.verification
+        || contract.confidence_basis_points > 10_000
+        || !contract.projection_state.is_object()
+        || !bounded_metadata(&contract.material_content_hash)
+    {
+        return Err(StoreError::InvalidBatch);
+    }
+    if contract.evidence_refs.is_empty()
+        || contract.evidence_refs.len() > agbox_core::limits::MAX_CONTRACT_EVIDENCE_REFS
+        || contract.field_evidence.len() > 10
+        || !bounded_contract_field_list(&contract.completed_steps)
+        || !bounded_contract_field_list(&contract.next_actions)
+        || !bounded_contract_field_list(&contract.blockers)
+        || !bounded_contract_field_list(&contract.constraints)
+        || !bounded_contract_field_list(&contract.completion_criteria)
+        || !bounded_contract_field_list(&contract.artifacts)
+        || !bounded_contract_field_list(&contract.verification)
+    {
+        return Err(StoreError::InvalidBatch);
+    }
+    Ok(())
+}
+
 impl fmt::Debug for WorkWriteBatch {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -544,6 +673,12 @@ fn work_status_name(status: WorkStatus) -> &'static str {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkApplyReceipt {
     pub through_event_seq: u64,
+    pub replayed: bool,
+    pub revision_inserted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExtractorApplyReceipt {
     pub replayed: bool,
     pub revision_inserted: bool,
 }
@@ -1102,6 +1237,10 @@ pub(crate) enum WriteCommand {
         batch: Box<WorkWriteBatch>,
         reply: oneshot::Sender<Result<WorkApplyReceipt, StoreError>>,
     },
+    ApplyExtractor {
+        batch: Box<ExtractorWriteBatch>,
+        reply: oneshot::Sender<Result<ExtractorApplyReceipt, StoreError>>,
+    },
     LoadWorkCandidates {
         query: Box<WorkCandidateQuery>,
         reply: oneshot::Sender<Result<WorkCandidatePage, StoreError>>,
@@ -1258,6 +1397,30 @@ impl WriterHandle {
         receive.await.map_err(|_| StoreError::WriterStopped)?
     }
 
+    /// Atomically records one semantic extractor run and, on success, its
+    /// immutable refined revision. Failed runs never replace the provisional
+    /// contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the batch is invalid, the work/project
+    /// reference is missing, or an immutable run/revision conflicts.
+    pub async fn apply_extractor(
+        &self,
+        batch: ExtractorWriteBatch,
+    ) -> Result<ExtractorApplyReceipt, StoreError> {
+        batch.validate()?;
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(WriteCommand::ApplyExtractor {
+                batch: Box::new(batch),
+                reply,
+            })
+            .await
+            .map_err(|_| StoreError::WriterStopped)?;
+        receive.await.map_err(|_| StoreError::WriterStopped)?
+    }
+
     /// Loads at most 64 same-project correlation candidates in explicit,
     /// continuation, artifact, command, and recent priority order.
     ///
@@ -1356,6 +1519,10 @@ pub(crate) fn run_writer(
             }
             WriteCommand::ApplyWork { batch, reply } => {
                 let result = apply_work(&mut connection, &batch);
+                let _ = reply.send(result);
+            }
+            WriteCommand::ApplyExtractor { batch, reply } => {
+                let result = apply_extractor(&mut connection, &batch);
                 let _ = reply.send(result);
             }
             WriteCommand::LoadWorkCandidates { query, reply } => {
@@ -2003,6 +2170,183 @@ fn apply_work(
         replayed,
         revision_inserted,
     })
+}
+
+#[allow(clippy::too_many_lines)]
+fn apply_extractor(
+    connection: &mut rusqlite::Connection,
+    batch: &ExtractorWriteBatch,
+) -> Result<ExtractorApplyReceipt, StoreError> {
+    batch.validate()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !work_exists_in_project(&transaction, batch.work_id.as_str(), &batch.project_id)? {
+        return Err(StoreError::InvalidReference);
+    }
+    let observed_at = format_timestamp(batch.observed_at)?;
+    let batch_digest = blake3::hash(&serde_json::to_vec(batch)?)
+        .to_hex()
+        .to_string();
+    let audit_id = extractor_audit_id(&batch.extractor_run_id);
+    let existing: Option<ExistingExtractorRun> = transaction
+        .query_row(
+            "SELECT extractor_runs.work_id, projects.project_id,
+                    extractor_runs.extractor_version, extractor_runs.input_event_watermark,
+                    extractor_runs.status, extractor_runs.bounded_error,
+                    extractor_runs.created_at
+             FROM extractor_runs
+             INNER JOIN work_items ON work_items.work_id = extractor_runs.work_id
+             INNER JOIN projects ON projects.project_id = work_items.project_id
+             WHERE extractor_runs.extractor_run_id = ?1",
+            [batch.extractor_run_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((
+        stored_work_id,
+        stored_project_id,
+        version,
+        watermark,
+        status,
+        error,
+        created_at,
+    )) = existing
+    {
+        let same = stored_work_id == batch.work_id.as_str()
+            && stored_project_id == batch.project_id.as_str()
+            && version == batch.extractor_version
+            && watermark == batch.input_event_watermark
+            && status == batch.status
+            && error == batch.bounded_error
+            && created_at == observed_at;
+        if !same {
+            return Err(StoreError::ImmutableConflict);
+        }
+        let stored_detail: Option<String> = transaction
+            .query_row(
+                "SELECT detail_json FROM audit_events WHERE audit_id = ?1",
+                [audit_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if stored_detail.as_deref()
+            != Some(format!(r#"{{"batch_digest":"{batch_digest}"}}"#).as_str())
+        {
+            return Err(StoreError::ImmutableConflict);
+        }
+        transaction.commit()?;
+        return Ok(ExtractorApplyReceipt {
+            replayed: true,
+            revision_inserted: false,
+        });
+    }
+    transaction.execute(
+        "INSERT INTO extractor_runs(
+             extractor_run_id, work_id, extractor_version, input_event_watermark,
+             status, bounded_error, created_at, finished_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        params![
+            batch.extractor_run_id.as_str(),
+            batch.work_id.as_str(),
+            batch.extractor_version.as_str(),
+            batch.input_event_watermark.as_str(),
+            batch.status.as_str(),
+            batch.bounded_error.as_deref(),
+            observed_at.as_str()
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO audit_events(
+             audit_id, kind, project_id, work_id, actor, detail_json, created_at
+         ) VALUES (?1, 'semantic.extractor_batch', ?2, ?3, 'system', ?4, ?5)",
+        params![
+            audit_id,
+            batch.project_id.as_str(),
+            batch.work_id.as_str(),
+            format!(r#"{{"batch_digest":"{batch_digest}"}}"#),
+            observed_at.as_str()
+        ],
+    )?;
+    let mut revision_inserted = false;
+    if let Some(contract) = &batch.refined_contract {
+        let stored: Option<String> = transaction
+            .query_row(
+                "SELECT contract_json FROM work_contract_revisions
+                 WHERE work_id = ?1 AND revision = ?2",
+                params![batch.work_id.as_str(), to_i64(contract.revision)?],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(stored) = stored {
+            if stored != contract.contract_json {
+                return Err(StoreError::ImmutableConflict);
+            }
+        } else {
+            let maximum: i64 = transaction.query_row(
+                "SELECT coalesce(max(revision), 0) FROM work_contract_revisions WHERE work_id = ?1",
+                [batch.work_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if to_i64(contract.revision)? != maximum + 1 {
+                return Err(StoreError::ImmutableConflict);
+            }
+            transaction.execute(
+                "INSERT INTO work_contract_revisions(
+                     contract_id, work_id, revision, contract_json,
+                     extractor_version, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    contract.contract_id.as_str(),
+                    batch.work_id.as_str(),
+                    to_i64(contract.revision)?,
+                    contract.contract_json.as_str(),
+                    contract.extractor_version.as_str(),
+                    observed_at.as_str()
+                ],
+            )?;
+            revision_inserted = true;
+            transaction.execute(
+                "DELETE FROM work_search WHERE work_id = ?1 AND project_id = ?2",
+                params![batch.work_id.as_str(), batch.project_id.as_str()],
+            )?;
+            transaction.execute(
+                "INSERT INTO work_search(
+                     work_id, project_id, objective, summary, completed_steps,
+                     next_actions, blockers, artifacts, verification
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    batch.work_id.as_str(),
+                    batch.project_id.as_str(),
+                    contract.objective.as_deref().unwrap_or_default(),
+                    contract.summary.as_str(),
+                    contract.completed_steps.join("\n"),
+                    contract.next_actions.join("\n"),
+                    contract.blockers.join("\n"),
+                    contract.artifacts.join("\n"),
+                    contract.verification.join("\n")
+                ],
+            )?;
+        }
+    }
+    transaction.commit()?;
+    Ok(ExtractorApplyReceipt {
+        replayed: false,
+        revision_inserted,
+    })
+}
+
+fn extractor_audit_id(run_id: &str) -> String {
+    let digest = blake3::hash(run_id.as_bytes()).to_hex();
+    format!("audit_extractor_{}", &digest[..24])
 }
 
 fn validate_work_candidate_query(query: &WorkCandidateQuery) -> Result<(), StoreError> {

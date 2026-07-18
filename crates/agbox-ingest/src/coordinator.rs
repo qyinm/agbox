@@ -21,16 +21,18 @@ use agbox_core::{
     WorkStatus,
 };
 use agbox_store::{
-    ContentRefWrite, CursorState, EvidenceLink, EvidenceOwner, EvidenceWrite, GraphActionRow,
-    GraphArtifactRow, GraphFinishRow, GraphObservedFinishRow, GraphRunRow, GraphSessionContextRow,
-    GraphWriteBatch, IngestionChunk, IngestionFault, MAX_BATCH_BYTES, MAX_BATCH_RECORDS, ReadStore,
-    SchemaFingerprintUpdate, StoreError, WorkApplyReceipt, WorkCandidateQuery, WorkContractRow,
-    WorkEdgeRow, WorkWriteBatch, WriterHandle, stable_content_ref_id,
+    ContentRefWrite, CursorState, EvidenceLink, EvidenceOwner, EvidenceWrite,
+    ExtractorApplyReceipt, ExtractorWriteBatch, GraphActionRow, GraphArtifactRow, GraphFinishRow,
+    GraphObservedFinishRow, GraphRunRow, GraphSessionContextRow, GraphWriteBatch, IngestionChunk,
+    IngestionFault, MAX_BATCH_BYTES, MAX_BATCH_RECORDS, ReadStore, SchemaFingerprintUpdate,
+    StoreError, WorkApplyReceipt, WorkCandidateQuery, WorkContractRow, WorkEdgeRow, WorkWriteBatch,
+    WriterHandle, stable_content_ref_id,
 };
 use agbox_workgraph::{
     CommittedEvent, ContractBuildError, CorrelationDecision, CorrelationInput, CorrelationOutcome,
-    Correlator, DeterministicReducer, GraphMutation, ProvisionalContract,
-    ProvisionalContractBuilder, ReduceError, ReducedFact, WorkCandidate,
+    Correlator, DeterministicReducer, ExtractionInput, GraphMutation, ProvisionalContract,
+    ProvisionalContractBuilder, ReduceError, ReducedFact, SemanticError, SemanticExtractor,
+    SemanticPolicy, WorkCandidate, filter_proposals, refine_provisional_contract_at,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Notify;
@@ -111,6 +113,8 @@ pub enum IngestError {
     Contract(#[from] ContractBuildError),
     #[error("stored provisional contract is invalid")]
     InvalidStoredContract,
+    #[error("semantic refinement failed")]
+    Semantic(#[from] SemanticError),
 }
 
 impl fmt::Debug for IngestError {
@@ -132,6 +136,7 @@ impl fmt::Debug for IngestError {
             Self::Reduce(_) => "Reduce",
             Self::Contract(_) => "Contract",
             Self::InvalidStoredContract => "InvalidStoredContract",
+            Self::Semantic(_) => "Semantic",
         })
     }
 }
@@ -173,6 +178,13 @@ pub struct WorkPublicationReport {
     pub revision: u64,
     pub correlation: CorrelationOutcome,
     pub candidate_truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SemanticPublicationReport {
+    pub receipt: ExtractorApplyReceipt,
+    pub refined: bool,
+    pub failed: bool,
 }
 
 /// Translates a pure workgraph mutation into the store-owned persistence DTO.
@@ -534,6 +546,42 @@ fn stable_graph_id(prefix: &str, parts: &[&str]) -> String {
         hasher.update(part.as_bytes());
     }
     format!("{prefix}_{}", &hasher.finalize().to_hex()[..24])
+}
+
+fn stable_extractor_run_id(
+    project_id: &ProjectId,
+    work_id: &WorkId,
+    extractor_version: &str,
+    watermark: &str,
+) -> String {
+    stable_graph_id(
+        "extractor",
+        &[
+            project_id.as_str(),
+            work_id.as_str(),
+            extractor_version,
+            watermark,
+        ],
+    )
+}
+
+fn extractor_contract_row(
+    contract: &ProvisionalContract,
+    contract_json: String,
+) -> WorkContractRow {
+    WorkContractRow {
+        contract_id: contract.contract_id.clone(),
+        revision: contract.revision,
+        contract_json,
+        extractor_version: contract.extractor_version.clone(),
+        objective: contract.objective.clone(),
+        summary: contract.summary.clone(),
+        completed_steps: contract.completed_steps.clone(),
+        next_actions: contract.next_actions.clone(),
+        blockers: contract.blockers.clone(),
+        artifacts: contract.artifacts.clone(),
+        verification: contract.verification.clone(),
+    }
 }
 
 /// Outcome of one bounded production graph-reducer page.
@@ -958,6 +1006,105 @@ impl IngestionCoordinator {
                 || correlation.truncation.candidates,
             correlation,
         })
+    }
+
+    /// Runs optional loopback semantic refinement and persists only the
+    /// authority-filtered result. Any extractor, schema, or policy failure is
+    /// recorded as an immutable failed run; the provisional revision remains
+    /// current because the store batch carries no refined contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::InvalidGraphMutation`] for mismatched project,
+    /// work, policy, or watermark inputs, or a store error when the run cannot
+    /// be recorded atomically.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_semantic(
+        &self,
+        project_id: ProjectId,
+        work_id: WorkId,
+        previous: ProvisionalContract,
+        input: ExtractionInput,
+        extractor: &dyn SemanticExtractor,
+        policy: &SemanticPolicy,
+        input_event_watermark: String,
+        observed_at: OffsetDateTime,
+    ) -> Result<SemanticPublicationReport, IngestError> {
+        if previous.project_id != project_id || previous.work_id != work_id {
+            return Err(IngestError::InvalidGraphMutation);
+        }
+        if !policy.project_matches(&project_id) {
+            return Err(IngestError::InvalidGraphMutation);
+        }
+        if input_event_watermark.is_empty() || input_event_watermark.len() > 128 {
+            return Err(IngestError::InvalidGraphMutation);
+        }
+        let extractor_version = extractor.version().to_owned();
+        let run_id = stable_extractor_run_id(
+            &project_id,
+            &work_id,
+            &extractor_version,
+            &input_event_watermark,
+        );
+        let result = extractor
+            .extract(input)
+            .await
+            .and_then(|proposals| filter_proposals(policy, proposals))
+            .and_then(|proposals| {
+                refine_provisional_contract_at(
+                    &previous,
+                    &proposals,
+                    extractor_version.clone(),
+                    observed_at,
+                )
+            });
+        match result {
+            Ok(contract) => {
+                let contract_json = serde_json::to_string(&contract)
+                    .map_err(|_| IngestError::InvalidGraphMutation)?;
+                let receipt = self
+                    .writer
+                    .apply_extractor(ExtractorWriteBatch {
+                        extractor_run_id: run_id,
+                        project_id,
+                        work_id,
+                        extractor_version,
+                        input_event_watermark,
+                        status: "succeeded".into(),
+                        bounded_error: None,
+                        observed_at,
+                        refined_contract: Some(extractor_contract_row(&contract, contract_json)),
+                    })
+                    .await?;
+                Ok(SemanticPublicationReport {
+                    receipt,
+                    refined: true,
+                    failed: false,
+                })
+            }
+            Err(error) => {
+                let bounded_error: String = error.to_string().chars().take(512).collect();
+                let receipt = self
+                    .writer
+                    .apply_extractor(ExtractorWriteBatch {
+                        extractor_run_id: run_id,
+                        project_id,
+                        work_id,
+                        extractor_version,
+                        input_event_watermark,
+                        status: "failed".into(),
+                        bounded_error: Some(bounded_error),
+                        observed_at,
+                        refined_contract: None,
+                    })
+                    .await?;
+                Ok(SemanticPublicationReport {
+                    receipt,
+                    refined: false,
+                    failed: true,
+                })
+            }
+        }
     }
 
     /// Registers immutable decode facts for an already store-registered source.

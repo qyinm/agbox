@@ -1,6 +1,17 @@
+mod authority;
 mod contract;
 mod correlate;
 mod reducer;
+mod semantic;
+
+pub use authority::{AuthorityEvidence, SemanticPolicy};
+pub use semantic::{
+    BoundedArtifact, BoundedEvidence, BoundedFact, DisabledExtractor, EndpointPolicy,
+    ExtractionInput, LoopbackExtractor, MAX_ASSERTION_VALUE_BYTES, MAX_ASSERTIONS_PER_RUN,
+    MAX_EXTRACTION_INPUT_BYTES, MAX_RESPONSE_BYTES, ProposedAssertion, ProposedAssertions,
+    SemanticError, SemanticExtractor, filter_proposals, refine_provisional_contract,
+    refine_provisional_contract_at,
+};
 
 pub use contract::{
     ContractBuildError, ContractField, ProvisionalContract, ProvisionalContractBuilder,
