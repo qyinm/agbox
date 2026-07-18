@@ -1,9 +1,9 @@
 use std::{
     ffi::OsString,
-    fs::File,
+    fs::{File, ReadDir},
     io::Write,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
@@ -56,6 +56,7 @@ pub struct EvidenceVault {
     root: PathBuf,
     root_directory: File,
     key: Zeroizing<[u8; 32]>,
+    orphan_scan: Mutex<Option<ReadDir>>,
 }
 
 impl std::fmt::Debug for EvidenceVault {
@@ -84,6 +85,7 @@ impl EvidenceVault {
             root,
             root_directory,
             key,
+            orphan_scan: Mutex::new(None),
         })
     }
 
@@ -245,7 +247,9 @@ impl EvidenceVault {
         }
     }
 
-    /// Lists at most 256 old, regular owner files with safe evidence IDs. The
+    /// Examines at most 256 directory entries per call and returns old,
+    /// regular owner files with safe evidence IDs. The iterator is retained
+    /// between calls so a noisy prefix cannot starve later orphan files. The
     /// writer must still verify that no metadata row exists immediately before
     /// removing each candidate.
     pub(crate) fn orphan_candidates(
@@ -254,8 +258,20 @@ impl EvidenceVault {
     ) -> Result<Vec<EvidenceId>, EvidenceError> {
         ensure_owner_directory(&self.root)?;
         let mut candidates = Vec::new();
-        for entry in std::fs::read_dir(&self.root)? {
-            let entry = entry?;
+        let mut scan = self
+            .orphan_scan
+            .lock()
+            .map_err(|_| std::io::Error::other("orphan scan cursor lock poisoned"))?;
+        if scan.is_none() {
+            *scan = Some(std::fs::read_dir(&self.root)?);
+        }
+        for _ in 0..256 {
+            let next = scan.as_mut().and_then(Iterator::next);
+            let Some(next) = next else {
+                *scan = None;
+                break;
+            };
+            let entry = next?;
             let name = entry.file_name();
             let text = name.to_string_lossy();
             let Some(raw) = text.strip_suffix(".agbx") else {
@@ -270,9 +286,6 @@ impl EvidenceVault {
                 .unwrap_or(Duration::ZERO);
             if age >= Duration::from_hours(24) {
                 candidates.push(id);
-                if candidates.len() == 256 {
-                    break;
-                }
             }
         }
         Ok(candidates)
