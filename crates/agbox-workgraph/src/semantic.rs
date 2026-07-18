@@ -161,7 +161,6 @@ struct EgressContract<'a> {
     verification: &'a [String],
     confidence_basis_points: u16,
     created_at: time::OffsetDateTime,
-    extractor_version: &'a str,
 }
 
 impl<'a> From<&'a WorkContractRevision> for EgressContract<'a> {
@@ -183,7 +182,6 @@ impl<'a> From<&'a WorkContractRevision> for EgressContract<'a> {
             verification: contract.verification(),
             confidence_basis_points: contract.confidence_basis_points(),
             created_at: contract.created_at(),
-            extractor_version: contract.extractor_version(),
         }
     }
 }
@@ -753,6 +751,7 @@ mod tests {
         assert!(!encoded.contains("source_runs"));
         assert!(!encoded.contains("evidence_refs"));
         assert!(!encoded.contains("disclosure_class"));
+        assert!(!encoded.contains("extractor_version"));
     }
 
     #[test]
