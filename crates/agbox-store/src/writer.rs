@@ -14,7 +14,10 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
-use crate::{EvidenceContext, EvidenceOwnerRef, EvidenceVault, StoreError};
+use crate::{
+    AuditRecord, EvidenceContext, EvidenceOwnerRef, EvidenceVault, ForgetOutcome, ForgetTarget,
+    RetentionTick, StoreError,
+};
 
 pub const MAX_BATCH_BYTES: usize = agbox_core::limits::MAX_BATCH_SEMANTIC_BYTES;
 pub const MAX_BATCH_RECORDS: usize = agbox_core::limits::MAX_BATCH_RECORDS;
@@ -1283,6 +1286,19 @@ pub(crate) enum WriteCommand {
         evidence_ids: Vec<EvidenceId>,
         reply: oneshot::Sender<Result<Vec<SemanticEvidenceRow>, StoreError>>,
     },
+    Forget {
+        target: ForgetTarget,
+        actor: &'static str,
+        observed_at: OffsetDateTime,
+        reply: oneshot::Sender<Result<ForgetOutcome, StoreError>>,
+    },
+    DrainDeletionQueue {
+        reply: oneshot::Sender<Result<RetentionTick, StoreError>>,
+    },
+    RecordAudit {
+        record: AuditRecord,
+        reply: oneshot::Sender<Result<(), StoreError>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -1534,6 +1550,58 @@ impl WriterHandle {
         receive.await.map_err(|_| StoreError::WriterStopped)?
     }
 
+    /// Atomically removes only agbox-owned state for a verified project scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, ownership, database, or writer error.
+    pub async fn forget(
+        &self,
+        target: ForgetTarget,
+        actor: &'static str,
+        observed_at: OffsetDateTime,
+    ) -> Result<ForgetOutcome, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(WriteCommand::Forget {
+                target,
+                actor,
+                observed_at,
+                reply,
+            })
+            .await
+            .map_err(|_| StoreError::WriterStopped)?;
+        receive.await.map_err(|_| StoreError::WriterStopped)?
+    }
+
+    /// Performs one bounded (256 object) evidence deletion tick.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database or writer error. Individual unlink failures remain queued for retry.
+    pub async fn drain_deletion_queue(&self) -> Result<RetentionTick, StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(WriteCommand::DrainDeletionQueue { reply })
+            .await
+            .map_err(|_| StoreError::WriterStopped)?;
+        receive.await.map_err(|_| StoreError::WriterStopped)?
+    }
+
+    /// Writes a typed allowlisted audit operation without recording user data.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database or writer error.
+    pub async fn record_audit(&self, record: AuditRecord) -> Result<(), StoreError> {
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(WriteCommand::RecordAudit { record, reply })
+            .await
+            .map_err(|_| StoreError::WriterStopped)?;
+        receive.await.map_err(|_| StoreError::WriterStopped)?
+    }
+
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     #[must_use]
@@ -1609,6 +1677,20 @@ pub(crate) fn run_writer(
             } => {
                 let result = load_semantic_evidence(&connection, &project_id, &evidence_ids);
                 let _ = reply.send(result);
+            }
+            WriteCommand::Forget {
+                target,
+                actor,
+                observed_at,
+                reply,
+            } => {
+                let _ = reply.send(forget(&mut connection, &target, actor, observed_at));
+            }
+            WriteCommand::DrainDeletionQueue { reply } => {
+                let _ = reply.send(drain_deletion_queue(&mut connection, &vault));
+            }
+            WriteCommand::RecordAudit { record, reply } => {
+                let _ = reply.send(record_audit(&mut connection, &record));
             }
             WriteCommand::Shutdown { reply } => {
                 let _ = reply.send(());
@@ -2455,6 +2537,205 @@ fn validate_extractor_parent(
 fn extractor_audit_id(run_id: &str) -> String {
     let digest = blake3::hash(run_id.as_bytes()).to_hex();
     format!("audit_extractor_{}", &digest[..24])
+}
+
+#[allow(clippy::too_many_lines)]
+fn forget(
+    connection: &mut rusqlite::Connection,
+    target: &ForgetTarget,
+    actor: &str,
+    observed_at: OffsetDateTime,
+) -> Result<ForgetOutcome, StoreError> {
+    let (project_id, work_id) = match target {
+        ForgetTarget::Work(work_id) => {
+            let project: Option<String> = connection
+                .query_row(
+                    "SELECT project_id FROM work_items WHERE work_id = ?1",
+                    [work_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            (
+                ProjectId::parse_wire(project.as_deref().ok_or(StoreError::InvalidReference)?)
+                    .ok_or(StoreError::InvalidBatch)?,
+                Some(work_id.clone()),
+            )
+        }
+        ForgetTarget::Project(project_id) => (project_id.clone(), None),
+    };
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let exists: Option<i64> = transaction
+        .query_row(
+            "SELECT 1 FROM projects WHERE project_id = ?1",
+            [project_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if exists.is_none() {
+        return Err(StoreError::InvalidReference);
+    }
+    let job = format!("delete_{}", uuid::Uuid::new_v4().simple());
+    let project_hash = blake3::hash(project_id.as_str().as_bytes())
+        .to_hex()
+        .to_string();
+    let timestamp = format_timestamp(observed_at)?;
+    let scope = work_id.as_ref().map_or_else(|| "e.project_id = ?1", |_| "e.project_id = ?1 AND (e.owner_kind = 'work' AND e.owner_id = ?2 OR EXISTS (SELECT 1 FROM work_evidence we WHERE we.evidence_id = e.evidence_id AND we.work_id = ?2))");
+    let inserted = if let Some(work_id) = &work_id {
+        transaction.execute(&format!("INSERT OR IGNORE INTO evidence_delete_queue(deletion_job_id,evidence_id,project_hash,attempts,state,created_at) SELECT ?3,e.evidence_id,?4,0,'pending',?5 FROM evidence_objects e WHERE {scope}"), params![project_id.as_str(), work_id.as_str(), job, project_hash, timestamp])?
+    } else {
+        transaction.execute("INSERT OR IGNORE INTO evidence_delete_queue(deletion_job_id,evidence_id,project_hash,attempts,state,created_at) SELECT ?2,evidence_id,?3,0,'pending',?4 FROM evidence_objects WHERE project_id = ?1", params![project_id.as_str(), job, project_hash, timestamp])?
+    };
+    let kind = if work_id.is_some() {
+        "forget.work.requested"
+    } else {
+        "forget.project.requested"
+    };
+    let audit_id = format!("audit_forget_{}", uuid::Uuid::new_v4().simple());
+    transaction.execute("INSERT INTO audit_events(audit_id,kind,project_id,work_id,actor,detail_json,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![audit_id, kind, project_id.as_str(), work_id.as_ref().map(WorkId::as_str), actor, format!(r#"{{"pending_blobs":{inserted},"result":"accepted"}}"#), timestamp])?;
+    if let Some(work_id) = &work_id {
+        transaction.execute("DELETE FROM event_evidence WHERE evidence_id IN (SELECT evidence_id FROM work_evidence WHERE work_id = ?1)", [work_id.as_str()])?;
+        transaction.execute(
+            "DELETE FROM work_evidence WHERE work_id = ?1",
+            [work_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM artifacts WHERE work_id = ?1",
+            [work_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM work_assertions WHERE work_id = ?1",
+            [work_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM work_edges WHERE from_work_id = ?1 OR to_work_id = ?1",
+            [work_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM work_contract_revisions WHERE work_id = ?1",
+            [work_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM extractor_runs WHERE work_id = ?1",
+            [work_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM handoff_reads WHERE work_id = ?1",
+            [work_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM work_search WHERE work_id = ?1 AND project_id = ?2",
+            params![work_id.as_str(), project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM work_items WHERE work_id = ?1 AND project_id = ?2",
+            params![work_id.as_str(), project_id.as_str()],
+        )?;
+        transaction.execute("DELETE FROM evidence_objects WHERE project_id = ?1 AND evidence_id IN (SELECT evidence_id FROM evidence_delete_queue WHERE deletion_job_id = ?2)", params![project_id.as_str(), job])?;
+    } else {
+        transaction.execute("DELETE FROM event_evidence WHERE event_id IN (SELECT event_id FROM activity_events WHERE project_id = ?1)", [project_id.as_str()])?;
+        transaction.execute("DELETE FROM work_evidence WHERE work_id IN (SELECT work_id FROM work_items WHERE project_id = ?1)", [project_id.as_str()])?;
+        transaction.execute("DELETE FROM artifacts WHERE work_id IN (SELECT work_id FROM work_items WHERE project_id = ?1)", [project_id.as_str()])?;
+        transaction.execute("DELETE FROM work_assertions WHERE work_id IN (SELECT work_id FROM work_items WHERE project_id = ?1)", [project_id.as_str()])?;
+        transaction.execute("DELETE FROM work_edges WHERE from_work_id IN (SELECT work_id FROM work_items WHERE project_id = ?1) OR to_work_id IN (SELECT work_id FROM work_items WHERE project_id = ?1)", [project_id.as_str()])?;
+        transaction.execute("DELETE FROM work_contract_revisions WHERE work_id IN (SELECT work_id FROM work_items WHERE project_id = ?1)", [project_id.as_str()])?;
+        transaction.execute("DELETE FROM extractor_runs WHERE work_id IN (SELECT work_id FROM work_items WHERE project_id = ?1)", [project_id.as_str()])?;
+        transaction.execute(
+            "DELETE FROM handoff_reads WHERE project_id = ?1",
+            [project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM work_search WHERE project_id = ?1",
+            [project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM work_items WHERE project_id = ?1",
+            [project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM verification_facts WHERE project_id = ?1",
+            [project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM action_facts WHERE project_id = ?1",
+            [project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM agent_runs WHERE project_id = ?1",
+            [project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM activity_events WHERE project_id = ?1",
+            [project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM evidence_objects WHERE project_id = ?1",
+            [project_id.as_str()],
+        )?;
+        transaction.execute("DELETE FROM source_cursors WHERE source_id IN (SELECT source_id FROM sources WHERE project_id = ?1)", [project_id.as_str()])?;
+        transaction.execute("DELETE FROM source_observations WHERE source_id IN (SELECT source_id FROM sources WHERE project_id = ?1)", [project_id.as_str()])?;
+        transaction.execute("DELETE FROM source_generation_identities WHERE source_id IN (SELECT source_id FROM sources WHERE project_id = ?1)", [project_id.as_str()])?;
+        transaction.execute("DELETE FROM source_generations WHERE source_id IN (SELECT source_id FROM sources WHERE project_id = ?1)", [project_id.as_str()])?;
+        transaction.execute(
+            "DELETE FROM sources WHERE project_id = ?1",
+            [project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM projects WHERE project_id = ?1",
+            [project_id.as_str()],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(ForgetOutcome {
+        deletion_job_id: job,
+        deleted_rows: u64::try_from(inserted).map_err(|_| StoreError::InvalidBatch)?,
+        pending_blobs: u64::try_from(inserted).map_err(|_| StoreError::InvalidBatch)?,
+    })
+}
+
+fn drain_deletion_queue(
+    connection: &mut rusqlite::Connection,
+    vault: &EvidenceVault,
+) -> Result<RetentionTick, StoreError> {
+    let mut statement = connection.prepare("SELECT deletion_job_id,evidence_id FROM evidence_delete_queue ORDER BY created_at LIMIT 256")?;
+    let jobs = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let mut result = RetentionTick {
+        attempted: 0,
+        deleted: 0,
+        failed: 0,
+    };
+    for (job, raw_id) in jobs {
+        result.attempted += 1;
+        let Some(id) = EvidenceId::parse_wire(&raw_id) else {
+            result.failed += 1;
+            continue;
+        };
+        if let Ok(()) = vault.remove(&id) {
+            connection.execute(
+                "DELETE FROM evidence_delete_queue WHERE deletion_job_id = ?1 AND evidence_id = ?2",
+                params![job, raw_id],
+            )?;
+            result.deleted += 1;
+        } else {
+            connection.execute("UPDATE evidence_delete_queue SET attempts = attempts + 1, state = 'failed', last_error_code = 'unlink_failed' WHERE deletion_job_id = ?1 AND evidence_id = ?2", params![job, raw_id])?;
+            result.failed += 1;
+        }
+    }
+    Ok(result)
+}
+
+fn record_audit(
+    connection: &mut rusqlite::Connection,
+    record: &AuditRecord,
+) -> Result<(), StoreError> {
+    let observed_at = format_timestamp(record.observed_at)?;
+    let audit_id = format!("audit_app_{}", uuid::Uuid::new_v4().simple());
+    connection.execute("INSERT INTO audit_events(audit_id,kind,project_id,work_id,actor,detail_json,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![audit_id, record.kind, record.project_id.as_str(), record.work_id.as_ref().map(WorkId::as_str), record.actor, format!(r#"{{"result":"{}"}}"#, record.result), observed_at])?;
+    Ok(())
 }
 
 fn validate_work_candidate_query(query: &WorkCandidateQuery) -> Result<(), StoreError> {

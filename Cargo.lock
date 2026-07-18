@@ -65,6 +65,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "agbox-service"
+version = "0.2.0"
+dependencies = [
+ "agbox-core",
+ "agbox-ingest",
+ "agbox-store",
+ "agbox-workgraph",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "agbox-store"
 version = "0.2.0"
 dependencies = [

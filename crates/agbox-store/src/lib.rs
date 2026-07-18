@@ -1,24 +1,29 @@
+mod audit;
 mod crypto;
 mod evidence;
 mod fs_security;
 mod migrate;
 mod read;
+mod retention;
 mod writer;
 
 use std::{ffi::OsStr, fmt, fs::File, path::Path, sync::Arc};
 
 use rusqlite::Connection;
 
+pub use audit::AuditRecord;
 #[cfg(feature = "test-support")]
 pub use crypto::MemoryKeyProvider;
 pub use crypto::{CryptoError, KeyProvider, KeyringKeyProvider, open, seal};
 pub use evidence::{EvidenceContext, EvidenceError, EvidenceOwnerRef, EvidenceVault};
 #[cfg(feature = "test-support")]
 pub use read::GraphCounts;
+pub use read::fts_literal_query;
 pub use read::{
-    MAX_EVENT_PAGE_BYTES, MAX_EVENT_PAGE_ROWS, READ_POOL_SIZE, ReadPool, ReadStore,
-    ReducerWatermark, StoredEvent,
+    EvidenceMetadata, MAX_EVENT_PAGE_BYTES, MAX_EVENT_PAGE_ROWS, READ_POOL_SIZE, ReadPool,
+    ReadStore, ReducerWatermark, StoredEvent,
 };
+pub use retention::{ForgetOutcome, ForgetTarget, RetentionTick};
 pub use writer::{
     CommitReceipt, CommitSubmission, ContentRefWrite, CursorState, EvidenceLink, EvidenceOwner,
     EvidenceWrite, ExtractorApplyReceipt, ExtractorWriteBatch, GraphActionRow, GraphApplyReceipt,

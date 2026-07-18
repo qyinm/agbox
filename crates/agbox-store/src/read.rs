@@ -7,8 +7,9 @@ use std::{
 };
 
 use agbox_core::{
-    ActivityEventDraft, ActivityEventV1, Actor, EventId, EventPayload, PrivacyLabel, ProjectId,
-    SemanticKey, SessionId, SourceRef,
+    ActivityEventDraft, ActivityEventV1, Actor, ContractId, EventId, EventPayload, EvidenceId,
+    PrivacyLabel, ProjectId, SemanticKey, SessionId, SourceRef, WorkId, WorkStatus,
+    api::{EvidenceAvailability, SearchHit, WorkDetail, WorkSummary},
 };
 use rusqlite::{OpenFlags, OptionalExtension};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -30,6 +31,20 @@ pub struct StoredEvent {
 pub struct ReducerWatermark {
     pub through_event_seq: u64,
     pub through_event_id: Option<EventId>,
+}
+
+/// Project-scoped metadata required to disclose one evidence object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceMetadata {
+    pub evidence_id: EvidenceId,
+    pub project_id: ProjectId,
+    pub work_id: Option<WorkId>,
+    pub event_id: Option<EventId>,
+    pub contract_id: Option<ContractId>,
+    pub revision: Option<u64>,
+    pub media_type: String,
+    pub redacted_preview: String,
+    pub availability: EvidenceAvailability,
 }
 
 #[cfg(feature = "test-support")]
@@ -182,6 +197,144 @@ pub struct ReadStore {
 impl ReadStore {
     pub(crate) fn new(pool: ReadPool) -> Self {
         Self { pool }
+    }
+
+    /// Lists latest project-owned immutable work contracts.  Project scope is
+    /// part of the SQL predicate, never a post-query filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a closed read pool, invalid stored rows, or SQL failures.
+    pub async fn list_work(
+        &self,
+        project: &ProjectId,
+        status: Option<WorkStatus>,
+        limit: u16,
+    ) -> Result<Vec<WorkSummary>, StoreError> {
+        let project = project.clone();
+        let limit = limit.clamp(1, 100);
+        self.pool.execute(move |connection| {
+            let status = status.map(work_status_wire);
+            let mut statement = connection.prepare(
+                "SELECT w.work_id, r.contract_json
+                 FROM work_items w
+                 INNER JOIN work_contract_revisions r ON r.work_id = w.work_id
+                 WHERE w.project_id = ?1
+                   AND (?2 IS NULL OR w.status = ?2)
+                   AND r.revision = (SELECT max(r2.revision) FROM work_contract_revisions r2 WHERE r2.work_id = w.work_id)
+                 ORDER BY r.revision DESC, w.updated_at DESC
+                 LIMIT ?3",
+            )?;
+            let rows = statement.query_map(rusqlite::params![project.as_str(), status, i64::from(limit)], |row| {
+                let work_id: String = row.get(0)?;
+                let json: String = row.get(1)?;
+                Ok((work_id, json))
+            })?;
+            rows.map(|row| {
+                let (work_id, json) = row?;
+                let contract = decode_contract(&json)?;
+                if contract.work_id.as_str() != work_id { return Err(StoreError::InvalidBatch); }
+                Ok(contract.summary())
+            }).collect()
+        }).await
+    }
+
+    /// Reads one latest immutable project-owned contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a closed read pool, invalid stored rows, or SQL failures.
+    pub async fn work(
+        &self,
+        project: &ProjectId,
+        work_id: &WorkId,
+    ) -> Result<Option<WorkDetail>, StoreError> {
+        let project = project.clone();
+        let work_id = work_id.clone();
+        self.pool
+            .execute(move |connection| {
+                let json: Option<String> = connection
+                    .query_row(
+                        "SELECT r.contract_json FROM work_items w
+                 INNER JOIN work_contract_revisions r ON r.work_id = w.work_id
+                 WHERE w.project_id = ?1 AND w.work_id = ?2
+                 ORDER BY r.revision DESC LIMIT 1",
+                        rusqlite::params![project.as_str(), work_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                json.map(|json| decode_contract(&json).map(StoredContract::detail))
+                    .transpose()
+            })
+            .await
+    }
+
+    /// Looks up only same-project evidence metadata. Unknown and foreign IDs
+    /// are intentionally indistinguishable to callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a closed read pool, invalid stored rows, or SQL failures.
+    pub async fn evidence_owner(
+        &self,
+        project: &ProjectId,
+        evidence_id: &EvidenceId,
+    ) -> Result<Option<EvidenceMetadata>, StoreError> {
+        let project = project.clone();
+        let evidence_id = evidence_id.clone();
+        self.pool.execute(move |connection| {
+            connection.query_row(
+                "SELECT e.owner_kind, e.owner_id, e.media_type, e.redacted_excerpt, e.blob_state,
+                        (SELECT we.work_id FROM work_evidence we WHERE we.evidence_id = e.evidence_id LIMIT 1),
+                        (SELECT r.contract_id FROM work_evidence we INNER JOIN work_contract_revisions r ON r.work_id = we.work_id WHERE we.evidence_id = e.evidence_id ORDER BY r.revision DESC LIMIT 1),
+                        (SELECT r.revision FROM work_evidence we INNER JOIN work_contract_revisions r ON r.work_id = we.work_id WHERE we.evidence_id = e.evidence_id ORDER BY r.revision DESC LIMIT 1)
+                 FROM evidence_objects e WHERE e.project_id = ?1 AND e.evidence_id = ?2",
+                rusqlite::params![project.as_str(), evidence_id.as_str()],
+                |row| {
+                    let owner_kind: String = row.get(0)?; let owner_id: String = row.get(1)?; let state: String = row.get(4)?;
+                    let work_id: Option<String> = row.get(5)?;
+                    let event_id = (owner_kind == "event").then_some(owner_id);
+                    let availability = match state.as_str() { "available" => EvidenceAvailability::Available, "expired" => EvidenceAvailability::Expired, "delete_pending" => EvidenceAvailability::DeletePending, _ => return Err(rusqlite::Error::InvalidQuery) };
+                    Ok(EvidenceMetadata {
+                        evidence_id: evidence_id.clone(), project_id: project.clone(),
+                        work_id: work_id.as_deref().and_then(WorkId::parse_wire),
+                        event_id: event_id.as_deref().and_then(EventId::parse_wire),
+                        contract_id: row.get::<_, Option<String>>(6)?.as_deref().and_then(ContractId::parse_wire),
+                        revision: row.get::<_, Option<i64>>(7)?.and_then(|v| u64::try_from(v).ok()),
+                        media_type: row.get(2)?, redacted_preview: row.get(3)?, availability,
+                    })
+                }
+            ).optional().map_err(StoreError::from)
+        }).await
+    }
+
+    /// Searches only derived contract projections using a literal FTS query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed or over-limit query text, a closed read
+    /// pool, invalid stored rows, or SQL failures.
+    pub async fn search_work(
+        &self,
+        project: &ProjectId,
+        query: String,
+        limit: u16,
+    ) -> Result<Vec<SearchHit>, StoreError> {
+        let project = project.clone();
+        let expression = fts_literal_query(&query)?;
+        let limit = limit.clamp(1, 100);
+        self.pool.execute(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT s.work_id, r.contract_json FROM work_search s
+                 INNER JOIN work_items w ON w.work_id = s.work_id AND w.project_id = s.project_id
+                 INNER JOIN work_contract_revisions r ON r.work_id = w.work_id
+                 WHERE s.project_id = ?1 AND work_search MATCH ?2
+                   AND r.revision = (SELECT max(r2.revision) FROM work_contract_revisions r2 WHERE r2.work_id = w.work_id)
+                 LIMIT ?3"
+            )?;
+            let rows = statement.query_map(rusqlite::params![project.as_str(), expression, i64::from(limit)], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+            rows.map(|row| { let (work_id, json) = row?; let contract = decode_contract(&json)?; if contract.work_id.as_str() != work_id { return Err(StoreError::InvalidBatch); } Ok(SearchHit { work: contract.summary() }) }).collect()
+        }).await
     }
 
     /// Returns the number of retained activity events.
@@ -448,6 +601,114 @@ impl ReadStore {
             })
             .await
     }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredContract {
+    contract_id: ContractId,
+    work_id: WorkId,
+    revision: u64,
+    project_id: ProjectId,
+    objective: Option<String>,
+    status: WorkStatus,
+    summary: String,
+    completed_steps: Vec<String>,
+    next_actions: Vec<String>,
+    blockers: Vec<String>,
+    constraints: Vec<String>,
+    completion_criteria: Vec<String>,
+    artifacts: Vec<String>,
+    verification: Vec<String>,
+    evidence_refs: Vec<EventId>,
+    field_evidence: serde_json::Value,
+    evidence_truncated: bool,
+    confidence_basis_points: u16,
+    created_at: OffsetDateTime,
+    extractor_version: String,
+    #[serde(default)]
+    fact_set_digest: String,
+    material_content_hash: String,
+    projection_state: serde_json::Value,
+}
+
+impl StoredContract {
+    fn summary(self) -> WorkSummary {
+        WorkSummary {
+            work_id: self.work_id,
+            contract_id: self.contract_id,
+            revision: self.revision,
+            status: self.status,
+            objective: self.objective,
+            summary: self.summary,
+        }
+    }
+    fn detail(self) -> WorkDetail {
+        WorkDetail {
+            work_id: self.work_id,
+            contract_id: self.contract_id,
+            revision: self.revision,
+            status: self.status,
+            objective: self.objective,
+            summary: self.summary,
+            completed_steps: self.completed_steps,
+            next_actions: self.next_actions,
+            blockers: self.blockers,
+            constraints: self.constraints,
+            completion_criteria: self.completion_criteria,
+            artifacts: self.artifacts,
+            verification: self.verification,
+        }
+    }
+}
+
+fn decode_contract(value: &str) -> Result<StoredContract, StoreError> {
+    if value.len() > agbox_core::limits::MAX_CONTRACT_SERIALIZED_BYTES {
+        return Err(StoreError::InvalidBatch);
+    }
+    serde_json::from_str(value).map_err(StoreError::from)
+}
+
+fn work_status_wire(value: WorkStatus) -> &'static str {
+    match value {
+        WorkStatus::Observed => "observed",
+        WorkStatus::Active => "active",
+        WorkStatus::Blocked => "blocked",
+        WorkStatus::Completed => "completed",
+        WorkStatus::Abandoned => "abandoned",
+    }
+}
+
+/// Converts hostile user input to a small all-literal FTS5 expression.
+///
+/// # Errors
+///
+/// Returns [`StoreError::InvalidBatch`] for empty or over-limit text.
+pub fn fts_literal_query(query: &str) -> Result<String, StoreError> {
+    if query.is_empty() || query.len() > 1024 || !query.is_char_boundary(query.len()) {
+        return Err(StoreError::InvalidBatch);
+    }
+    let terms = query
+        .split_whitespace()
+        .filter_map(|term| {
+            let clipped: String = term
+                .chars()
+                .take_while(|c| !c.is_control())
+                .take(64)
+                .collect();
+            (!clipped.is_empty()).then_some(clipped)
+        })
+        .take(16)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return Err(StoreError::InvalidBatch);
+    }
+    Ok(terms
+        .into_iter()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND "))
 }
 
 fn decode_event_row(row: &rusqlite::Row<'_>) -> Result<ActivityEventV1, StoreError> {

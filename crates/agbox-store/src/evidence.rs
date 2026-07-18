@@ -219,6 +219,24 @@ impl EvidenceVault {
             &envelope,
         )?))
     }
+
+    /// Removes a vault object after the database transaction has recorded a
+    /// delete-pending queue entry. It uses the same descriptor-relative,
+    /// no-follow confinement as reads and writes.
+    pub(crate) fn remove(&self, id: &EvidenceId) -> Result<(), EvidenceError> {
+        let path = self.path(id)?;
+        let name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "evidence target has no file name",
+            )
+        })?;
+        match remove_owner_file(&self.root_directory, name) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 struct TempCleanup<'a> {
