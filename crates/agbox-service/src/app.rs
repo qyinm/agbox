@@ -257,6 +257,7 @@ where
                     .reader
                     .list_work(scope.project_id(), status, limit.clamp(1, 100))
                     .await?;
+                self.audit(&scope, "handoff.work.list", None, "ok").await?;
                 Ok(AppResponse::WorkList(bounded_page(rows)?))
             }
             AppRequest::GetWork { work_id } => {

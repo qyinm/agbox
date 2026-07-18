@@ -3101,6 +3101,7 @@ fn record_audit(
 ) -> Result<(), StoreError> {
     const KINDS: &[&str] = &[
         "handoff.work.read",
+        "handoff.work.list",
         "handoff.evidence.read",
         "handoff.evidence.raw",
         "handoff.search",
