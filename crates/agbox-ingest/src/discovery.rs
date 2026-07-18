@@ -341,7 +341,6 @@ impl DiscoveryWalker {
                 .last()
                 .is_none_or(|active| active.cursor != directory_cursor)
             {
-                self.active.clear();
                 let directory = match self.open_directory(&directory_cursor, self.restored) {
                     Ok(directory) => directory,
                     Err(OpenDirectoryError::Unavailable) => {
