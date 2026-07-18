@@ -1,4 +1,8 @@
-use std::{collections::HashSet, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 
 use agbox_core::{
     ActivityEventV1, ContentRef, DisclosureClass, EventId, EvidenceId, PrivacyLabel, ProjectId,
@@ -308,7 +312,7 @@ struct ContractProjectionDto {
     artifacts: Vec<String>,
     verification: Vec<String>,
     evidence_refs: Vec<EventId>,
-    field_evidence: serde_json::Value,
+    field_evidence: BTreeMap<String, Vec<EventId>>,
     evidence_truncated: bool,
     confidence_basis_points: u16,
     created_at: OffsetDateTime,
@@ -481,9 +485,20 @@ fn validate_contract_projection(batch: &WorkWriteBatch) -> Result<(), StoreError
             .evidence_refs
             .iter()
             .any(|event_id| !bounded_identifier(event_id.as_str()))
+        || contract.field_evidence.len() > 10
+        || contract.field_evidence.values().any(|references| {
+            references.len() > agbox_core::limits::MAX_CONTRACT_ITEMS_PER_FIELD
+                || references
+                    .iter()
+                    .any(|event_id| !bounded_identifier(event_id.as_str()))
+        })
+        || !bounded_contract_field_list(&contract.completed_steps)
+        || !bounded_contract_field_list(&contract.next_actions)
+        || !bounded_contract_field_list(&contract.blockers)
         || !bounded_contract_field_list(&contract.constraints)
         || !bounded_contract_field_list(&contract.completion_criteria)
-        || !contract.field_evidence.is_object()
+        || !bounded_contract_field_list(&contract.artifacts)
+        || !bounded_contract_field_list(&contract.verification)
         || !contract.projection_state.is_object()
         || (!contract.fact_set_digest.is_empty() && !bounded_metadata(&contract.fact_set_digest))
         || (contract.evidence_truncated
