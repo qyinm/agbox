@@ -22,8 +22,8 @@ use crate::{
 };
 
 use super::state::{
-    CallLink, CodexStateV1, HistoryMode, PendingResult, StagedArtifact, StagedContent,
-    bounded_identifier,
+    CallLink, CodexStateV1, Continuation, HistoryMode, PendingResult, StagedArtifact,
+    StagedContent, bounded_identifier,
 };
 
 const DECODER_VERSION: &str = "codex-rollout-1";
@@ -101,6 +101,12 @@ impl SourceAdapter for CodexAdapter {
         prior_state: &DecoderState,
     ) -> Result<DecodedRecord, DecodeError> {
         validate_context(context)?;
+        let prior_codex_state = CodexStateV1::decode(prior_state)?;
+        if prior_codex_state.continuation().is_some() {
+            return Err(DecodeError::Malformed(
+                "codex-continuation-required".to_owned(),
+            ));
+        }
         let (top_type_capture, schema_fingerprint) =
             capture_single_string(record, &["type"], MAX_ID_BYTES, false)?;
         let top_type = top_type_capture
@@ -119,10 +125,25 @@ impl SourceAdapter for CodexAdapter {
                 );
             }
         };
+        let declared_mode = match declared_history_mode(record, &top_type) {
+            Ok(value) => value,
+            Err(error) => {
+                return malformed_envelope(
+                    record,
+                    context,
+                    prior_state,
+                    &top_type,
+                    &schema_fingerprint,
+                    error,
+                );
+            }
+        };
         let session_id = session_id(context);
         let source = make_source(record, context, &session_id, &top_type, ordinal)?;
-        let mut progression_state = CodexStateV1::decode(prior_state)?;
-        if let Err(error) = progress_envelope(&top_type, ordinal, &mut progression_state) {
+        let mut progression_state = prior_codex_state;
+        if let Err(error) =
+            progress_envelope(&top_type, ordinal, declared_mode, &mut progression_state)
+        {
             let observation = make_observation(
                 record,
                 context,
@@ -202,9 +223,12 @@ impl SourceAdapter for CodexAdapter {
         let mut state = progression_state;
         let mut output = Output::default();
         let mut retained = RetainedBudget::default();
+        let mut terminal_timestamp = None;
+        let terminal_boundary = is_terminal_boundary(&top_type, nested_type.as_deref());
         let result = (|| {
-            observe_known_history_mode(record, &mut state)?;
+            observe_known_history_mode(record, &top_type, declared_mode, &mut state)?;
             let timestamp = capture_timestamp(record)?.unwrap_or(context.observed_at);
+            terminal_timestamp = Some(timestamp);
             let mut scope = Scope {
                 context,
                 source: &source,
@@ -240,6 +264,19 @@ impl SourceAdapter for CodexAdapter {
 
         match result {
             Ok(()) => {
+                if terminal_boundary && state.pending_result_count() > 0 {
+                    let timestamp = terminal_timestamp.unwrap_or(context.observed_at);
+                    state.set_continuation(Some(Continuation(
+                        record.record_hash().to_owned(),
+                        record.start(),
+                        record.end(),
+                        top_type.clone(),
+                        ordinal,
+                        schema_fingerprint.clone(),
+                        timestamp.unix_timestamp_nanos().to_string(),
+                        output.next_event_ordinal,
+                    )));
+                }
                 let observation = make_observation(
                     record,
                     context,
@@ -290,6 +327,52 @@ impl SourceAdapter for CodexAdapter {
             }
         }
     }
+
+    fn decode_continuation(
+        &self,
+        context: &DecodeContext,
+        prior_state: &DecoderState,
+    ) -> Result<Option<DecodedRecord>, DecodeError> {
+        validate_context(context)?;
+        let mut state = CodexStateV1::decode(prior_state)?;
+        let Some(marker) = state.continuation().cloned() else {
+            return Ok(None);
+        };
+        let occurred_at = marker
+            .6
+            .parse::<i128>()
+            .ok()
+            .and_then(|value| OffsetDateTime::from_unix_timestamp_nanos(value).ok())
+            .ok_or_else(|| DecodeError::Malformed("invalid-codex-continuation-time".to_owned()))?;
+        let session_id = session_id(context);
+        let source = make_continuation_source(context, &session_id, &marker)?;
+        let page_start = marker.7;
+        let mut output = Output::continuing_at(page_start);
+        let scope = Scope {
+            context,
+            source: &source,
+            session_id: &session_id,
+            occurred_at,
+        };
+        reconcile_pending_results(scope, &mut state, &mut output, 0)?;
+        if state.pending_result_count() == 0 {
+            state.set_continuation(None);
+        } else {
+            let mut next_marker = marker.clone();
+            next_marker.7 = output.next_event_ordinal;
+            state.set_continuation(Some(next_marker));
+        }
+        let observation = make_continuation_observation(context, source, &marker, page_start)?;
+        let next_state = state.encode_bounded()?;
+        Ok(Some(record_with(
+            observation,
+            DecodeDisposition::Known,
+            output.events,
+            output.evidence,
+            next_state,
+            prior_state,
+        )))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -309,6 +392,13 @@ struct Output {
 }
 
 impl Output {
+    fn continuing_at(next_event_ordinal: u32) -> Self {
+        Self {
+            next_event_ordinal,
+            ..Self::default()
+        }
+    }
+
     fn push_event(&mut self, event: ActivityEventV1) -> Result<(), DecodeError> {
         if self.events.len() >= MAX_EVENTS_PER_RECORD {
             return Err(DecodeError::OutputTooLarge);
@@ -588,11 +678,7 @@ fn decode_action_request(
     else {
         return Ok(());
     };
-    let result_key =
-        SemanticKey::from_native(Provider::Codex, scope.session_id, "codex.call", &call_id);
-    if state.completed_rank(result_key.as_str()).is_some()
-        || state.pending_result(&call_id).is_some()
-    {
+    if state.completed_rank(&call_id).is_some() || state.pending_result(&call_id).is_some() {
         return Ok(());
     }
     let tool_name = match item_type {
@@ -626,7 +712,6 @@ fn decode_action_request(
     let input = capture_first_value(record, input_paths, retained.remaining())?
         .unwrap_or(capture_derived(b"{}")?);
     retained.charge(&input)?;
-    let input_hash = input.hash.clone();
     let event_id = output.event_id(scope)?;
     let content = make_content_with_event(
         scope,
@@ -663,13 +748,14 @@ fn decode_action_request(
         &["payload", "path"],
         scope.context.project_root.as_deref(),
     )?;
-    state.insert_call(CallLink {
+    let fallback_artifact = project_relative_path
+        .filter(|_| is_patch_tool(&tool_name))
+        .map(|path| staged_artifact_for_path(&path, "update"));
+    state.insert_call(CallLink(
         call_id,
-        request_event_id: event_id.as_str().to_owned(),
-        tool_name,
-        input_hash,
-        project_relative_path,
-    })
+        event_id.as_str().to_owned(),
+        fallback_artifact,
+    ))
 }
 
 fn decode_event_message(
@@ -803,7 +889,7 @@ fn decode_ranked_result(
     }
     let semantic_key =
         SemanticKey::from_native(Provider::Codex, scope.session_id, "codex.call", &call_id);
-    if state.completed_rank(semantic_key.as_str()).is_some() {
+    if state.completed_rank(&call_id).is_some() {
         return Ok(());
     }
     let link = state.call(&call_id).cloned();
@@ -827,15 +913,13 @@ fn decode_ranked_result(
     }
     let request_event_id = pending
         .as_ref()
-        .map(|candidate| candidate.request_event_id.clone())
-        .or_else(|| {
-            link.as_ref()
-                .map(|candidate| candidate.request_event_id.clone())
-        });
+        .map(|candidate| candidate.1.clone())
+        .or_else(|| link.as_ref().map(|candidate| candidate.1.clone()));
     let Some(request_event_id) = request_event_id else {
         return Ok(());
     };
-    let artifact_values = result_artifacts(outcome, artifacts, link.as_ref());
+    let artifact_values = result_artifacts(outcome, artifacts);
+    let fallback_artifact = result_fallback_artifact(outcome, &artifact_values, link.as_ref());
 
     if rank < 3 {
         let _ = state.take_call(&call_id);
@@ -847,12 +931,13 @@ fn decode_ranked_result(
             outcome,
             result_capture.as_ref(),
             &artifact_values,
+            fallback_artifact.as_ref(),
         );
     }
 
     let _ = state.take_pending_result(&call_id);
     let _ = state.take_call(&call_id);
-    let should_emit = state.observe_result(semantic_key.as_str().to_owned(), rank)?;
+    let should_emit = state.observe_result(call_id.clone(), rank)?;
     if !should_emit {
         return Ok(());
     }
@@ -886,10 +971,15 @@ fn decode_ranked_result(
         PrivacyLabel::SyncEligible,
     )?;
     output.push_event(event)?;
-    for (path, operation) in artifact_values {
+    for (path, operation) in &artifact_values {
         emit_artifact(
-            scope, output, retained, &call_id, &event_id, &path, &operation,
+            scope, output, retained, &call_id, &event_id, path, operation,
         )?;
+    }
+    if artifact_values.is_empty()
+        && let Some(StagedArtifact(hash, bytes, operation)) = fallback_artifact
+    {
+        emit_staged_artifact(scope, output, &call_id, &event_id, &hash, bytes, operation)?;
     }
     Ok(())
 }
@@ -897,19 +987,21 @@ fn decode_ranked_result(
 fn result_artifacts(
     outcome: ActionOutcome,
     artifacts: Option<Vec<(String, String)>>,
-    link: Option<&CallLink>,
 ) -> Vec<(String, String)> {
     if outcome != ActionOutcome::Succeeded {
         return Vec::new();
     }
-    let mut artifacts = artifacts.unwrap_or_default();
-    if artifacts.is_empty()
-        && link.is_some_and(|value| is_patch_tool(&value.tool_name))
-        && let Some(path) = link.and_then(|value| value.project_relative_path.clone())
-    {
-        artifacts.push((path, "update".to_owned()));
-    }
-    artifacts
+    artifacts.unwrap_or_default()
+}
+
+fn result_fallback_artifact(
+    outcome: ActionOutcome,
+    artifacts: &[(String, String)],
+    link: Option<&CallLink>,
+) -> Option<StagedArtifact> {
+    (outcome == ActionOutcome::Succeeded && artifacts.is_empty())
+        .then(|| link.and_then(|value| value.2.clone()))
+        .flatten()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -921,22 +1013,33 @@ fn stage_ranked_result(
     outcome: ActionOutcome,
     result: Option<&SecureCapturedString>,
     artifacts: &[(String, String)],
+    fallback_artifact: Option<&StagedArtifact>,
 ) -> Result<(), DecodeError> {
-    let artifact = artifacts.first().map(|(path, operation)| {
-        StagedArtifact(
-            blake3::hash(path.as_bytes()).to_hex().to_string(),
-            u64::try_from(path.len()).unwrap_or(u64::MAX),
-            canonical_operation(operation),
-        )
-    });
-    state.stage_result(PendingResult {
+    let artifact = artifacts
+        .first()
+        .map(|(path, operation)| staged_artifact_for_path(path, operation))
+        .or_else(|| fallback_artifact.cloned());
+    let output = result
+        .map(|capture| {
+            compact_blake3_hex(&capture.hash).map(|hash| StagedContent(hash, capture.total_bytes))
+        })
+        .transpose()?;
+    state.stage_result(PendingResult(
         call_id,
         request_event_id,
         rank,
-        outcome: outcome.into(),
-        output: result.map(|capture| StagedContent(capture.hash.clone(), capture.total_bytes)),
+        outcome.into(),
+        output,
         artifact,
-    })
+    ))
+}
+
+fn staged_artifact_for_path(path: &str, operation: &str) -> StagedArtifact {
+    StagedArtifact(
+        encode_base64_url(blake3::hash(path.as_bytes()).as_bytes()),
+        u64::try_from(path.len()).unwrap_or(u64::MAX),
+        canonical_operation(operation),
+    )
 }
 
 fn reconcile_pending_results(
@@ -945,29 +1048,30 @@ fn reconcile_pending_results(
     output: &mut Output,
     reserved_events: usize,
 ) -> Result<(), DecodeError> {
-    let available = MAX_EVENTS_PER_RECORD
-        .saturating_sub(output.events.len())
-        .saturating_sub(reserved_events);
-    let to_flush = available.min(state.pending_result_count());
-    for _ in 0..to_flush {
-        if output.events.len() + reserved_events >= MAX_EVENTS_PER_RECORD {
+    while let Some(pending) = state.peek_pending_result() {
+        let required_slots = 1 + usize::from(pending.5.is_some());
+        if output
+            .events
+            .len()
+            .saturating_add(reserved_events)
+            .saturating_add(required_slots)
+            > MAX_EVENTS_PER_RECORD
+        {
             break;
         }
         let Some(pending) = state.pop_pending_result() else {
             break;
         };
-        let semantic_key = SemanticKey::from_native(
-            Provider::Codex,
-            scope.session_id,
-            "codex.call",
-            &pending.call_id,
-        );
-        if !state.observe_result(semantic_key.as_str().to_owned(), pending.rank)? {
+        let PendingResult(call_id, request_event_id, rank, outcome, staged_output, artifact) =
+            pending;
+        let semantic_key =
+            SemanticKey::from_native(Provider::Codex, scope.session_id, "codex.call", &call_id);
+        if !state.observe_result(call_id.clone(), rank)? {
             continue;
         }
         let event_id = output.event_id(scope)?;
         let output_ref = staged_content(
-            pending.output.as_ref(),
+            staged_output.as_ref(),
             DisclosureClass::ToolResult,
             "text/plain",
         )?;
@@ -975,30 +1079,19 @@ fn reconcile_pending_results(
             scope,
             event_id.clone(),
             Actor::Tool,
-            Some(pending.call_id.clone()),
-            Some(pending.request_event_id),
+            Some(call_id.clone()),
+            Some(request_event_id),
             semantic_key,
             EventPayload::ActionFinished {
-                native_action_id: pending.call_id.clone(),
-                outcome: pending.outcome.into(),
+                native_action_id: call_id.clone(),
+                outcome: outcome.into(),
                 output: output_ref,
             },
             PrivacyLabel::SyncEligible,
         )?;
         output.push_event(event)?;
-        if let Some(StagedArtifact(hash, bytes, operation)) = pending.artifact {
-            if output.events.len() + reserved_events >= MAX_EVENTS_PER_RECORD {
-                continue;
-            }
-            emit_staged_artifact(
-                scope,
-                output,
-                &pending.call_id,
-                &event_id,
-                hash,
-                bytes,
-                operation,
-            )?;
+        if let Some(StagedArtifact(hash, bytes, operation)) = artifact {
+            emit_staged_artifact(scope, output, &call_id, &event_id, &hash, bytes, operation)?;
         }
     }
     Ok(())
@@ -1010,11 +1103,16 @@ fn staged_content(
     media_type: &'static str,
 ) -> Result<Option<ContentRef>, DecodeError> {
     match staged {
-        Some(StagedContent(hash, bytes)) => {
-            ContentRef::bounded(hash.clone(), *bytes, media_type, None, disclosure, None)
-                .map(Some)
-                .map_err(|_| DecodeError::Malformed("invalid-codex-staged-content".to_owned()))
-        }
+        Some(StagedContent(hash, bytes)) => ContentRef::bounded(
+            expand_blake3_hash(hash)?,
+            *bytes,
+            media_type,
+            None,
+            disclosure,
+            None,
+        )
+        .map(Some)
+        .map_err(|_| DecodeError::Malformed("invalid-codex-staged-content".to_owned())),
         None => Ok(None),
     }
 }
@@ -1025,13 +1123,13 @@ fn emit_staged_artifact(
     output: &mut Output,
     call_id: &str,
     parent_id: &EventId,
-    path_hash: String,
+    path_hash: &str,
     path_bytes: u64,
     operation: String,
 ) -> Result<(), DecodeError> {
     let event_id = output.event_id(scope)?;
     let path = ContentRef::bounded(
-        path_hash,
+        expand_blake3_hash(path_hash)?,
         path_bytes,
         "text/uri-list",
         None,
@@ -1343,9 +1441,10 @@ fn make_content_with_event(
 fn progress_envelope(
     top_type: &str,
     ordinal: Option<u64>,
+    declared_mode: HistoryMode,
     state: &mut CodexStateV1,
 ) -> Result<(), DecodeError> {
-    let observed = if ordinal.is_some() {
+    let observed = if declared_mode == HistoryMode::Paginated || ordinal.is_some() {
         HistoryMode::Paginated
     } else if top_type == "session_meta" {
         HistoryMode::Legacy
@@ -1358,8 +1457,14 @@ fn progress_envelope(
 
 fn observe_known_history_mode(
     record: &dyn RecordSource,
+    top_type: &str,
+    declared_mode: HistoryMode,
     state: &mut CodexStateV1,
 ) -> Result<(), DecodeError> {
+    if top_type == "session_meta" {
+        state.observe_history_mode(declared_mode);
+        return Ok(());
+    }
     let explicit = capture_optional_plain(record, &["payload", "history_mode"], MAX_ID_BYTES)?;
     let observed = match explicit.as_deref() {
         Some("paginated") => HistoryMode::Paginated,
@@ -1368,6 +1473,21 @@ fn observe_known_history_mode(
     };
     state.observe_history_mode(observed);
     Ok(())
+}
+
+fn declared_history_mode(
+    record: &dyn RecordSource,
+    top_type: &str,
+) -> Result<HistoryMode, DecodeError> {
+    if top_type != "session_meta" {
+        return Ok(HistoryMode::Unknown);
+    }
+    let explicit = capture_optional_plain(record, &["payload", "history_mode"], MAX_ID_BYTES)?;
+    Ok(match explicit.as_deref() {
+        Some("paginated") => HistoryMode::Paginated,
+        Some("legacy") => HistoryMode::Legacy,
+        Some(_) | None => HistoryMode::Unknown,
+    })
 }
 
 fn capture_timestamp(record: &dyn RecordSource) -> Result<Option<OffsetDateTime>, DecodeError> {
@@ -1544,18 +1664,15 @@ fn capture_optional_digest_identifier(
     if value.total_bytes == 0 {
         return Ok(None);
     }
+    if domain == "call" {
+        return Ok(Some(opaque_call_id(value.total_bytes, &value.hash)));
+    }
     let raw = (!value.truncated && value.total_bytes <= limit as u64)
         .then(|| String::from_utf8(value.take_bytes()).ok())
         .flatten();
     Ok(Some(
         raw.filter(|text| safe_native_id(text, domain))
-            .unwrap_or_else(|| {
-                if domain == "call" {
-                    opaque_call_id(value.total_bytes, &value.hash)
-                } else {
-                    opaque_id(domain, value.total_bytes, &value.hash)
-                }
-            }),
+            .unwrap_or_else(|| opaque_id(domain, value.total_bytes, &value.hash)),
     ))
 }
 
@@ -1972,7 +2089,96 @@ fn opaque_call_id(total_bytes: u64, hash: &str) -> String {
     hasher.update(b"agbox-codex-call-identity-v1");
     hasher.update(&total_bytes.to_le_bytes());
     hasher.update(hash.as_bytes());
-    format!("codex_call_{}", &hasher.finalize().to_hex()[..32])
+    format!(
+        "codex_call_{}",
+        encode_base64_url(&hasher.finalize().as_bytes()[..16])
+    )
+}
+
+fn compact_blake3_hex(value: &str) -> Result<String, DecodeError> {
+    if value.len() != 64 {
+        return Err(DecodeError::Malformed(
+            "invalid-codex-staged-hash".to_owned(),
+        ));
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let pair = std::str::from_utf8(pair)
+            .map_err(|_| DecodeError::Malformed("invalid-codex-staged-hash".to_owned()))?;
+        bytes[index] = u8::from_str_radix(pair, 16)
+            .map_err(|_| DecodeError::Malformed("invalid-codex-staged-hash".to_owned()))?;
+    }
+    Ok(encode_base64_url(&bytes))
+}
+
+fn encode_base64_url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        output.push(char::from(ALPHABET[usize::from(first >> 2)]));
+        let second = chunk.get(1).copied().unwrap_or_default();
+        output.push(char::from(
+            ALPHABET[usize::from(((first & 0x03) << 4) | (second >> 4))],
+        ));
+        if chunk.len() > 1 {
+            let third = chunk.get(2).copied().unwrap_or_default();
+            output.push(char::from(
+                ALPHABET[usize::from(((second & 0x0f) << 2) | (third >> 6))],
+            ));
+            if chunk.len() > 2 {
+                output.push(char::from(ALPHABET[usize::from(third & 0x3f)]));
+            }
+        }
+    }
+    output
+}
+
+fn decode_base64_url(value: &str) -> Result<Vec<u8>, DecodeError> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    if value.len() % 4 == 1 {
+        return Err(DecodeError::Malformed(
+            "invalid-codex-staged-hash".to_owned(),
+        ));
+    }
+    let mut output = Vec::with_capacity(value.len() * 3 / 4);
+    let mut accumulator = 0_u16;
+    let mut bits = 0_u8;
+    for byte in value.bytes() {
+        let digit = ALPHABET
+            .iter()
+            .position(|candidate| *candidate == byte)
+            .ok_or_else(|| DecodeError::Malformed("invalid-codex-staged-hash".to_owned()))?;
+        accumulator = (accumulator << 6) | u16::try_from(digit).unwrap_or_default();
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push(u8::try_from(accumulator >> bits).unwrap_or_default());
+            accumulator &= (1_u16 << bits) - 1;
+        }
+    }
+    if accumulator != 0 {
+        return Err(DecodeError::Malformed(
+            "invalid-codex-staged-hash".to_owned(),
+        ));
+    }
+    Ok(output)
+}
+
+fn expand_blake3_hash(value: &str) -> Result<String, DecodeError> {
+    let bytes = decode_base64_url(value)?;
+    if bytes.len() != 32 {
+        return Err(DecodeError::Malformed(
+            "invalid-codex-staged-hash".to_owned(),
+        ));
+    }
+    let mut output = String::with_capacity(64);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(output, "{byte:02x}")
+            .map_err(|_| DecodeError::Malformed("invalid-codex-staged-hash".to_owned()))?;
+    }
+    Ok(output)
 }
 
 fn source_identity(scope: Scope<'_>) -> SourceIdentity {
@@ -2005,6 +2211,75 @@ fn make_source(
         decoder_version: DECODER_VERSION.to_owned(),
     })
     .map_err(|_| DecodeError::Malformed("invalid-codex-source".to_owned()))
+}
+
+fn make_continuation_source(
+    context: &DecodeContext,
+    session_id: &str,
+    marker: &Continuation,
+) -> Result<SourceRef, DecodeError> {
+    SourceRef::new(SourceRefDraft {
+        provider: Provider::Codex,
+        format: DECODER_VERSION.to_owned(),
+        native_session_id: session_id.to_owned(),
+        native_record_type: marker.3.clone(),
+        native_record_id: marker.4.map(|value| format!("codex_record_{value}")),
+        source_generation: context.source_generation,
+        byte_offset: marker.1,
+        ordinal: marker.4,
+        record_hash: marker.0.clone(),
+        decoder_version: DECODER_VERSION.to_owned(),
+    })
+    .map_err(|_| DecodeError::Malformed("invalid-codex-continuation-source".to_owned()))
+}
+
+fn make_continuation_observation(
+    context: &DecodeContext,
+    source: SourceRef,
+    marker: &Continuation,
+    page_start: u32,
+) -> Result<SourceObservation, DecodeError> {
+    let range = ByteRange::new(marker.1, marker.2)
+        .map_err(|_| DecodeError::Malformed("invalid-codex-continuation-range".to_owned()))?;
+    let bounded_record = ContentRef::bounded(
+        marker.0.clone(),
+        marker.2.saturating_sub(marker.1),
+        "application/x-ndjson",
+        Some(LocalLocator::SourceRange {
+            source_id: source_id(context),
+            generation: context.source_generation,
+            byte_start: marker.1,
+            byte_end: marker.2,
+        }),
+        DisclosureClass::ObservedState,
+        None,
+    )
+    .map_err(|_| DecodeError::Malformed("invalid-codex-continuation-content".to_owned()))?;
+    let observation_id = format!(
+        "obs_{}",
+        &blake3::hash(
+            format!(
+                "{}:{}:{}:{}:{}",
+                source_id(context),
+                context.source_generation,
+                marker.1,
+                marker.0,
+                page_start
+            )
+            .as_bytes()
+        )
+        .to_hex()[..24]
+    );
+    SourceObservation::new(SourceObservationDraft {
+        observation_id,
+        source,
+        range,
+        observed_at: context.observed_at,
+        status: DecodeStatus::Known,
+        bounded_record: Some(bounded_record),
+        schema_fingerprint: marker.5.clone(),
+    })
+    .map_err(|_| DecodeError::Malformed("invalid-codex-continuation-observation".to_owned()))
 }
 
 fn make_observation(
@@ -2208,6 +2483,18 @@ fn known_nested_type(top_type: &str, value: &str) -> bool {
         ),
         _ => false,
     }
+}
+
+fn is_terminal_boundary(top_type: &str, nested_type: Option<&str>) -> bool {
+    top_type == "compacted"
+        || matches!(
+            (top_type, nested_type),
+            ("response_item", Some("compaction"))
+                | (
+                    "event_msg",
+                    Some("task_started" | "task_complete" | "turn_aborted" | "context_compacted")
+                )
+        )
 }
 
 fn terminal_status(status: Option<&str>) -> bool {

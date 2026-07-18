@@ -526,6 +526,25 @@ pub trait SourceAdapter: Send + Sync {
         context: &DecodeContext,
         state: &DecoderState,
     ) -> Result<DecodedRecord, DecodeError>;
+
+    /// Emits a bounded continuation previously staged by [`Self::decode`].
+    ///
+    /// Callers must poll this method with each returned state until it returns
+    /// `None` before decoding another source record. Implementations must derive
+    /// continuations only from verified bounded state and must not reopen
+    /// mutable source bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] when persisted continuation state is invalid or
+    /// cannot produce a complete bounded normalized result.
+    fn decode_continuation(
+        &self,
+        _context: &DecodeContext,
+        _state: &DecoderState,
+    ) -> Result<Option<DecodedRecord>, DecodeError> {
+        Ok(None)
+    }
 }
 
 #[must_use]

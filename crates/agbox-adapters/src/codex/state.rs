@@ -2,7 +2,6 @@ use std::{
     collections::VecDeque,
     fmt,
     io::{self, Write},
-    path::{Component, Path},
 };
 
 use serde::{Deserialize, Serialize};
@@ -13,12 +12,13 @@ use crate::{DecodeError, DecoderState, MAX_DECODER_STATE_BYTES};
 
 const MAX_CALLS: usize = 128;
 const MAX_COMPLETED_KEYS: usize = 128;
-const MAX_CALL_ID_BYTES: usize = 128;
+const MAX_CALL_ID_BYTES: usize = 48;
 const MAX_EVENT_ID_BYTES: usize = 128;
-const MAX_TOOL_NAME_BYTES: usize = 64;
-const MAX_HASH_BYTES: usize = 128;
-const MAX_PROJECT_PATH_BYTES: usize = 512;
-const MAX_RANKED_KEY_BYTES: usize = 128;
+const MAX_COMPACT_HASH_BYTES: usize = 43;
+const MAX_RECORD_HASH_BYTES: usize = 128;
+const MAX_OPERATION_BYTES: usize = 8;
+const MAX_NATIVE_TYPE_BYTES: usize = 128;
+const MAX_SCHEMA_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +37,7 @@ pub(super) struct CodexStateV1 {
     pending_results: VecDeque<PendingResult>,
     completed_semantic_keys: VecDeque<RankedKey>,
     last_ordinal: Option<u64>,
+    continuation: Option<Continuation>,
 }
 
 impl fmt::Debug for CodexStateV1 {
@@ -48,35 +49,20 @@ impl fmt::Debug for CodexStateV1 {
             .field("pending_result_count", &self.pending_results.len())
             .field("completed_key_count", &self.completed_semantic_keys.len())
             .field("has_last_ordinal", &self.last_ordinal.is_some())
+            .field("has_continuation", &self.continuation.is_some())
             .finish()
     }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-pub(super) struct PendingResult {
-    #[serde(alias = "call_id", rename = "c")]
-    pub call_id: String,
-    #[serde(alias = "request_event_id", rename = "e")]
-    pub request_event_id: String,
-    #[serde(alias = "rank", rename = "r")]
-    pub rank: u8,
-    #[serde(alias = "outcome", rename = "o")]
-    pub outcome: PendingOutcome,
-    #[serde(
-        alias = "output",
-        default,
-        rename = "v",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub output: Option<StagedContent>,
-    #[serde(
-        alias = "artifact",
-        default,
-        rename = "z",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub artifact: Option<StagedArtifact>,
-}
+pub(super) struct PendingResult(
+    pub String,
+    pub String,
+    pub u8,
+    pub PendingOutcome,
+    pub Option<StagedContent>,
+    pub Option<StagedArtifact>,
+);
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(super) struct StagedContent(pub String, pub u64);
@@ -100,54 +86,42 @@ impl fmt::Debug for PendingResult {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PendingResult")
-            .field("request_event_id", &self.request_event_id)
-            .field("rank", &self.rank)
-            .field("outcome", &self.outcome)
-            .field("has_output", &self.output.is_some())
-            .field("has_artifact", &self.artifact.is_some())
+            .field("request_event_id", &self.1)
+            .field("rank", &self.2)
+            .field("outcome", &self.3)
+            .field("has_output", &self.4.is_some())
+            .field("has_artifact", &self.5.is_some())
             .finish_non_exhaustive()
     }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-pub(super) struct CallLink {
-    #[serde(alias = "call_id", rename = "c")]
-    pub call_id: String,
-    #[serde(alias = "request_event_id", rename = "e")]
-    pub request_event_id: String,
-    #[serde(alias = "tool_name", rename = "t")]
-    pub tool_name: String,
-    #[serde(alias = "input_hash", rename = "h")]
-    pub input_hash: String,
-    #[serde(
-        alias = "project_relative_path",
-        default,
-        rename = "p",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub project_relative_path: Option<String>,
-}
+pub(super) struct CallLink(pub String, pub String, pub Option<StagedArtifact>);
 
 impl fmt::Debug for CallLink {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CallLink")
-            .field("request_event_id", &self.request_event_id)
-            .field("tool_name_bytes", &self.tool_name.len())
-            .field("input_hash", &self.input_hash)
-            .field(
-                "has_project_relative_path",
-                &self.project_relative_path.is_some(),
-            )
+            .field("request_event_id", &self.1)
+            .field("has_fallback_artifact", &self.2.is_some())
             .finish_non_exhaustive()
     }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-struct RankedKey {
-    key: String,
-    rank: u8,
-}
+struct RankedKey(String, u8);
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(super) struct Continuation(
+    pub String,
+    pub u64,
+    pub u64,
+    pub String,
+    pub Option<u64>,
+    pub String,
+    pub String,
+    pub u32,
+);
 
 impl CodexStateV1 {
     pub fn decode(state: &DecoderState) -> Result<Self, DecodeError> {
@@ -200,11 +174,13 @@ impl CodexStateV1 {
     pub fn insert_call(&mut self, link: CallLink) -> Result<(), DecodeError> {
         link.validate()?;
         self.unresolved_calls
-            .retain(|candidate| candidate.call_id != link.call_id);
+            .retain(|candidate| candidate.0 != link.0);
         self.pending_results
-            .retain(|candidate| candidate.call_id != link.call_id);
+            .retain(|candidate| candidate.0 != link.0);
+        if self.unresolved_calls.len() + self.pending_results.len() >= MAX_CALLS {
+            return Err(DecodeError::StateTooLarge);
+        }
         self.unresolved_calls.push_back(link);
-        self.fit_call_count();
         self.fit_serialized_bound()
     }
 
@@ -212,27 +188,27 @@ impl CodexStateV1 {
         let index = self
             .unresolved_calls
             .iter()
-            .position(|candidate| candidate.call_id == call_id)?;
+            .position(|candidate| candidate.0 == call_id)?;
         self.unresolved_calls.remove(index)
     }
 
     pub fn call(&self, call_id: &str) -> Option<&CallLink> {
         self.unresolved_calls
             .iter()
-            .find(|candidate| candidate.call_id == call_id)
+            .find(|candidate| candidate.0 == call_id)
     }
 
     pub fn pending_result(&self, call_id: &str) -> Option<&PendingResult> {
         self.pending_results
             .iter()
-            .find(|candidate| candidate.call_id == call_id)
+            .find(|candidate| candidate.0 == call_id)
     }
 
     pub fn take_pending_result(&mut self, call_id: &str) -> Option<PendingResult> {
         let index = self
             .pending_results
             .iter()
-            .position(|candidate| candidate.call_id == call_id)?;
+            .position(|candidate| candidate.0 == call_id)?;
         self.pending_results.remove(index)
     }
 
@@ -241,16 +217,22 @@ impl CodexStateV1 {
         if let Some(existing) = self
             .pending_results
             .iter_mut()
-            .find(|existing| existing.call_id == candidate.call_id)
+            .find(|existing| existing.0 == candidate.0)
         {
-            if candidate.rank > existing.rank {
+            if candidate.2 > existing.2 {
                 *existing = candidate;
             }
             return self.fit_serialized_bound();
         }
+        if self.unresolved_calls.len() + self.pending_results.len() >= MAX_CALLS {
+            return Err(DecodeError::StateTooLarge);
+        }
         self.pending_results.push_back(candidate);
-        self.fit_call_count();
         self.fit_serialized_bound()
+    }
+
+    pub fn peek_pending_result(&self) -> Option<&PendingResult> {
+        self.pending_results.front()
     }
 
     pub fn pop_pending_result(&mut self) -> Option<PendingResult> {
@@ -264,14 +246,14 @@ impl CodexStateV1 {
     pub fn completed_rank(&self, key: &str) -> Option<u8> {
         self.completed_semantic_keys
             .iter()
-            .find(|candidate| candidate.key == key)
-            .map(|candidate| candidate.rank)
+            .find(|candidate| candidate.0 == key)
+            .map(|candidate| candidate.1)
     }
 
     /// Records the strongest observation and returns whether this semantic key
     /// has never emitted a result inside the reconciliation window.
     pub fn observe_result(&mut self, key: String, rank: u8) -> Result<bool, DecodeError> {
-        if rank == 0 || !bounded_identifier(&key, MAX_RANKED_KEY_BYTES) {
+        if rank == 0 || !bounded_identifier(&key, MAX_CALL_ID_BYTES) {
             return Err(DecodeError::Malformed(
                 "invalid-codex-result-key".to_owned(),
             ));
@@ -279,19 +261,26 @@ impl CodexStateV1 {
         if let Some(existing) = self
             .completed_semantic_keys
             .iter_mut()
-            .find(|candidate| candidate.key == key)
+            .find(|candidate| candidate.0 == key)
         {
-            existing.rank = existing.rank.max(rank);
+            existing.1 = existing.1.max(rank);
             self.fit_serialized_bound()?;
             return Ok(false);
         }
-        self.completed_semantic_keys
-            .push_back(RankedKey { key, rank });
+        self.completed_semantic_keys.push_back(RankedKey(key, rank));
         while self.completed_semantic_keys.len() > MAX_COMPLETED_KEYS {
             let _ = self.completed_semantic_keys.pop_front();
         }
         self.fit_serialized_bound()?;
         Ok(true)
+    }
+
+    pub fn continuation(&self) -> Option<&Continuation> {
+        self.continuation.as_ref()
+    }
+
+    pub fn set_continuation(&mut self, continuation: Option<Continuation>) {
+        self.continuation = continuation;
     }
 
     pub fn encode_bounded(mut self) -> Result<DecoderState, DecodeError> {
@@ -322,12 +311,14 @@ impl CodexStateV1 {
             pending.validate()?;
         }
         if self.completed_semantic_keys.iter().any(|candidate| {
-            !bounded_identifier(&candidate.key, MAX_RANKED_KEY_BYTES)
-                || !(1..=3).contains(&candidate.rank)
+            !bounded_identifier(&candidate.0, MAX_CALL_ID_BYTES) || !(1..=3).contains(&candidate.1)
         }) {
             return Err(DecodeError::Malformed(
                 "invalid-codex-ranked-key".to_owned(),
             ));
+        }
+        if let Some(continuation) = &self.continuation {
+            continuation.validate()?;
         }
         Ok(())
     }
@@ -337,42 +328,17 @@ impl CodexStateV1 {
             if self.completed_semantic_keys.pop_front().is_some() {
                 continue;
             }
-            if let Some(link) = self
-                .unresolved_calls
-                .iter_mut()
-                .find(|link| link.project_relative_path.is_some())
-            {
-                link.project_relative_path = None;
-                continue;
-            }
-            if self.unresolved_calls.pop_front().is_none()
-                && self.pending_results.pop_front().is_none()
-            {
-                return Err(DecodeError::StateTooLarge);
-            }
+            return Err(DecodeError::StateTooLarge);
         }
         Ok(())
-    }
-
-    fn fit_call_count(&mut self) {
-        while self.unresolved_calls.len() + self.pending_results.len() > MAX_CALLS {
-            if self.unresolved_calls.pop_front().is_none() {
-                let _ = self.pending_results.pop_front();
-            }
-        }
     }
 }
 
 impl CallLink {
     fn validate(&self) -> Result<(), DecodeError> {
-        let valid = bounded_identifier(&self.call_id, MAX_CALL_ID_BYTES)
-            && bounded_identifier(&self.request_event_id, MAX_EVENT_ID_BYTES)
-            && bounded_identifier(&self.tool_name, MAX_TOOL_NAME_BYTES)
-            && bounded_identifier(&self.input_hash, MAX_HASH_BYTES)
-            && self
-                .project_relative_path
-                .as_ref()
-                .is_none_or(|path| valid_project_path(path));
+        let valid = bounded_identifier(&self.0, MAX_CALL_ID_BYTES)
+            && bounded_identifier(&self.1, MAX_EVENT_ID_BYTES)
+            && self.2.as_ref().is_none_or(valid_artifact);
         if valid {
             Ok(())
         } else {
@@ -383,22 +349,42 @@ impl CallLink {
 
 impl PendingResult {
     fn validate(&self) -> Result<(), DecodeError> {
-        let valid = bounded_identifier(&self.call_id, MAX_CALL_ID_BYTES)
-            && bounded_identifier(&self.request_event_id, MAX_EVENT_ID_BYTES)
-            && (1..=2).contains(&self.rank)
+        let valid = bounded_identifier(&self.0, MAX_CALL_ID_BYTES)
+            && bounded_identifier(&self.1, MAX_EVENT_ID_BYTES)
+            && (1..=2).contains(&self.2)
             && self
-                .output
+                .4
                 .as_ref()
-                .is_none_or(|output| bounded_identifier(&output.0, MAX_HASH_BYTES))
-            && self.artifact.as_ref().is_none_or(|artifact| {
-                bounded_identifier(&artifact.0, MAX_HASH_BYTES)
-                    && bounded_identifier(&artifact.2, MAX_TOOL_NAME_BYTES)
-            });
+                .is_none_or(|output| bounded_identifier(&output.0, MAX_COMPACT_HASH_BYTES))
+            && self.5.as_ref().is_none_or(valid_artifact);
         if valid {
             Ok(())
         } else {
             Err(DecodeError::Malformed(
                 "invalid-codex-pending-result".to_owned(),
+            ))
+        }
+    }
+}
+
+fn valid_artifact(artifact: &StagedArtifact) -> bool {
+    bounded_identifier(&artifact.0, MAX_COMPACT_HASH_BYTES)
+        && bounded_identifier(&artifact.2, MAX_OPERATION_BYTES)
+}
+
+impl Continuation {
+    fn validate(&self) -> Result<(), DecodeError> {
+        let valid = bounded_identifier(&self.0, MAX_RECORD_HASH_BYTES)
+            && self.1 <= self.2
+            && bounded_identifier(&self.3, MAX_NATIVE_TYPE_BYTES)
+            && bounded_identifier(&self.5, MAX_SCHEMA_BYTES)
+            && !self.6.is_empty()
+            && self.6.len() <= MAX_EVENT_ID_BYTES;
+        if valid {
+            Ok(())
+        } else {
+            Err(DecodeError::Malformed(
+                "invalid-codex-continuation".to_owned(),
             ))
         }
     }
@@ -430,18 +416,6 @@ pub(super) fn bounded_identifier(value: &str, max_bytes: usize) -> bool {
     !value.is_empty()
         && value.len() <= max_bytes
         && value.bytes().all(|byte| byte.is_ascii_graphic())
-}
-
-fn valid_project_path(value: &str) -> bool {
-    let Some(relative) = value.strip_prefix("$PROJECT/") else {
-        return false;
-    };
-    !relative.is_empty()
-        && value.len() <= MAX_PROJECT_PATH_BYTES
-        && !relative.chars().any(char::is_control)
-        && Path::new(relative)
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 fn serialized_len<T: Serialize>(value: &T) -> Result<usize, DecodeError> {

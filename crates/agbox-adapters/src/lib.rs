@@ -96,6 +96,10 @@ pub mod test_support {
             let decoded = adapter.decode(&source, &context, &state)?;
             state = decoded.next_state().clone();
             records.push(decoded);
+            while let Some(decoded) = adapter.decode_continuation(&context, &state)? {
+                state = decoded.next_state().clone();
+                records.push(decoded);
+            }
         }
         Ok(records)
     }

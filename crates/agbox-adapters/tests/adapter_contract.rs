@@ -3,17 +3,37 @@
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
 use agbox_adapters::{
-    BoundedJsonReader, DecodeDisposition, DecodeError, DecodedEvidence, DecodedRecord,
-    DecodedRecordDraft, DecoderState, MAX_CAPTURE_BYTES, MAX_DECODER_STATE_BYTES,
-    MAX_EVENTS_PER_RECORD, MAX_RECORD_SEMANTIC_BYTES, MemoryRecordSource, RecordSource,
+    BoundedJsonReader, ClaudeAdapter, DecodeContext, DecodeDisposition, DecodeError,
+    DecodedEvidence, DecodedRecord, DecodedRecordDraft, DecoderState, MAX_CAPTURE_BYTES,
+    MAX_DECODER_STATE_BYTES, MAX_EVENTS_PER_RECORD, MAX_RECORD_SEMANTIC_BYTES, MemoryRecordSource,
+    RecordSource, SourceAdapter,
 };
 use agbox_core::{
-    ActivityEventV1, ContentRef, DisclosureClass, EvidenceId, RedactionPolicy, SourceObservation,
-    SourceObservationDraft,
+    ActivityEventV1, ContentRef, DisclosureClass, EvidenceId, ProjectId, RedactionPolicy,
+    SourceObservation, SourceObservationDraft,
 };
 use agbox_ingest::{RecordScanner, ScanOutcome};
 use proptest::prelude::*;
 use struson::reader::{JsonReader, JsonStreamReader};
+use time::OffsetDateTime;
+
+#[test]
+fn adapters_without_staged_output_default_to_no_continuation() {
+    let context = DecodeContext {
+        project_id: ProjectId::for_test("project_fixture"),
+        project_root: Some("/fixture/project".into()),
+        source_id: "source_fixture".to_owned(),
+        observed_at: OffsetDateTime::UNIX_EPOCH,
+        source_generation: 0,
+        format: "claude-transcript-2.1".to_owned(),
+    };
+    assert!(
+        ClaudeAdapter
+            .decode_continuation(&context, &DecoderState::default())
+            .unwrap()
+            .is_none()
+    );
+}
 
 #[test]
 fn unknown_top_level_type_is_preserved_as_drift() {
