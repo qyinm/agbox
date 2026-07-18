@@ -294,6 +294,21 @@ pub struct WorkContractRow {
 /// from the publication projections.  Keeping this DTO private prevents the
 /// persistence API from becoming coupled to the pure workgraph crate while
 /// still requiring the complete contract wire shape at the trust boundary.
+#[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+enum ContractFieldDto {
+    Objective,
+    Status,
+    Summary,
+    CompletedSteps,
+    NextActions,
+    Blockers,
+    Constraints,
+    CompletionCriteria,
+    Artifacts,
+    Verification,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ContractProjectionDto {
@@ -312,7 +327,7 @@ struct ContractProjectionDto {
     artifacts: Vec<String>,
     verification: Vec<String>,
     evidence_refs: Vec<EventId>,
-    field_evidence: BTreeMap<String, Vec<EventId>>,
+    field_evidence: BTreeMap<ContractFieldDto, Vec<EventId>>,
     evidence_truncated: bool,
     confidence_basis_points: u16,
     created_at: OffsetDateTime,
