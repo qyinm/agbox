@@ -554,8 +554,9 @@ fn consuming_record_parts_moves_evidence_plaintext_allocation() {
     );
 
     let parts = record.into_parts();
-    assert_eq!(parts.evidence.len(), 1);
-    assert_eq!(parts.evidence[0].plaintext.as_ptr(), pointer);
+    let (_, _, evidence, _, _, _) = parts.decompose();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].plaintext.as_ptr(), pointer);
 }
 
 #[test]

@@ -195,6 +195,7 @@ pub const fn validate_decoder_workers(workers: usize) -> Result<usize, QueueConf
 pub struct KeyedQueue {
     capacity: usize,
     pending: HashMap<SourceKey, QueueItem>,
+    in_flight: HashMap<SourceKey, QueueItem>,
     index: [VecDeque<SourceKey>; PRIORITY_COUNT],
 }
 
@@ -205,6 +206,7 @@ impl KeyedQueue {
         Self {
             capacity,
             pending: HashMap::with_capacity(capacity),
+            in_flight: HashMap::with_capacity(capacity),
             index: std::array::from_fn(|_| VecDeque::with_capacity(capacity)),
         }
     }
@@ -218,13 +220,19 @@ impl KeyedQueue {
     /// Returns the number of distinct pending source generations.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.pending.len()
+        self.pending.len() + self.in_flight.len()
     }
 
     /// Returns whether no source generation is pending.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.pending.is_empty()
+        self.pending.is_empty() && self.in_flight.is_empty()
+    }
+
+    /// Returns the number of capacity-owning source leases.
+    #[must_use]
+    pub fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
     }
 
     /// Returns the number of priority-index slots currently held.
@@ -263,7 +271,13 @@ impl KeyedQueue {
             return Ok(EnqueueOutcome::Coalesced);
         }
 
-        if self.pending.len() == self.capacity {
+        if let Some(item) = self.in_flight.get_mut(&key) {
+            item.target_offset = item.target_offset.max(target_offset);
+            item.priority = item.priority.max(priority);
+            return Ok(EnqueueOutcome::Coalesced);
+        }
+
+        if self.len() == self.capacity {
             return Err(QueueError::Full {
                 capacity: self.capacity,
             });
@@ -283,6 +297,55 @@ impl KeyedQueue {
 
     /// Removes the next item, prioritizing `Live`, then `ActiveCatchup`, then `Archive`.
     pub fn pop(&mut self) -> Option<QueueItem> {
+        self.pop_pending()
+    }
+
+    /// Leases the next item while retaining its queue-capacity ownership.
+    ///
+    /// Incoming signals for the leased key continue to coalesce into the
+    /// retained in-flight entry.
+    pub fn lease_next(&mut self) -> Option<QueueItem> {
+        let item = self.pop_pending()?;
+        self.in_flight.insert(item.key.clone(), item.clone());
+        Some(item)
+    }
+
+    /// Completes one lease, atomically requeueing retained continuation work.
+    ///
+    /// Returns whether the lease was requeued. `force_requeue` retains the key
+    /// even when its processed cursor reached the currently known target.
+    pub fn finish_lease(
+        &mut self,
+        key: &SourceKey,
+        processed_offset: u64,
+        force_requeue: bool,
+    ) -> bool {
+        let Some(item) = self.in_flight.remove(key) else {
+            return false;
+        };
+        if force_requeue || processed_offset < item.target_offset {
+            self.push_pending(item);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns a cancelled lease to the pending queue without releasing its slot.
+    pub fn cancel_lease(&mut self, key: &SourceKey) -> bool {
+        let Some(item) = self.in_flight.remove(key) else {
+            return false;
+        };
+        self.push_pending(item);
+        true
+    }
+
+    /// Releases an exhausted lease while preserving its failure in health state.
+    pub fn abandon_lease(&mut self, key: &SourceKey) -> bool {
+        self.in_flight.remove(key).is_some()
+    }
+
+    fn pop_pending(&mut self) -> Option<QueueItem> {
         for priority in [
             WorkPriority::Live,
             WorkPriority::ActiveCatchup,
@@ -301,6 +364,11 @@ impl KeyedQueue {
         None
     }
 
+    fn push_pending(&mut self, item: QueueItem) {
+        self.index[item.priority.index()].push_back(item.key.clone());
+        self.pending.insert(item.key.clone(), item);
+    }
+
     fn remove_index_entry(&mut self, priority: WorkPriority, key: &SourceKey) {
         self.index[priority.index()].retain(|candidate| candidate != key);
     }
@@ -311,7 +379,8 @@ impl fmt::Debug for KeyedQueue {
         formatter
             .debug_struct("KeyedQueue")
             .field("capacity", &self.capacity)
-            .field("len", &self.pending.len())
+            .field("len", &self.len())
+            .field("in_flight", &self.in_flight.len())
             .field("index_len", &self.index_len())
             .finish_non_exhaustive()
     }

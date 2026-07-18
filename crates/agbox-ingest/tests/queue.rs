@@ -37,6 +37,45 @@ fn keyed_queue_repeated_signals_coalesce_to_the_largest_offset() {
 }
 
 #[test]
+fn leased_key_keeps_capacity_and_coalesces_incoming_signals() {
+    let mut queue = KeyedQueue::new(1);
+    let source = key(1);
+    queue
+        .try_enqueue(source.clone(), 100, WorkPriority::Archive)
+        .unwrap();
+    let leased = queue.lease_next().unwrap();
+    assert_eq!(queue.in_flight_len(), 1);
+    assert_eq!(
+        queue
+            .try_enqueue(source.clone(), 250, WorkPriority::Live)
+            .unwrap(),
+        EnqueueOutcome::Coalesced
+    );
+    assert_eq!(
+        queue.try_enqueue(key(2), 1, WorkPriority::Live),
+        Err(QueueError::Full { capacity: 1 })
+    );
+    assert!(queue.finish_lease(&leased.key, 100, false));
+    let continuation = queue.lease_next().unwrap();
+    assert_eq!(continuation.target_offset, 250);
+    assert_eq!(continuation.priority, WorkPriority::Live);
+}
+
+#[test]
+fn cancelled_lease_returns_work_without_releasing_its_reserved_slot() {
+    let mut queue = KeyedQueue::new(1);
+    let source = key(1);
+    queue
+        .try_enqueue(source.clone(), 100, WorkPriority::Live)
+        .unwrap();
+    let leased = queue.lease_next().unwrap();
+    queue.cancel_lease(&leased.key);
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue.in_flight_len(), 0);
+    assert_eq!(queue.lease_next().unwrap(), leased);
+}
+
+#[test]
 fn keyed_queue_live_work_preempts_catchup_and_capacity_is_explicit() {
     let mut queue = KeyedQueue::new(2);
     queue.try_enqueue(key(1), 1, WorkPriority::Archive).unwrap();

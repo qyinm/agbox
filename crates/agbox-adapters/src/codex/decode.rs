@@ -376,7 +376,7 @@ impl SourceAdapter for CodexAdapter {
             next_marker.7 = output.next_event_ordinal;
             state.set_continuation(Some(next_marker));
         }
-        let observation = make_continuation_observation(context, source, &marker, page_start)?;
+        let observation = make_continuation_observation(context, source, &marker)?;
         let next_state = state.encode_bounded()?;
         Ok(Some(record_with(
             observation,
@@ -2710,7 +2710,6 @@ fn make_continuation_observation(
     context: &DecodeContext,
     source: SourceRef,
     marker: &Continuation,
-    page_start: u32,
 ) -> Result<SourceObservation, DecodeError> {
     let range = ByteRange::new(marker.1, marker.2)
         .map_err(|_| DecodeError::Malformed("invalid-codex-continuation-range".to_owned()))?;
@@ -2732,12 +2731,11 @@ fn make_continuation_observation(
         "obs_{}",
         &blake3::hash(
             format!(
-                "{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}",
                 source_id(context),
                 context.source_generation,
                 marker.1,
-                marker.0,
-                page_start
+                marker.0
             )
             .as_bytes()
         )

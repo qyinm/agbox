@@ -317,13 +317,35 @@ impl fmt::Debug for DecodedRecord {
 /// This type deliberately has no public constructor: callers can consume a
 /// [`DecodedRecord`] without copying evidence plaintext, while construction
 /// and limit enforcement remain inside the adapter boundary.
+///
+/// ```compile_fail
+/// use agbox_adapters::{
+///     DecodeDisposition, DecodedEvidence, DecodedRecordParts, DecoderState,
+/// };
+/// use agbox_core::{ActivityEventV1, SourceObservation};
+///
+/// fn bypass(
+///     observation: SourceObservation,
+///     events: Vec<ActivityEventV1>,
+///     evidence: Vec<DecodedEvidence>,
+/// ) -> DecodedRecordParts {
+///     DecodedRecordParts {
+///         observation,
+///         events,
+///         evidence,
+///         disposition: DecodeDisposition::Known,
+///         next_state: DecoderState::default(),
+///         semantic_bytes: 0,
+///     }
+/// }
+/// ```
 pub struct DecodedRecordParts {
-    pub observation: SourceObservation,
-    pub events: Vec<ActivityEventV1>,
-    pub evidence: Vec<DecodedEvidence>,
-    pub disposition: DecodeDisposition,
-    pub next_state: DecoderState,
-    pub semantic_bytes: usize,
+    observation: SourceObservation,
+    events: Vec<ActivityEventV1>,
+    evidence: Vec<DecodedEvidence>,
+    disposition: DecodeDisposition,
+    next_state: DecoderState,
+    semantic_bytes: usize,
 }
 
 impl fmt::Debug for DecodedRecordParts {
@@ -337,6 +359,31 @@ impl fmt::Debug for DecodedRecordParts {
             .field("next_state_bytes", &self.next_state.as_bytes().len())
             .field("semantic_bytes", &self.semantic_bytes)
             .finish()
+    }
+}
+
+impl DecodedRecordParts {
+    /// Consumes the validated parts into their move-only components.
+    #[must_use]
+    #[allow(clippy::type_complexity)]
+    pub fn decompose(
+        self,
+    ) -> (
+        SourceObservation,
+        Vec<ActivityEventV1>,
+        Vec<DecodedEvidence>,
+        DecodeDisposition,
+        DecoderState,
+        usize,
+    ) {
+        (
+            self.observation,
+            self.events,
+            self.evidence,
+            self.disposition,
+            self.next_state,
+            self.semantic_bytes,
+        )
     }
 }
 

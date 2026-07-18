@@ -1,21 +1,29 @@
 use std::{
     collections::{HashMap, HashSet},
-    fmt, io,
+    fmt,
+    future::Future,
+    io,
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock},
+    pin::Pin,
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use agbox_adapters::{
-    DecodeContext, DecodeDisposition, DecodeError, DecodedRecord, DecodedRecordParts, DecoderState,
-    DiscoveredSource, SourceAdapter,
+    DecodeContext, DecodeDisposition, DecodeError, DecodedRecord, DecoderState, DiscoveredSource,
+    SourceAdapter,
 };
 use agbox_core::{ContentRef, EventPayload, PrivacyLabel, ProjectId, Provider, SourceObservation};
 use agbox_store::{
-    CommitReceipt, ContentRefWrite, CursorState, EvidenceLink, EvidenceOwner, EvidenceWrite,
-    IngestionChunk, IngestionFault, MAX_BATCH_BYTES, MAX_BATCH_RECORDS, ReadStore,
-    SchemaFingerprintUpdate, StoreError, WriterHandle, stable_content_ref_id,
+    ContentRefWrite, CursorState, EvidenceLink, EvidenceOwner, EvidenceWrite, IngestionChunk,
+    IngestionFault, MAX_BATCH_BYTES, MAX_BATCH_RECORDS, ReadStore, SchemaFingerprintUpdate,
+    StoreError, WriterHandle, stable_content_ref_id,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::sync::Notify;
 
 use crate::{
     DECODER_WORKERS, KeyedQueue, QueueError, QueueItem, RecordScanner, ScanOutcome, SourceKey,
@@ -77,6 +85,8 @@ pub enum IngestError {
     NoProgress,
     #[error("decoder worker stopped")]
     WorkerStopped,
+    #[error("injected retryable ingestion failure")]
+    InjectedRetry(RetryClass),
 }
 
 impl fmt::Debug for IngestError {
@@ -92,6 +102,7 @@ impl fmt::Debug for IngestError {
             Self::SemanticMeasurementMismatch => "SemanticMeasurementMismatch",
             Self::NoProgress => "NoProgress",
             Self::WorkerStopped => "WorkerStopped",
+            Self::InjectedRetry(_) => "InjectedRetry",
         })
     }
 }
@@ -102,12 +113,156 @@ impl From<VerifiedOpenError> for IngestError {
     }
 }
 
+/// Bounded retry category retained in per-source health.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetryClass {
+    IdentityChanged,
+    CursorConflict,
+    Busy,
+    StoreFailure,
+}
+
+/// Bounded health state for one source generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceHealth {
+    Healthy,
+    Retrying { attempt: u8, class: RetryClass },
+    Exhausted { attempts: u8, class: RetryClass },
+}
+
+/// Injected bounded retry schedule. Durations include caller-selected jitter.
+#[derive(Clone, Debug)]
+pub struct RetryPolicy {
+    delays: Arc<[Duration]>,
+}
+
+impl RetryPolicy {
+    pub const MAX_RETRIES: usize = 8;
+
+    /// Builds a bounded retry policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when more than eight retries are configured.
+    pub fn new(delays: Vec<Duration>) -> Result<Self, IngestError> {
+        if delays.len() > Self::MAX_RETRIES {
+            return Err(IngestError::StateUnavailable);
+        }
+        Ok(Self {
+            delays: delays.into(),
+        })
+    }
+
+    fn delay(&self, retry: usize) -> Option<Duration> {
+        self.delays.get(retry).copied()
+    }
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            delays: Arc::from([
+                Duration::from_millis(5),
+                Duration::from_millis(17),
+                Duration::from_millis(43),
+            ]),
+        }
+    }
+}
+
+/// Async clock and writer-submission observation point used by retry tests.
+pub trait RetryClock: Send + Sync {
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
+    fn before_attempt(&self) -> Pin<Box<dyn Future<Output = Option<RetryClass>> + Send + '_>> {
+        Box::pin(std::future::ready(None))
+    }
+
+    fn before_writer_submit(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::ready(()))
+    }
+
+    fn writer_submitted(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::ready(()))
+    }
+}
+
+#[derive(Debug)]
+pub struct TokioRetryClock;
+
+impl RetryClock for TokioRetryClock {
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(tokio::time::sleep(duration))
+    }
+}
+
+/// Capacity-owning queue lease. Dropping it returns work to the shared queue.
+pub struct WorkLease {
+    queue: Arc<Mutex<KeyedQueue>>,
+    notify: Arc<Notify>,
+    item: QueueItem,
+    active: bool,
+}
+
+impl fmt::Debug for WorkLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkLease")
+            .field("item", &self.item)
+            .field("active", &self.active)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WorkLease {
+    #[must_use]
+    pub fn item(&self) -> &QueueItem {
+        &self.item
+    }
+
+    fn finish(mut self, processed_offset: u64, force_requeue: bool) -> Result<bool, IngestError> {
+        let requeued = self
+            .queue
+            .lock()
+            .map_err(|_| IngestError::StateUnavailable)?
+            .finish_lease(&self.item.key, processed_offset, force_requeue);
+        self.active = false;
+        self.notify.notify_waiters();
+        Ok(requeued)
+    }
+
+    fn abandon(mut self) -> Result<(), IngestError> {
+        self.queue
+            .lock()
+            .map_err(|_| IngestError::StateUnavailable)?
+            .abandon_lease(&self.item.key);
+        self.active = false;
+        self.notify.notify_waiters();
+        Ok(())
+    }
+}
+
+impl Drop for WorkLease {
+    fn drop(&mut self) {
+        if self.active {
+            if let Ok(mut queue) = self.queue.lock() {
+                queue.cancel_lease(&self.item.key);
+            }
+            self.notify.notify_waiters();
+        }
+    }
+}
+
 /// Coordinates verified record decoding and the store's sole writer.
 pub struct IngestionCoordinator {
     read: ReadStore,
     writer: WriterHandle,
-    queue: Mutex<KeyedQueue>,
+    queue: Arc<Mutex<KeyedQueue>>,
+    notify: Arc<Notify>,
     sources: RwLock<HashMap<SourceKey, CoordinatorSource>>,
+    health: Mutex<HashMap<SourceKey, SourceHealth>>,
+    retry_policy: RetryPolicy,
+    clock: Arc<dyn RetryClock>,
 }
 
 impl fmt::Debug for IngestionCoordinator {
@@ -121,11 +276,32 @@ impl fmt::Debug for IngestionCoordinator {
 impl IngestionCoordinator {
     #[must_use]
     pub fn new(read: ReadStore, writer: WriterHandle, queue_capacity: usize) -> Self {
+        Self::with_retry(
+            read,
+            writer,
+            queue_capacity,
+            RetryPolicy::default(),
+            Arc::new(TokioRetryClock),
+        )
+    }
+
+    #[must_use]
+    pub fn with_retry(
+        read: ReadStore,
+        writer: WriterHandle,
+        queue_capacity: usize,
+        retry_policy: RetryPolicy,
+        clock: Arc<dyn RetryClock>,
+    ) -> Self {
         Self {
             read,
             writer,
-            queue: Mutex::new(KeyedQueue::new(queue_capacity)),
+            queue: Arc::new(Mutex::new(KeyedQueue::new(queue_capacity))),
+            notify: Arc::new(Notify::new()),
             sources: RwLock::new(HashMap::new()),
+            health: Mutex::new(HashMap::with_capacity(queue_capacity)),
+            retry_policy,
+            clock,
         }
     }
 
@@ -163,20 +339,42 @@ impl IngestionCoordinator {
             .lock()
             .map_err(|_| IngestError::StateUnavailable)?
             .try_enqueue(key, target_offset, priority)?;
+        self.notify.notify_one();
         Ok(())
     }
 
-    /// Pops the highest-priority queued source.
+    /// Leases the highest-priority queued source while reserving its capacity.
     ///
     /// # Errors
     ///
     /// Returns an error if coordinator state is unavailable.
-    pub fn pop(&self) -> Result<Option<QueueItem>, IngestError> {
-        Ok(self
+    pub fn lease_one(&self) -> Result<Option<WorkLease>, IngestError> {
+        let item = self
             .queue
             .lock()
             .map_err(|_| IngestError::StateUnavailable)?
-            .pop())
+            .lease_next();
+        Ok(item.map(|item| WorkLease {
+            queue: Arc::clone(&self.queue),
+            notify: Arc::clone(&self.notify),
+            item,
+            active: true,
+        }))
+    }
+
+    /// Returns the bounded health state for one source generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when coordinator health state is unavailable.
+    pub fn source_health(&self, key: &SourceKey) -> Result<SourceHealth, IngestError> {
+        Ok(self
+            .health
+            .lock()
+            .map_err(|_| IngestError::StateUnavailable)?
+            .get(key)
+            .copied()
+            .unwrap_or(SourceHealth::Healthy))
     }
 
     /// Decodes and atomically commits one bounded source slice.
@@ -189,7 +387,65 @@ impl IngestionCoordinator {
     ///
     /// Returns a bounded identity, I/O, decode, store, queue, or accounting
     /// error. Failed commits never advance the durable cursor.
-    pub async fn process_one(&self, item: QueueItem) -> Result<ProcessReport, IngestError> {
+    pub async fn process_one(&self, lease: WorkLease) -> Result<ProcessReport, IngestError> {
+        let item = lease.item().clone();
+        let mut retry = 0_usize;
+        loop {
+            let attempt_result = match self.clock.before_attempt().await {
+                Some(class) => Err(IngestError::InjectedRetry(class)),
+                None => self.process_attempt(&item).await,
+            };
+            match attempt_result {
+                Ok(attempt) => {
+                    self.set_health(&item.key, SourceHealth::Healthy)?;
+                    let requeued =
+                        lease.finish(attempt.cursor_offset, attempt.needs_continuation)?;
+                    return Ok(ProcessReport {
+                        key: item.key,
+                        committed_records: attempt.committed_records,
+                        committed_events: attempt.committed_events,
+                        cursor_offset: attempt.cursor_offset,
+                        requeued,
+                    });
+                }
+                Err(error) => {
+                    let Some(class) = retry_class(&error) else {
+                        self.set_health(
+                            &item.key,
+                            SourceHealth::Exhausted {
+                                attempts: u8::try_from(retry).unwrap_or(u8::MAX),
+                                class: RetryClass::StoreFailure,
+                            },
+                        )?;
+                        lease.abandon()?;
+                        return Err(error);
+                    };
+                    let Some(delay) = self.retry_policy.delay(retry) else {
+                        self.set_health(
+                            &item.key,
+                            SourceHealth::Exhausted {
+                                attempts: u8::try_from(retry).unwrap_or(u8::MAX),
+                                class,
+                            },
+                        )?;
+                        lease.abandon()?;
+                        return Err(error);
+                    };
+                    retry += 1;
+                    self.set_health(
+                        &item.key,
+                        SourceHealth::Retrying {
+                            attempt: u8::try_from(retry).unwrap_or(u8::MAX),
+                            class,
+                        },
+                    )?;
+                    self.clock.sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    async fn process_attempt(&self, item: &QueueItem) -> Result<AttemptReport, IngestError> {
         let source = self
             .sources
             .read()
@@ -203,7 +459,6 @@ impl IngestionCoordinator {
             .await?
             .ok_or(StoreError::SourceNotFound)?;
         let decode_target = item.target_offset.min(source.discovered.size);
-        let requeue_target = decode_target;
         let (chunk, record_count, needs_continuation) = tokio::task::spawn_blocking(move || {
             build_chunk(source, expected_cursor, decode_target)
         })
@@ -211,39 +466,74 @@ impl IngestionCoordinator {
         .map_err(|_| IngestError::WorkerStopped)??;
 
         if record_count == 0 {
-            return Ok(ProcessReport {
-                key: item.key,
+            return Ok(AttemptReport {
                 committed_records: 0,
                 committed_events: 0,
                 cursor_offset: chunk.expected_cursor.offset,
-                requeued: false,
+                needs_continuation: false,
             });
         }
         let measured = chunk.measured_semantic_bytes()?;
         if measured > MAX_BATCH_BYTES {
             return Err(IngestError::SemanticMeasurementMismatch);
         }
-        let receipt = self.writer.commit_ingestion(chunk).await?;
-        let should_requeue = needs_continuation || receipt.cursor_offset < requeue_target;
-        if should_requeue {
-            self.try_enqueue(item.key.clone(), item.target_offset, item.priority)?;
+        self.clock.before_writer_submit().await;
+        let submission = self.writer.submit_ingestion(chunk).await?;
+        self.clock.writer_submitted().await;
+        let receipt = submission.receive().await?;
+        Ok(AttemptReport {
+            committed_records: record_count,
+            committed_events: receipt.inserted_events,
+            cursor_offset: receipt.cursor_offset,
+            needs_continuation,
+        })
+    }
+
+    fn set_health(&self, key: &SourceKey, value: SourceHealth) -> Result<(), IngestError> {
+        let mut health = self
+            .health
+            .lock()
+            .map_err(|_| IngestError::StateUnavailable)?;
+        if value == SourceHealth::Healthy {
+            health.remove(key);
+            return Ok(());
         }
-        Ok(report(item.key, record_count, &receipt, should_requeue))
+        let capacity = self
+            .queue
+            .lock()
+            .map_err(|_| IngestError::StateUnavailable)?
+            .capacity();
+        if !health.contains_key(key)
+            && health.len() == capacity
+            && let Some(evicted) = health.keys().next().cloned()
+        {
+            health.remove(&evicted);
+        }
+        health.insert(key.clone(), value);
+        Ok(())
     }
 }
 
-fn report(
-    key: SourceKey,
+struct AttemptReport {
     committed_records: usize,
-    receipt: &CommitReceipt,
-    requeued: bool,
-) -> ProcessReport {
-    ProcessReport {
-        key,
-        committed_records,
-        committed_events: receipt.inserted_events,
-        cursor_offset: receipt.cursor_offset,
-        requeued,
+    committed_events: usize,
+    cursor_offset: u64,
+    needs_continuation: bool,
+}
+
+fn retry_class(error: &IngestError) -> Option<RetryClass> {
+    match error {
+        IngestError::IdentityChanged => Some(RetryClass::IdentityChanged),
+        IngestError::InjectedRetry(class) => Some(*class),
+        IngestError::Io(_)
+        | IngestError::WorkerStopped
+        | IngestError::Decode(DecodeError::Io(_)) => Some(RetryClass::StoreFailure),
+        IngestError::Store(StoreError::CursorConflict) => Some(RetryClass::CursorConflict),
+        IngestError::Store(error) if error.is_busy_or_locked() => Some(RetryClass::Busy),
+        IngestError::Store(error) if error.is_retryable_store_failure() => {
+            Some(RetryClass::StoreFailure)
+        }
+        _ => None,
     }
 }
 
@@ -302,15 +592,20 @@ fn build_chunk(
         let decoded = match decoded {
             Ok(decoded) => decoded,
             Err(error) if recoverable_decode_error(&error) => {
-                batch.try_push_fault(
+                match batch.try_push_fault(
                     window.start(),
                     window.content_end(),
                     next_offset,
                     decode_error_class(&error),
                     &context,
                     adapter.provider(),
-                )?;
-                continue;
+                )? {
+                    BatchPush::Accepted => continue,
+                    BatchPush::FullBeforeRecord => {
+                        needs_continuation = true;
+                        break;
+                    }
+                }
             }
             Err(error) => return Err(error.into()),
         };
@@ -350,6 +645,7 @@ fn decode_error_class(error: &DecodeError) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BatchPush {
     Accepted,
     FullBeforeRecord,
@@ -407,10 +703,10 @@ impl BatchBuilder {
         )?;
         self.retain_new_content_refs(&mut contribution);
         let candidate = self.candidate_bytes(&contribution)?;
-        if candidate > MAX_BATCH_BYTES && self.record_count != 0 {
+        if candidate_over_limit(candidate) && self.record_count != 0 {
             return Ok(BatchPush::FullBeforeRecord);
         }
-        if candidate > MAX_BATCH_BYTES {
+        if candidate_over_limit(candidate) {
             return self.try_push_oversized(contribution);
         }
         self.accept(contribution, candidate);
@@ -454,7 +750,7 @@ impl BatchBuilder {
             next_state: self.state.clone(),
         };
         let candidate = self.candidate_bytes(&oversized)?;
-        if candidate > MAX_BATCH_BYTES {
+        if candidate_over_limit(candidate) {
             return Err(IngestError::NoProgress);
         }
         self.accept(oversized, candidate);
@@ -469,7 +765,7 @@ impl BatchBuilder {
         class: &str,
         context: &DecodeContext,
         provider: Provider,
-    ) -> Result<(), IngestError> {
+    ) -> Result<BatchPush, IngestError> {
         let fault = IngestionFault {
             fault_id: stable_fault_id(
                 &self.chunk.expected_cursor.source_id,
@@ -508,10 +804,13 @@ impl BatchBuilder {
         };
         let candidate = self.candidate_bytes(&contribution)?;
         if candidate > MAX_BATCH_BYTES {
+            if self.record_count != 0 {
+                return Ok(BatchPush::FullBeforeRecord);
+            }
             return Err(IngestError::NoProgress);
         }
         self.accept(contribution, candidate);
-        Ok(())
+        Ok(BatchPush::Accepted)
     }
 
     fn candidate_bytes(&self, contribution: &Contribution) -> Result<usize, IngestError> {
@@ -567,6 +866,10 @@ impl BatchBuilder {
     }
 }
 
+const fn candidate_over_limit(candidate: usize) -> bool {
+    candidate > MAX_BATCH_BYTES
+}
+
 struct Contribution {
     observation: SourceObservation,
     events: Vec<agbox_core::ActivityEventV1>,
@@ -586,14 +889,8 @@ impl Contribution {
         next_offset: u64,
         context: &DecodeContext,
     ) -> Result<Self, IngestError> {
-        let DecodedRecordParts {
-            observation,
-            events,
-            evidence,
-            disposition,
-            next_state,
-            ..
-        } = decoded.into_parts();
+        let (observation, events, evidence, disposition, next_state, _) =
+            decoded.into_parts().decompose();
         let mut content_refs = Vec::new();
         if let Some(content) = observation.bounded_record() {
             content_refs.push(content_write(
@@ -915,34 +1212,115 @@ impl IngestionRuntime {
         self,
         mut input: tokio::sync::mpsc::Receiver<QueueItem>,
     ) -> Result<(), IngestError> {
-        let mut senders = Vec::with_capacity(DECODER_WORKERS);
+        let closed = Arc::new(AtomicBool::new(false));
         let mut workers = tokio::task::JoinSet::new();
         for _ in 0..DECODER_WORKERS {
-            let (sender, mut receiver) = tokio::sync::mpsc::channel::<QueueItem>(1);
-            senders.push(sender);
             let coordinator = Arc::clone(&self.coordinator);
+            let closed = Arc::clone(&closed);
             workers.spawn(async move {
-                while let Some(item) = receiver.recv().await {
-                    coordinator.process_one(item).await?;
-                    while let Some(requeued) = coordinator.pop()? {
-                        coordinator.process_one(requeued).await?;
+                loop {
+                    let notified = coordinator.notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if let Some(lease) = coordinator.lease_one()? {
+                        let _ = coordinator.process_one(lease).await;
+                        coordinator.notify.notify_waiters();
+                        continue;
                     }
+                    let idle = coordinator
+                        .queue
+                        .lock()
+                        .map_err(|_| IngestError::StateUnavailable)?
+                        .is_empty();
+                    if closed.load(Ordering::Acquire) && idle {
+                        break;
+                    }
+                    notified.await;
                 }
                 Ok::<(), IngestError>(())
             });
         }
-        let mut next = 0;
+
         while let Some(item) = input.recv().await {
-            senders[next]
-                .send(item)
-                .await
-                .map_err(|_| IngestError::WorkerStopped)?;
-            next = (next + 1) % DECODER_WORKERS;
+            loop {
+                let notified = self.coordinator.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                match self.coordinator.try_enqueue(
+                    item.key.clone(),
+                    item.target_offset,
+                    item.priority,
+                ) {
+                    Ok(()) => break,
+                    Err(IngestError::Queue(QueueError::Full { .. })) => notified.await,
+                    Err(error) => {
+                        closed.store(true, Ordering::Release);
+                        self.coordinator.notify.notify_waiters();
+                        while workers.join_next().await.is_some() {}
+                        return Err(error);
+                    }
+                }
+            }
         }
-        drop(senders);
+        closed.store(true, Ordering::Release);
+        self.coordinator.notify.notify_waiters();
         while let Some(result) = workers.join_next().await {
             result.map_err(|_| IngestError::WorkerStopped)??;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    fn cursor() -> CursorState {
+        CursorState {
+            source_id: "source_00000000000000000000000000000001".to_owned(),
+            generation: 1,
+            offset: 0,
+            parser_state: Vec::new(),
+        }
+    }
+
+    fn context() -> DecodeContext {
+        DecodeContext {
+            project_id: ProjectId::parse_wire("project_fixture").unwrap(),
+            project_root: None,
+            source_id: cursor().source_id,
+            observed_at: OffsetDateTime::UNIX_EPOCH,
+            source_generation: 1,
+            format: "codex-rollout-1".to_owned(),
+        }
+    }
+
+    #[test]
+    fn malformed_fault_over_nonempty_cap_returns_full_without_mutation() {
+        let mut builder = BatchBuilder::new(cursor(), DecoderState::default()).unwrap();
+        builder.record_count = 1;
+        builder.measured = MAX_BATCH_BYTES;
+        let outcome = builder
+            .try_push_fault(0, 10, 11, "malformed", &context(), Provider::Codex)
+            .unwrap();
+        assert_eq!(outcome, BatchPush::FullBeforeRecord);
+        assert_eq!(builder.record_count(), 1);
+        assert!(builder.chunk.faults.is_empty());
+    }
+
+    #[test]
+    fn exact_batch_cap_is_inclusive_and_incremental_mismatch_is_rejected() {
+        assert!(!candidate_over_limit(MAX_BATCH_BYTES));
+        assert!(candidate_over_limit(MAX_BATCH_BYTES + 1));
+        let mut builder = BatchBuilder::new(cursor(), DecoderState::default()).unwrap();
+        let authoritative = builder.chunk.measured_semantic_bytes().unwrap();
+        assert_eq!(builder.measured, authoritative);
+        builder.measured += 1;
+        assert!(matches!(
+            builder.finish(),
+            Err(IngestError::SemanticMeasurementMismatch)
+        ));
     }
 }

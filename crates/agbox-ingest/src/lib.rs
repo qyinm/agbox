@@ -42,8 +42,8 @@ pub mod test_support {
     use zeroize::Zeroizing;
 
     use crate::{
-        CoordinatorSource, IngestError, IngestionCoordinator, ProcessReport, SourceKey,
-        WorkPriority,
+        CoordinatorSource, IngestError, IngestionCoordinator, IngestionRuntime, ProcessReport,
+        RetryClock, RetryPolicy, SourceHealth, SourceKey, TokioRetryClock, WorkPriority,
     };
 
     pub struct FixtureRuntime {
@@ -90,6 +90,25 @@ pub mod test_support {
         }
 
         pub async fn try_records<I, S>(records: I) -> Result<Self, IngestError>
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<str>,
+        {
+            Self::try_records_with_retry(
+                records,
+                crate::SOURCE_QUEUE_CAPACITY,
+                RetryPolicy::default(),
+                Arc::new(TokioRetryClock),
+            )
+            .await
+        }
+
+        pub async fn try_records_with_retry<I, S>(
+            records: I,
+            queue_capacity: usize,
+            retry_policy: RetryPolicy,
+            clock: Arc<dyn RetryClock>,
+        ) -> Result<Self, IngestError>
         where
             I: IntoIterator<Item = S>,
             S: AsRef<str>,
@@ -160,10 +179,12 @@ pub mod test_support {
                     initial_cursor: 0,
                 })
                 .await?;
-            let coordinator = Arc::new(IngestionCoordinator::new(
+            let coordinator = Arc::new(IngestionCoordinator::with_retry(
                 store.read().clone(),
                 store.writer().clone(),
-                crate::SOURCE_QUEUE_CAPACITY,
+                queue_capacity,
+                retry_policy,
+                clock,
             ));
             let key = coordinator.register_source(CoordinatorSource {
                 discovered,
@@ -185,8 +206,11 @@ pub mod test_support {
         }
 
         pub async fn process_one(&self) -> Result<ProcessReport, IngestError> {
-            let item = self.coordinator.pop()?.ok_or(IngestError::NoProgress)?;
-            self.coordinator.process_one(item).await
+            let lease = self
+                .coordinator
+                .lease_one()?
+                .ok_or(IngestError::NoProgress)?;
+            self.coordinator.process_one(lease).await
         }
 
         pub async fn process_target(
@@ -194,12 +218,8 @@ pub mod test_support {
             target_offset: u64,
         ) -> Result<ProcessReport, IngestError> {
             self.coordinator
-                .process_one(crate::QueueItem {
-                    key: self.key.clone(),
-                    target_offset,
-                    priority: WorkPriority::Live,
-                })
-                .await
+                .try_enqueue(self.key.clone(), target_offset, WorkPriority::Live)?;
+            self.process_one().await
         }
 
         pub fn enqueue(&self) -> Result<(), IngestError> {
@@ -215,8 +235,8 @@ pub mod test_support {
         }
 
         pub async fn drain(&self) -> Result<(), IngestError> {
-            while let Some(item) = self.coordinator.pop()? {
-                let _ = self.coordinator.process_one(item).await?;
+            while let Some(lease) = self.coordinator.lease_one()? {
+                let _ = self.coordinator.process_one(lease).await?;
             }
             Ok(())
         }
@@ -247,6 +267,46 @@ pub mod test_support {
         pub fn database_path(&self) -> &Path {
             &self.database_path
         }
+
+        pub fn health(&self) -> Result<SourceHealth, IngestError> {
+            self.coordinator.source_health(&self.key)
+        }
+
+        pub async fn run_signals(&self, signals: Vec<u64>) -> Result<(), IngestError> {
+            let (sender, receiver) = tokio::sync::mpsc::channel(signals.len().max(1));
+            for target_offset in signals {
+                sender
+                    .send(crate::QueueItem {
+                        key: self.key.clone(),
+                        target_offset,
+                        priority: WorkPriority::Live,
+                    })
+                    .await
+                    .map_err(|_| IngestError::WorkerStopped)?;
+            }
+            drop(sender);
+            IngestionRuntime::new(Arc::clone(&self.coordinator))
+                .run(receiver)
+                .await
+        }
+
+        pub async fn run_with_unregistered_signal(&self) -> Result<(), IngestError> {
+            let invalid = SourceKey::new("source_ffffffffffffffffffffffffffffffff".to_owned(), 1)
+                .map_err(|_| IngestError::SourceNotRegistered)?;
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            sender
+                .send(crate::QueueItem {
+                    key: invalid,
+                    target_offset: 1,
+                    priority: WorkPriority::Live,
+                })
+                .await
+                .map_err(|_| IngestError::WorkerStopped)?;
+            drop(sender);
+            IngestionRuntime::new(Arc::clone(&self.coordinator))
+                .run(receiver)
+                .await
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -271,6 +331,14 @@ pub mod test_support {
                 .cursor(self.key.source_id().to_owned(), self.key.generation())
                 .await?
                 .map(|cursor| cursor.offset)
+                .ok_or(agbox_store::StoreError::SourceNotFound)
+        }
+
+        pub async fn parser_state(&self) -> Result<Vec<u8>, agbox_store::StoreError> {
+            self.read
+                .cursor(self.key.source_id().to_owned(), self.key.generation())
+                .await?
+                .map(|cursor| cursor.parser_state)
                 .ok_or(agbox_store::StoreError::SourceNotFound)
         }
 
@@ -300,4 +368,5 @@ pub mod test_support {
 }
 pub use coordinator::{
     CoordinatorSource, IngestError, IngestionCoordinator, IngestionRuntime, ProcessReport,
+    RetryClass, RetryClock, RetryPolicy, SourceHealth, TokioRetryClock, WorkLease,
 };

@@ -98,7 +98,7 @@ pub(crate) fn open_writer(path: &Path) -> Result<OpenedWriter, StoreError> {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    connection.busy_timeout(Duration::from_secs(5))?;
+    connection.busy_timeout(Duration::from_millis(1))?;
 
     // Reserve SQLite's sidecar names through the held directory descriptor.
     // SQLite then opens owner-only regular files instead of creating them by

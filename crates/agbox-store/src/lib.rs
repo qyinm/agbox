@@ -15,10 +15,10 @@ pub use crypto::{CryptoError, KeyProvider, KeyringKeyProvider};
 pub use evidence::{EvidenceContext, EvidenceError, EvidenceOwnerRef, EvidenceVault};
 pub use read::{READ_POOL_SIZE, ReadPool, ReadStore};
 pub use writer::{
-    CommitReceipt, ContentRefWrite, CursorState, EvidenceLink, EvidenceOwner, EvidenceWrite,
-    IngestionChunk, IngestionFault, MAX_BATCH_BYTES, MAX_BATCH_RECORDS, SchemaFingerprintUpdate,
-    SourceRegistration, SourceRegistrationReceipt, WRITER_QUEUE_CAPACITY, WriterHandle,
-    stable_content_ref_id,
+    CommitReceipt, CommitSubmission, ContentRefWrite, CursorState, EvidenceLink, EvidenceOwner,
+    EvidenceWrite, IngestionChunk, IngestionFault, MAX_BATCH_BYTES, MAX_BATCH_RECORDS,
+    SchemaFingerprintUpdate, SourceRegistration, SourceRegistrationReceipt, WRITER_QUEUE_CAPACITY,
+    WriterHandle, stable_content_ref_id,
 };
 
 #[derive(thiserror::Error)]
@@ -84,6 +84,25 @@ impl fmt::Debug for StoreError {
             .debug_struct("StoreError")
             .field("kind", &label)
             .finish()
+    }
+}
+
+impl StoreError {
+    #[must_use]
+    pub fn is_busy_or_locked(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    }
+
+    #[must_use]
+    pub fn is_retryable_store_failure(&self) -> bool {
+        matches!(self, Self::Io(_) | Self::Evidence(_) | Self::Sqlite(_))
     }
 }
 

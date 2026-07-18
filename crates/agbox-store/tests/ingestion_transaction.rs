@@ -9,8 +9,9 @@ use agbox_core::{
     WorkId,
 };
 use agbox_store::{
-    ContentRefWrite, EvidenceLink, EvidenceOwner, EvidenceWrite, IngestionChunk, MemoryKeyProvider,
-    SchemaFingerprintUpdate, Store, StoreError, StoreRuntime, stable_content_ref_id,
+    ContentRefWrite, EvidenceLink, EvidenceOwner, EvidenceWrite, IngestionChunk, IngestionFault,
+    MAX_BATCH_BYTES, MemoryKeyProvider, SchemaFingerprintUpdate, Store, StoreError, StoreRuntime,
+    stable_content_ref_id,
 };
 use rusqlite::params;
 use zeroize::Zeroizing;
@@ -679,6 +680,51 @@ fn semantic_bytes_count_owner_labels_expiry_and_content_ref_privacy() {
     );
 }
 
+#[test]
+fn exact_four_mib_semantic_chunk_is_accepted_and_one_more_byte_is_rejected() {
+    let mut chunk = IngestionChunk::fixture("src_1", 1, 0, 128, 0);
+    chunk.observations = vec![chunk.observations[0].clone(); agbox_store::MAX_BATCH_RECORDS];
+    chunk.faults = (0..agbox_store::MAX_BATCH_RECORDS)
+        .map(|index| IngestionFault {
+            fault_id: format!("fault_{index}"),
+            source_id: "src_1".to_owned(),
+            generation: 1,
+            byte_start: u64::try_from(index).unwrap(),
+            byte_end: u64::try_from(index + 1).unwrap(),
+            class: "malformed".to_owned(),
+            bounded_detail: String::new(),
+        })
+        .collect();
+    let event = IngestionChunk::fixture("src_1", 1, 0, 128, 1)
+        .events
+        .remove(0);
+    let event_bytes = serde_json::to_vec(&event).unwrap().len();
+    let base_without_events = chunk.measured_semantic_bytes().unwrap();
+    let detail_capacity = agbox_store::MAX_BATCH_RECORDS * agbox_core::limits::MAX_PREVIEW_BYTES;
+    let event_bytes_needed = MAX_BATCH_BYTES
+        .saturating_sub(base_without_events)
+        .saturating_sub(detail_capacity);
+    let event_count = event_bytes_needed.div_ceil(event_bytes);
+    chunk.events = vec![event; event_count];
+    let base = chunk.measured_semantic_bytes().unwrap();
+    let mut remaining = MAX_BATCH_BYTES.checked_sub(base).unwrap();
+    for fault in &mut chunk.faults {
+        let retained = remaining.min(agbox_core::limits::MAX_PREVIEW_BYTES);
+        fault.bounded_detail = "x".repeat(retained);
+        remaining -= retained;
+    }
+    assert_eq!(remaining, 0);
+    assert_eq!(chunk.measured_semantic_bytes().unwrap(), MAX_BATCH_BYTES);
+    assert!(chunk.validate().is_ok());
+
+    chunk.faults[0].bounded_detail.push('x');
+    assert_eq!(
+        chunk.measured_semantic_bytes().unwrap(),
+        MAX_BATCH_BYTES + 1
+    );
+    assert!(matches!(chunk.validate(), Err(StoreError::InvalidBatch)));
+}
+
 #[tokio::test]
 async fn concurrent_typed_reads_return_all_pool_checkouts() {
     let dir = private_tempdir();
@@ -739,14 +785,12 @@ async fn explicit_shutdown_drains_and_stops_cloned_writer_handles() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_shutdown_before_enqueue_falls_back_to_drain_and_join() {
     let dir = private_tempdir();
-    let database = dir.path().join("state.db");
     let runtime = fixture_runtime(&dir, 25).await;
     let writer = runtime.writer().clone();
-    let lock = rusqlite::Connection::open(&database).unwrap();
-    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let release_writer = writer.pause_for_test().await.unwrap();
 
     let mut commits = Vec::new();
-    for _ in 0..33 {
+    for _ in 0..agbox_store::WRITER_QUEUE_CAPACITY {
         let queued_writer = writer.clone();
         commits.push(tokio::spawn(async move {
             queued_writer
@@ -762,11 +806,6 @@ async fn cancelled_shutdown_before_enqueue_falls_back_to_drain_and_join() {
     .await
     .unwrap();
 
-    let (release_send, release_receive) = std::sync::mpsc::channel();
-    let release_thread = std::thread::spawn(move || {
-        release_receive.recv().unwrap();
-        lock.execute_batch("COMMIT").unwrap();
-    });
     let (entered_send, entered_receive) = tokio::sync::oneshot::channel();
     let shutdown = tokio::spawn(async move {
         let _ = entered_send.send(());
@@ -777,9 +816,8 @@ async fn cancelled_shutdown_before_enqueue_falls_back_to_drain_and_join() {
     assert_eq!(writer.available_capacity_for_test(), 0);
 
     shutdown.abort();
-    release_send.send(()).unwrap();
+    release_writer.send(()).unwrap();
     assert!(shutdown.await.unwrap_err().is_cancelled());
-    release_thread.join().unwrap();
     for commit in commits {
         commit.await.unwrap().unwrap();
     }

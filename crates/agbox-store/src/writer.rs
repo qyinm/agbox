@@ -14,7 +14,6 @@ use crate::{EvidenceContext, EvidenceOwnerRef, EvidenceVault, StoreError};
 pub const MAX_BATCH_BYTES: usize = agbox_core::limits::MAX_BATCH_SEMANTIC_BYTES;
 pub const MAX_BATCH_RECORDS: usize = agbox_core::limits::MAX_BATCH_RECORDS;
 pub const WRITER_QUEUE_CAPACITY: usize = 32;
-const BUSY_RETRY_DELAYS_MS: [u64; 3] = [1, 3, 7];
 
 #[derive(Clone)]
 pub struct SourceRegistration {
@@ -537,6 +536,11 @@ pub(crate) enum WriteCommand {
     Shutdown {
         reply: oneshot::Sender<()>,
     },
+    #[cfg(feature = "test-support")]
+    TestBarrier {
+        entered: oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    },
 }
 
 #[derive(Clone)]
@@ -549,6 +553,30 @@ impl fmt::Debug for WriterHandle {
         formatter
             .debug_struct("WriterHandle")
             .finish_non_exhaustive()
+    }
+}
+
+/// One submitted ingestion command awaiting its sole-writer receipt.
+pub struct CommitSubmission {
+    receive: oneshot::Receiver<Result<CommitReceipt, StoreError>>,
+}
+
+impl fmt::Debug for CommitSubmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommitSubmission")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CommitSubmission {
+    /// Awaits the sole writer's atomic commit result.
+    ///
+    /// # Errors
+    ///
+    /// Returns the writer's validation/database result or `WriterStopped`.
+    pub async fn receive(self) -> Result<CommitReceipt, StoreError> {
+        self.receive.await.map_err(|_| StoreError::WriterStopped)?
     }
 }
 
@@ -585,6 +613,18 @@ impl WriterHandle {
         &self,
         chunk: IngestionChunk,
     ) -> Result<CommitReceipt, StoreError> {
+        self.submit_ingestion(chunk).await?.receive().await
+    }
+
+    /// Validates and submits one chunk without awaiting its writer receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation or writer-channel failure before submission.
+    pub async fn submit_ingestion(
+        &self,
+        chunk: IngestionChunk,
+    ) -> Result<CommitSubmission, StoreError> {
         chunk.validate()?;
         let (reply, receive) = oneshot::channel();
         self.sender
@@ -594,7 +634,7 @@ impl WriterHandle {
             })
             .await
             .map_err(|_| StoreError::WriterStopped)?;
-        receive.await.map_err(|_| StoreError::WriterStopped)?
+        Ok(CommitSubmission { receive })
     }
 
     #[cfg(feature = "test-support")]
@@ -602,6 +642,24 @@ impl WriterHandle {
     #[must_use]
     pub fn available_capacity_for_test(&self) -> usize {
         self.sender.capacity()
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn pause_for_test(&self) -> Result<std::sync::mpsc::Sender<()>, StoreError> {
+        let (entered, receive_entered) = oneshot::channel();
+        let (release, receive_release) = std::sync::mpsc::channel();
+        self.sender
+            .send(WriteCommand::TestBarrier {
+                entered,
+                release: receive_release,
+            })
+            .await
+            .map_err(|_| StoreError::WriterStopped)?;
+        receive_entered
+            .await
+            .map_err(|_| StoreError::WriterStopped)?;
+        Ok(release)
     }
 }
 
@@ -620,41 +678,20 @@ pub(crate) fn run_writer(
                 let _ = reply.send(register_source(&mut connection, &vault, &registration));
             }
             WriteCommand::Commit { chunk, reply } => {
-                let _ = reply.send(commit_with_busy_retry(&mut connection, &vault, &chunk));
+                let result = commit(&mut connection, &vault, &chunk);
+                let _ = reply.send(result);
             }
             WriteCommand::Shutdown { reply } => {
                 let _ = reply.send(());
                 break;
             }
-        }
-    }
-}
-
-fn commit_with_busy_retry(
-    connection: &mut rusqlite::Connection,
-    vault: &EvidenceVault,
-    chunk: &IngestionChunk,
-) -> Result<CommitReceipt, StoreError> {
-    for delay_ms in BUSY_RETRY_DELAYS_MS {
-        match commit(connection, vault, chunk) {
-            Err(StoreError::Sqlite(error)) if is_busy(&error) => {
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            #[cfg(feature = "test-support")]
+            WriteCommand::TestBarrier { entered, release } => {
+                let _ = entered.send(());
+                let _ = release.recv();
             }
-            result => return result,
         }
     }
-    commit(connection, vault, chunk)
-}
-
-fn is_busy(error: &rusqlite::Error) -> bool {
-    matches!(
-        error,
-        rusqlite::Error::SqliteFailure(code, _)
-            if matches!(
-                code.code,
-                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-            )
-    )
 }
 
 fn validate_registration(registration: &SourceRegistration) -> Result<(), StoreError> {

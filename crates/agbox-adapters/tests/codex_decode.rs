@@ -1065,12 +1065,29 @@ fn maximum_pending_window_fits_and_drains_atomically_across_continuations() {
         .iter()
         .map(|record| record.observation().observation_id())
         .collect::<std::collections::HashSet<_>>();
-    assert_eq!(observation_ids.len(), pages.len());
+    assert_eq!(observation_ids.len(), 1);
+    let observation_rows = pages
+        .iter()
+        .map(|record| serde_json::to_vec(record.observation()).unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(observation_rows.len(), 1);
     let source_hashes = pages
         .iter()
         .map(|record| record.observation().source().record_hash())
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(source_hashes.len(), 1);
+    let evidence_ids = pages
+        .iter()
+        .flat_map(agbox_adapters::DecodedRecord::evidence)
+        .map(|evidence| evidence.evidence_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        evidence_ids.len(),
+        pages
+            .iter()
+            .map(|record| record.evidence().len())
+            .sum::<usize>()
+    );
     assert!(
         CodexAdapter
             .decode_continuation(&context(), pages.last().unwrap().next_state())
