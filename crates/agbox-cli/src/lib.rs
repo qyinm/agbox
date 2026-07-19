@@ -18,6 +18,24 @@ pub use platform::{Change, Platform, PlatformError, ServiceSpec};
 ///
 pub async fn run(cli: args::Cli) -> Result<(), CliError> {
     match cli.command {
+        args::Command::Init(arguments) => {
+            let executable = std::env::current_exe().map_err(|_| CliError::Unavailable)?;
+            let platform = platform::macos::MacOsPlatform::for_current_user(executable)
+                .map_err(|_| CliError::Unavailable)?;
+            let report = Initializer::new(platform)
+                .run(InitOptions {
+                    quiet: arguments.quiet,
+                })
+                .await
+                .map_err(|_| CliError::Unavailable)?;
+            if !arguments.quiet {
+                println!(
+                    "paths: {}; claude: {}; codex: {}; service: {}",
+                    report.paths, report.claude, report.codex, report.service
+                );
+            }
+            Ok(())
+        }
         args::Command::Mcp { provider } => {
             let root = project_root(cli.project_root)?;
             let provider = match provider {
