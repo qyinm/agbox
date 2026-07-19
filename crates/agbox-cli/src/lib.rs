@@ -133,7 +133,9 @@ pub async fn run(cli: args::Cli) -> Result<(), CliError> {
             let agbox_core::api::AppResponse::WorkList(page) = value else {
                 return Err(CliError::Unavailable);
             };
-            tui::run(page.items).map_err(|_| CliError::Unavailable)
+            tui::run(page.items, client)
+                .await
+                .map_err(|_| CliError::Unavailable)
         }
         args::Command::Forget { command } => {
             let client = human_client(cli.project_root).await?;
@@ -167,7 +169,19 @@ pub async fn run(cli: args::Cli) -> Result<(), CliError> {
             let root = project_root(cli.project_root)?;
             let paths = AgboxPaths::from_home(&user_home()?);
             match command {
-                args::HookCommand::Ingest { .. } => Err(CliError::Unavailable),
+                args::HookCommand::Ingest {
+                    provider,
+                    max_bytes,
+                } => {
+                    let provider = match provider {
+                        args::ProviderArg::Claude => agbox_core::Provider::Claude,
+                        args::ProviderArg::Codex => agbox_core::Provider::Codex,
+                    };
+                    agbox_ingest::ProjectResolver::new(&root)
+                        .and_then(|resolver| resolver.resolve(&root))
+                        .map_err(|_| CliError::InvalidProject)?;
+                    commands::hook::ingest_stdin(&paths, &user_home()?, provider, max_bytes)
+                }
                 args::HookCommand::ActiveIndex {
                     provider,
                     max_items,
@@ -198,6 +212,8 @@ pub enum CliError {
     Output,
     #[error("configuration value is invalid")]
     InvalidConfig,
+    #[error("hook payload is invalid or does not name a verified local source")]
+    InvalidHook,
 }
 
 fn project_root(configured: Option<std::path::PathBuf>) -> Result<std::path::PathBuf, CliError> {

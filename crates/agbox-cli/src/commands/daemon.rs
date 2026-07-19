@@ -4,8 +4,9 @@ use std::{os::unix::ffi::OsStrExt, path::Path, sync::Arc};
 
 use agbox_adapters::{RootClass, adapters};
 use agbox_ingest::{
-    CoordinatorSource, DiscoveryWalker, HistoryDecision, HistoryPolicy, IngestionCoordinator,
-    RecordScanner, ScanOutcome, VerifiedSourceOpener, WorkPriority, resolve_source_project,
+    CoordinatorSource, DiscoveryWalker, HistoryDecision, HistoryPolicy, HookSpool,
+    IngestionCoordinator, RecordScanner, ScanOutcome, VerifiedSourceOpener, WorkPriority,
+    resolve_source_project,
 };
 use agbox_service::{ApplicationService, Components, Daemon, ipc::LocalIpcServer};
 use agbox_store::{EvidenceVault, KeyringKeyProvider, SourceRegistration, StoreRuntime};
@@ -105,14 +106,25 @@ pub async fn foreground(paths: &AgboxPaths) -> Result<(), CliError> {
     ));
     let home = paths.root.parent().ok_or(CliError::HomeUnavailable)?;
     bootstrap_sources(home, &store, &coordinator).await?;
+    let spool = HookSpool::new(&paths.spool, Arc::new(KeyringKeyProvider))
+        .map_err(|_| CliError::Unavailable)?;
     let application = ApplicationService::new(store.read().clone(), store.writer().clone(), vault);
     let server = LocalIpcServer::bind(paths.socket(), Arc::new(application))
         .await
         .map_err(|_| CliError::Unavailable)?;
     let daemon = Daemon::run(Components::new(server)).map_err(|_| CliError::Unavailable)?;
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|_| CliError::Unavailable)?;
+    let mut hook_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    loop {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(|_| CliError::Unavailable)?;
+                break;
+            }
+            _ = hook_tick.tick() => {
+                drain_hook_spool(&spool, &coordinator).await?;
+            }
+        }
+    }
     daemon.shutdown().await.map_err(|_| CliError::Unavailable)?;
     store.shutdown().await.map_err(|_| CliError::Unavailable)
 }
@@ -143,6 +155,33 @@ async fn bootstrap_sources(
             }
         }
     }
+    drain_coordinator(coordinator).await
+}
+
+async fn drain_hook_spool(
+    spool: &HookSpool,
+    coordinator: &Arc<IngestionCoordinator>,
+) -> Result<(), CliError> {
+    let coordinator_for_commit = Arc::clone(coordinator);
+    let committed = spool
+        .drain(move |signal| {
+            let coordinator = Arc::clone(&coordinator_for_commit);
+            async move {
+                let key = signal.source_key().map_err(|_| ())?;
+                coordinator
+                    .try_enqueue(key, signal.target_size(), WorkPriority::Live)
+                    .map_err(|_| ())
+            }
+        })
+        .await
+        .map_err(|_| CliError::Unavailable)?;
+    if committed != 0 {
+        drain_coordinator(coordinator).await?;
+    }
+    Ok(())
+}
+
+async fn drain_coordinator(coordinator: &Arc<IngestionCoordinator>) -> Result<(), CliError> {
     while let Some(lease) = coordinator.lease_one().map_err(|_| CliError::Unavailable)? {
         let _ = coordinator
             .process_one(lease)
