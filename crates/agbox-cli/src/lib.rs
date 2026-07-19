@@ -66,6 +66,7 @@ pub async fn run(cli: args::Cli) -> Result<(), CliError> {
             )
         }
         args::Command::Agent { command } => run_agent(command).await,
+        args::Command::Config { command } => run_config(output, command),
         args::Command::Work { command } => {
             let client = human_client(cli.project_root).await?;
             let request = match command {
@@ -162,7 +163,7 @@ pub async fn run(cli: args::Cli) -> Result<(), CliError> {
             .await
             .map_err(|_| CliError::Unavailable)
         }
-        _ => Err(CliError::Unavailable),
+        args::Command::Hook { .. } => Err(CliError::Unavailable),
     }
 }
 
@@ -179,6 +180,8 @@ pub enum CliError {
     InvalidIdentifier,
     #[error("unable to write bounded CLI output")]
     Output,
+    #[error("configuration value is invalid")]
+    InvalidConfig,
 }
 
 fn project_root(configured: Option<std::path::PathBuf>) -> Result<std::path::PathBuf, CliError> {
@@ -240,6 +243,27 @@ async fn run_agent(command: args::AgentCommand) -> Result<(), CliError> {
             .map(|_| ())
             .map_err(|_| CliError::Unavailable),
         args::AgentCommand::Disconnect => commands::agent::disconnect(&platform),
+    }
+}
+
+fn run_config(output: args::Output, command: args::ConfigCommand) -> Result<(), CliError> {
+    let executable = std::env::current_exe().map_err(|_| CliError::Unavailable)?;
+    let platform = platform::macos::MacOsPlatform::for_current_user(executable)
+        .map_err(|_| CliError::Unavailable)?;
+    let settings = commands::config::run(&platform, command)?;
+    match output {
+        args::Output::Json => {
+            let encoded = serde_json::to_vec(&settings).map_err(|_| CliError::Output)?;
+            std::io::stdout()
+                .lock()
+                .write_all(&encoded)
+                .and_then(|()| std::io::stdout().lock().write_all(b"\n"))
+                .map_err(|_| CliError::Output)
+        }
+        args::Output::Text => {
+            println!("retention_days={}", settings.retention_days);
+            Ok(())
+        }
     }
 }
 
