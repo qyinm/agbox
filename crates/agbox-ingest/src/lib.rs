@@ -275,6 +275,84 @@ pub mod test_support {
             self.coordinator.reduce_and_publish_grouped_next().await
         }
 
+        /// Adds another independently registered provider source to the same
+        /// fixture project through the production registration and coordinator
+        /// path. This intentionally does not seed events or contracts.
+        pub async fn add_provider_records<I, S>(
+            &self,
+            provider: Provider,
+            records: I,
+        ) -> Result<(), IngestError>
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<str>,
+        {
+            let mut bytes = Vec::new();
+            for record in records {
+                bytes.extend_from_slice(record.as_ref().as_bytes());
+                bytes.push(b'\n');
+            }
+            let root = self
+                .source_path
+                .parent()
+                .ok_or(IngestError::IdentityChanged)?
+                .canonicalize()
+                .map_err(IngestError::Io)?;
+            let source_path = root.join(format!("source-{}.jsonl", provider.as_str()));
+            std::fs::write(&source_path, bytes).map_err(IngestError::Io)?;
+            let source_path = source_path.canonicalize().map_err(IngestError::Io)?;
+            let stat = fs::stat(&source_path).map_err(|_| IngestError::IdentityChanged)?;
+            let size = u64::try_from(stat.st_size).map_err(|_| IngestError::IdentityChanged)?;
+            let device = u64::try_from(stat.st_dev).map_err(|_| IngestError::IdentityChanged)?;
+            let file_identity = format!("unix:{device}:{}", stat.st_ino);
+            let source_id = stable_source_id(&file_identity);
+            let mtime = stat_time(stat.st_mtime, stat.st_mtime_nsec)?;
+            let ctime = stat_time(stat.st_ctime, stat.st_ctime_nsec)?;
+            let root_stat = fs::stat(&root).map_err(|_| IngestError::IdentityChanged)?;
+            let root_device =
+                u64::try_from(root_stat.st_dev).map_err(|_| IngestError::IdentityChanged)?;
+            let project_id = ProjectId::for_test("project_fixture");
+            let discovered = DiscoveredSource {
+                source_id: source_id.clone(),
+                provider,
+                root: root.clone(),
+                path: source_path.clone(),
+                class: RootClass::Active,
+                file_identity: file_identity.clone(),
+                generation: 1,
+                size,
+                mtime,
+                ctime,
+                session_time: None,
+            };
+            self.store
+                .writer()
+                .register_source(SourceRegistration {
+                    project_id: project_id.clone(),
+                    repository_identity: format!("repo-fs-v1:{root_device}:{}", root_stat.st_ino),
+                    project_root: Zeroizing::new(path_bytes(&root)),
+                    source_id,
+                    provider,
+                    root_class: "active".to_owned(),
+                    source_path: Zeroizing::new(path_bytes(&source_path)),
+                    file_identity,
+                    generation: 1,
+                    size_bytes: size,
+                    mtime,
+                    session_time: None,
+                    initial_cursor: 0,
+                })
+                .await?;
+            let key = self.coordinator.register_source(CoordinatorSource {
+                discovered,
+                project_id,
+                project_root: Some(root),
+                format: source_format(provider).to_owned(),
+                observed_at: OffsetDateTime::UNIX_EPOCH,
+            })?;
+            self.coordinator.try_enqueue(key, size, WorkPriority::Live)
+        }
+
         #[must_use]
         pub fn read(&self) -> FixtureRead {
             FixtureRead {
@@ -413,6 +491,13 @@ pub mod test_support {
             "source_{}",
             &blake3::hash(identity.as_bytes()).to_hex()[..32]
         )
+    }
+
+    const fn source_format(provider: Provider) -> &'static str {
+        match provider {
+            Provider::Claude => "claude-transcript-2.1",
+            Provider::Codex => "codex-rollout-1",
+        }
     }
 }
 pub use coordinator::{
