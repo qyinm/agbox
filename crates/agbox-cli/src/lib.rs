@@ -1,5 +1,7 @@
 //! Native setup and command boundary for agbox.
 
+use std::io::Write;
+
 pub mod args;
 pub mod commands;
 pub mod config;
@@ -45,6 +47,23 @@ pub async fn run(cli: args::Cli) -> Result<(), CliError> {
             let client = human_client(cli.project_root).await?;
             let value = call(&client, agbox_core::api::AppRequest::Health).await?;
             commands::output::response(output, value)
+        }
+        args::Command::Doctor => {
+            let paths = AgboxPaths::from_home(&user_home()?);
+            let daemon_reachable = match project_root(cli.project_root) {
+                Ok(root) => commands::client::scoped_client(
+                    &paths,
+                    &root,
+                    agbox_service::ipc::WireActor::HumanCli,
+                )
+                .await
+                .is_ok(),
+                Err(_) => false,
+            };
+            render_doctor(
+                output,
+                commands::doctor::DoctorReport::inspect(&paths, daemon_reachable),
+            )
         }
         args::Command::Work { command } => {
             let client = human_client(cli.project_root).await?;
@@ -191,4 +210,31 @@ async fn call(
 
 fn parse_work_id(value: &str) -> Result<agbox_core::WorkId, CliError> {
     agbox_core::WorkId::parse_wire(value).ok_or(CliError::InvalidIdentifier)
+}
+
+fn render_doctor(
+    output: args::Output,
+    report: commands::doctor::DoctorReport,
+) -> Result<(), CliError> {
+    match output {
+        args::Output::Json => {
+            let encoded = serde_json::to_vec(&report).map_err(|_| CliError::Output)?;
+            std::io::stdout()
+                .lock()
+                .write_all(&encoded)
+                .and_then(|()| std::io::stdout().lock().write_all(b"\n"))
+                .map_err(|_| CliError::Output)
+        }
+        args::Output::Text => {
+            for check in report.checks {
+                println!("{:?}: {}", check.severity, check.code);
+                if !check.remediation.is_empty()
+                    && check.severity != commands::doctor::DoctorSeverity::Healthy
+                {
+                    println!("  {}", check.remediation);
+                }
+            }
+            Ok(())
+        }
+    }
 }
