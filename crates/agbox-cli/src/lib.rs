@@ -163,7 +163,23 @@ pub async fn run(cli: args::Cli) -> Result<(), CliError> {
             .await
             .map_err(|_| CliError::Unavailable)
         }
-        args::Command::Hook { .. } => Err(CliError::Unavailable),
+        args::Command::Hook { command } => {
+            let root = project_root(cli.project_root)?;
+            let paths = AgboxPaths::from_home(&user_home()?);
+            match command {
+                args::HookCommand::Ingest { .. } => Err(CliError::Unavailable),
+                args::HookCommand::ActiveIndex {
+                    provider,
+                    max_items,
+                } => {
+                    let provider = match provider {
+                        args::ProviderArg::Claude => agbox_core::Provider::Claude,
+                        args::ProviderArg::Codex => agbox_core::Provider::Codex,
+                    };
+                    commands::hook::active_index(&paths, &root, provider, max_items).await
+                }
+            }
+        }
     }
 }
 
