@@ -36,6 +36,9 @@ pub async fn run(cli: args::Cli) -> Result<(), CliError> {
             }
             Ok(())
         }
+        args::Command::Daemon {
+            command: args::DaemonCommand::Start { foreground: true },
+        } => commands::daemon::foreground(&AgboxPaths::from_home(&user_home()?)).await,
         args::Command::Mcp { provider } => {
             let root = project_root(cli.project_root)?;
             let provider = match provider {
