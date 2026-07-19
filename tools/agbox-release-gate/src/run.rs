@@ -706,8 +706,12 @@ mod tests {
     #[test]
     fn ingestion_latency_starts_after_the_append_has_completed() {
         let visible_at = Instant::now();
-        let append_started = visible_at - Duration::from_millis(160);
-        let append_completed = visible_at - Duration::from_millis(24);
+        let Some(append_started) = visible_at.checked_sub(Duration::from_millis(160)) else {
+            panic!("monotonic clock did not have 160ms of history");
+        };
+        let Some(append_completed) = visible_at.checked_sub(Duration::from_millis(24)) else {
+            panic!("monotonic clock did not have 24ms of history");
+        };
 
         assert_eq!(
             super::completed_append_latency_micros(append_completed, visible_at),
