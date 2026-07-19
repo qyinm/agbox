@@ -25,6 +25,7 @@ async fn daemon_shutdown_removes_its_socket() {
         .prefix("a")
         .tempdir_in("/tmp")
         .unwrap();
+    std::fs::create_dir(directory.path().join(".git")).unwrap();
     let socket = directory.path().join("agbox.sock");
     let server = LocalIpcServer::bind(&socket, Arc::new(Accepted))
         .await

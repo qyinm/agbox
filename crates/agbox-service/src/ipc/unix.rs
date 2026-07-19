@@ -8,6 +8,7 @@ use std::{
         io::AsRawFd,
     },
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use interprocess::local_socket::{
@@ -51,21 +52,7 @@ impl BoundUnixListener {
             }
             remove_stale_socket(&directory, &socket_name)?;
         }
-        let listener_name = canonical_path
-            .as_os_str()
-            .to_fs_name::<GenericFilePath>()
-            .map_err(|_| IpcError::BindFailed)?;
-        let listener = ListenerOptions::new()
-            .name(listener_name)
-            .reclaim_name(false)
-            .create_tokio()
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AddrInUse {
-                    IpcError::AlreadyRunning
-                } else {
-                    IpcError::BindFailed
-                }
-            })?;
+        let listener = create_listener(&canonical_path).await?;
         fs::set_permissions(&canonical_path, fs::Permissions::from_mode(0o600))
             .map_err(|_| IpcError::UnsafeSocketPath)?;
         Ok(Self {
@@ -103,6 +90,36 @@ impl BoundUnixListener {
             Err(_) => Err(IpcError::UnsafeSocketPath),
         }
     }
+}
+
+async fn create_listener(path: &Path) -> Result<Listener, IpcError> {
+    const TRANSIENT_PERMISSION_RETRIES: u8 = 3;
+    for attempt in 0..TRANSIENT_PERMISSION_RETRIES {
+        let listener_name = path
+            .as_os_str()
+            .to_fs_name::<GenericFilePath>()
+            .map_err(|_| IpcError::BindFailed)?;
+        match ListenerOptions::new()
+            .name(listener_name)
+            .reclaim_name(false)
+            .create_tokio()
+        {
+            Ok(listener) => return Ok(listener),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    && attempt + 1 < TRANSIENT_PERMISSION_RETRIES =>
+            {
+                // macOS can briefly reject a new filesystem socket immediately
+                // after another short-lived test/runtime socket is removed.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                return Err(IpcError::AlreadyRunning);
+            }
+            Err(_) => return Err(IpcError::BindFailed),
+        }
+    }
+    Err(IpcError::BindFailed)
 }
 
 pub(crate) async fn connect(path: &Path) -> Result<Stream, IpcError> {
