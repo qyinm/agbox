@@ -69,6 +69,8 @@ pub enum ServiceError {
     EvidenceUnavailable,
     #[error("evidence operation failed")]
     Evidence,
+    #[error("service is still initializing")]
+    Unavailable,
 }
 
 #[async_trait]

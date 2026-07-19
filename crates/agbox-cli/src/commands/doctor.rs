@@ -79,6 +79,24 @@ impl DoctorReport {
             severity: regular_owner_file(&paths.state_db),
             remediation: "run agbox daemon start",
         });
+        for (code, directory) in [
+            ("evidence.owner_only", &paths.evidence),
+            ("spool.owner_only", &paths.spool),
+            ("logs.owner_only", &paths.logs),
+            ("runtime.owner_only", &paths.runtime),
+            ("config.owner_only", &paths.config),
+        ] {
+            report.checks.push(DoctorCheck {
+                code,
+                severity: private_runtime(directory),
+                remediation: "run agbox init",
+            });
+        }
+        report.checks.push(DoctorCheck {
+            code: "evidence.root_containment",
+            severity: contained_child(&paths.root, &paths.evidence),
+            remediation: "remove the unsafe evidence path and run agbox init",
+        });
         report.checks.push(DoctorCheck {
             code: "legacy.runtime",
             severity: if paths.root.join("agbox.db").exists() {
@@ -89,6 +107,20 @@ impl DoctorReport {
             remediation: "legacy agbox.db is ignored; run agbox init to retire the legacy service",
         });
         report
+    }
+}
+
+fn contained_child(root: &Path, child: &Path) -> DoctorSeverity {
+    let Ok(root) = root.canonicalize() else {
+        return DoctorSeverity::Failing;
+    };
+    let Ok(child) = child.canonicalize() else {
+        return DoctorSeverity::Failing;
+    };
+    if child.starts_with(root) {
+        DoctorSeverity::Healthy
+    } else {
+        DoctorSeverity::Failing
     }
 }
 

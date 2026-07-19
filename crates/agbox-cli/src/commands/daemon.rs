@@ -8,7 +8,10 @@ use agbox_ingest::{
     IngestionCoordinator, RecordScanner, ScanOutcome, VerifiedSourceOpener, WorkPriority,
     resolve_source_project,
 };
-use agbox_service::{ApplicationService, Components, Daemon, ipc::LocalIpcServer};
+use agbox_service::{
+    ApplicationService, Components, Daemon,
+    ipc::{DeferredRequestHandler, LocalIpcServer},
+};
 use agbox_store::{EvidenceVault, KeyringKeyProvider, SourceRegistration, StoreRuntime};
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
@@ -91,6 +94,42 @@ fn read_bounded_log(path: &Path) -> Result<String, CliError> {
 /// Returns a stable CLI error when the store, IPC daemon, signal, or shutdown
 /// lifecycle cannot complete.
 pub async fn foreground(paths: &AgboxPaths) -> Result<(), CliError> {
+    // Reserve the singleton owner-only socket before touching the credential
+    // store or SQLite. This prevents a concurrent init/daemon invocation from
+    // becoming a second writer during slow startup.
+    let deferred = Arc::new(DeferredRequestHandler::default());
+    let server = LocalIpcServer::bind(paths.socket(), deferred.clone())
+        .await
+        .map_err(|_| CliError::Unavailable)?;
+    let daemon = Daemon::run(Components::new(server)).map_err(|_| CliError::Unavailable)?;
+    let runtime = start_runtime(paths, &deferred).await;
+    let (store, spool, coordinator) = match runtime {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = daemon.shutdown().await;
+            return Err(error);
+        }
+    };
+    let mut hook_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    loop {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(|_| CliError::Unavailable)?;
+                break;
+            }
+            _ = hook_tick.tick() => {
+                drain_hook_spool(&spool, &coordinator).await?;
+            }
+        }
+    }
+    daemon.shutdown().await.map_err(|_| CliError::Unavailable)?;
+    store.shutdown().await.map_err(|_| CliError::Unavailable)
+}
+
+async fn start_runtime(
+    paths: &AgboxPaths,
+    deferred: &DeferredRequestHandler,
+) -> Result<(StoreRuntime, HookSpool, Arc<IngestionCoordinator>), CliError> {
     let store = StoreRuntime::start(&paths.state_db)
         .await
         .map_err(|_| CliError::Unavailable)?;
@@ -109,24 +148,8 @@ pub async fn foreground(paths: &AgboxPaths) -> Result<(), CliError> {
     let spool = HookSpool::new(&paths.spool, Arc::new(KeyringKeyProvider))
         .map_err(|_| CliError::Unavailable)?;
     let application = ApplicationService::new(store.read().clone(), store.writer().clone(), vault);
-    let server = LocalIpcServer::bind(paths.socket(), Arc::new(application))
-        .await
-        .map_err(|_| CliError::Unavailable)?;
-    let daemon = Daemon::run(Components::new(server)).map_err(|_| CliError::Unavailable)?;
-    let mut hook_tick = tokio::time::interval(std::time::Duration::from_millis(250));
-    loop {
-        tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal.map_err(|_| CliError::Unavailable)?;
-                break;
-            }
-            _ = hook_tick.tick() => {
-                drain_hook_spool(&spool, &coordinator).await?;
-            }
-        }
-    }
-    daemon.shutdown().await.map_err(|_| CliError::Unavailable)?;
-    store.shutdown().await.map_err(|_| CliError::Unavailable)
+    deferred.activate(Arc::new(application)).await;
+    Ok((store, spool, coordinator))
 }
 
 async fn bootstrap_sources(

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-test-support = []
+test-support = ["agbox-ingest/test-support"]
 
 [[bin]]
 name = "agbox"
@@ -35,6 +35,9 @@ toml_edit.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+tokio-util.workspace = true
 
 [lints]
 workspace = true

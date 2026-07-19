@@ -24,7 +24,7 @@ use futures::{SinkExt, StreamExt};
 use interprocess::local_socket::traits::StreamCommon;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore},
     task::JoinSet,
 };
 use tokio_util::{
@@ -168,6 +168,42 @@ pub trait ScopedRequestHandler: Send + Sync {
         scope: RequestScope,
         request: AppRequest,
     ) -> Result<AppResponse, ServiceError>;
+}
+
+/// Keeps the singleton socket reserved while the daemon initializes its
+/// credential-backed store. Requests are never routed until the real scoped
+/// handler has been installed.
+#[derive(Default)]
+pub struct DeferredRequestHandler {
+    active: RwLock<Option<Arc<dyn ScopedRequestHandler>>>,
+}
+
+impl fmt::Debug for DeferredRequestHandler {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeferredRequestHandler")
+            .finish_non_exhaustive()
+    }
+}
+
+impl DeferredRequestHandler {
+    /// Atomically makes the verified application handler available to IPC.
+    pub async fn activate(&self, handler: Arc<dyn ScopedRequestHandler>) {
+        *self.active.write().await = Some(handler);
+    }
+}
+
+#[async_trait]
+impl ScopedRequestHandler for DeferredRequestHandler {
+    async fn dispatch(
+        &self,
+        scope: RequestScope,
+        request: AppRequest,
+    ) -> Result<AppResponse, ServiceError> {
+        let handler = self.active.read().await.clone();
+        let handler = handler.ok_or(ServiceError::Unavailable)?;
+        handler.dispatch(scope, request).await
+    }
 }
 
 #[async_trait]
@@ -524,9 +560,56 @@ fn public_error(error: &ServiceError) -> PublicServiceError {
             code: PublicErrorCode::Unavailable,
             message: PublicMessage::EvidenceUnavailable,
         },
+        ServiceError::Unavailable => PublicServiceError {
+            code: PublicErrorCode::Unavailable,
+            message: PublicMessage::ServiceUnavailable,
+        },
         ServiceError::Store(_) => PublicServiceError {
             code: PublicErrorCode::Internal,
             message: PublicMessage::ServiceUnavailable,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use agbox_core::ProjectId;
+
+    use super::{AppRequest, AppResponse, DeferredRequestHandler, ScopedRequestHandler};
+    use crate::{RequestActor, RequestScope, ServiceError};
+    use async_trait::async_trait;
+
+    #[derive(Debug)]
+    struct Ready;
+
+    #[async_trait]
+    impl ScopedRequestHandler for Ready {
+        async fn dispatch(
+            &self,
+            _: RequestScope,
+            _: AppRequest,
+        ) -> Result<AppResponse, ServiceError> {
+            Ok(AppResponse::Accepted)
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_handler_reserves_ipc_without_dispatching_before_readiness() {
+        let handler = DeferredRequestHandler::default();
+        let Some(project_id) = ProjectId::parse_wire("project_deferred") else {
+            panic!("valid fixture project id");
+        };
+        let scope = RequestScope::verified(project_id, RequestActor::HumanCli);
+        assert!(matches!(
+            handler.dispatch(scope.clone(), AppRequest::Health).await,
+            Err(ServiceError::Unavailable)
+        ));
+        handler.activate(Arc::new(Ready)).await;
+        assert!(matches!(
+            handler.dispatch(scope, AppRequest::Health).await,
+            Ok(AppResponse::Accepted)
+        ));
     }
 }

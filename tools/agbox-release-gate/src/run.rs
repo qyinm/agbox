@@ -14,10 +14,12 @@ use std::{
 
 use agbox_adapters::{DiscoveredSource, RootClass};
 use agbox_core::{ProjectId, Provider, api::AppRequest};
-use agbox_ingest::{CoordinatorSource, IngestionCoordinator, SourceKey, WorkPriority};
+use agbox_ingest::{
+    CoordinatorSource, IngestionCoordinator, ProjectResolver, SourceKey, WorkPriority,
+};
 use agbox_service::{
     AppClient, ApplicationService, IpcAppClient,
-    ipc::{IPC_PROTOCOL_VERSION, IpcHello, LocalIpcServer, WireActor},
+    ipc::{DeferredRequestHandler, IPC_PROTOCOL_VERSION, IpcHello, LocalIpcServer, WireActor},
 };
 use agbox_store::{CryptoError, EvidenceVault, KeyProvider, SourceRegistration, StoreRuntime};
 use time::OffsetDateTime;
@@ -133,9 +135,35 @@ pub async fn execute(options: RunOptions) -> Result<ReleaseArtifact, String> {
     }
     let project_root = root.path().join("project");
     fs::create_dir_all(project_root.join(".git")).map_err(|_| "project_root")?;
+    let project_root = project_root.canonicalize().map_err(|_| "project_root")?;
+    let resolved_project = ProjectResolver::new(&project_root)
+        .and_then(|resolver| resolver.resolve(&project_root))
+        .map_err(|_| "project_identity")?;
     let corpus_root = root.path().join("corpus");
     fs::create_dir(&corpus_root).map_err(|_| "corpus_root")?;
     let manifest = manifest(&CorpusSpec::release());
+    // Reserve the singleton first: a performance gate must exercise the same
+    // startup ordering as the daemon and cannot allow a second writer to race
+    // the store migration/credential initialization path.
+    // Keep the macOS filesystem-socket name below its platform bound even
+    // when a CI artifact directory has a long checkout/workflow prefix.
+    let socket_directory = tempfile::Builder::new()
+        .prefix("a")
+        .tempdir_in("/tmp")
+        .map_err(|_| "socket_directory")?;
+    let socket = socket_directory.path().join("agbox.sock");
+    let deferred = Arc::new(DeferredRequestHandler::default());
+    let server = Arc::new(
+        LocalIpcServer::bind(&socket, deferred.clone())
+            .await
+            .map_err(|_| "ipc_bind")?,
+    );
+    let cancellation = CancellationToken::new();
+    let serving = {
+        let server = Arc::clone(&server);
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move { server.serve_until(cancellation).await })
+    };
     let store = StoreRuntime::start_with_key_provider(
         root.path().join("state.db"),
         Arc::new(FixedKeyProvider),
@@ -149,35 +177,24 @@ pub async fn execute(options: RunOptions) -> Result<ReleaseArtifact, String> {
         store.writer().clone(),
         agbox_ingest::SOURCE_QUEUE_CAPACITY,
     ));
-    let project_id = ProjectId::parse_wire("project_release_gate").ok_or("project_id")?;
     let registered = register_corpus(
         &manifest,
         &corpus_root,
         &project_root,
-        &project_id,
+        &resolved_project.project_id,
+        &resolved_project.repository_identity,
         &store,
         &coordinator,
     )
     .await?;
     let eof_probe_bytes_read = probe_eof(&registered[0].source.discovered.path)?;
 
-    let socket = root.path().join("agbox.sock");
     let app = Arc::new(ApplicationService::new(
         store.read().clone(),
         store.writer().clone(),
         vault,
     ));
-    let server = Arc::new(
-        LocalIpcServer::bind(&socket, app)
-            .await
-            .map_err(|_| "ipc_bind")?,
-    );
-    let cancellation = CancellationToken::new();
-    let serving = {
-        let server = Arc::clone(&server);
-        let cancellation = cancellation.clone();
-        tokio::spawn(async move { server.serve_until(cancellation).await })
-    };
+    deferred.activate(app).await;
     let client = IpcAppClient::connect(
         &socket,
         IpcHello {
@@ -299,11 +316,10 @@ async fn register_corpus(
     corpus_root: &Path,
     project_root: &Path,
     project_id: &ProjectId,
+    repository_identity: &str,
     store: &StoreRuntime,
     coordinator: &Arc<IngestionCoordinator>,
 ) -> Result<Vec<RegisteredSource>, String> {
-    let root_metadata = fs::metadata(project_root).map_err(|_| "project_metadata")?;
-    let repository_identity = format!("repo-fs-v1:{}:{}", root_metadata.dev(), root_metadata.ino());
     let now = OffsetDateTime::now_utc();
     let mut sources = Vec::with_capacity(manifest.sources.len());
     for declaration in &manifest.sources {
@@ -332,7 +348,7 @@ async fn register_corpus(
             .writer()
             .register_source(SourceRegistration {
                 project_id: project_id.clone(),
-                repository_identity: repository_identity.clone(),
+                repository_identity: repository_identity.into(),
                 project_root: Zeroizing::new(project_root.as_os_str().as_bytes().to_vec()),
                 source_id: source.source_id.clone(),
                 provider,

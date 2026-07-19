@@ -93,7 +93,11 @@ impl BoundUnixListener {
 }
 
 async fn create_listener(path: &Path) -> Result<Listener, IpcError> {
-    const TRANSIENT_PERMISSION_RETRIES: u8 = 3;
+    // macOS may return EPERM briefly after a Unix-domain socket is reclaimed.
+    // The parent directory has already passed ownership and mode checks, so a
+    // bounded one-second retry is safe and avoids treating a transient kernel
+    // refusal as daemon startup failure.
+    const TRANSIENT_PERMISSION_RETRIES: u8 = 20;
     for attempt in 0..TRANSIENT_PERMISSION_RETRIES {
         let listener_name = path
             .as_os_str()
@@ -111,7 +115,7 @@ async fn create_listener(path: &Path) -> Result<Listener, IpcError> {
             {
                 // macOS can briefly reject a new filesystem socket immediately
                 // after another short-lived test/runtime socket is removed.
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
                 return Err(IpcError::AlreadyRunning);
