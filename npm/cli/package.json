@@ -13,7 +13,6 @@
   },
   "files": [
     "bin/",
-    "cache/",
     "scripts/",
     "native.json",
     "README.md"

@@ -18,8 +18,19 @@ const ALLOWED_HOSTS = new Set(["github.com", "objects.githubusercontent.com", "r
 
 function verified(binary) {
   if (!fs.existsSync(binary) || fs.lstatSync(binary).isSymbolicLink()) return false;
-  const hash = crypto.createHash("sha256").update(fs.readFileSync(binary)).digest("hex");
-  return hash === metadata.sha256;
+  const hash = crypto.createHash("sha256");
+  const descriptor = fs.openSync(binary, "r");
+  const chunk = Buffer.allocUnsafe(64 * 1024);
+  try {
+    let bytesRead;
+    do {
+      bytesRead = fs.readSync(descriptor, chunk, 0, chunk.length, null);
+      if (bytesRead > 0) hash.update(chunk.subarray(0, bytesRead));
+    } while (bytesRead > 0);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  return hash.digest("hex") === metadata.sha256;
 }
 
 function download(url, destination, redirects = 0) {

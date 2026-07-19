@@ -22,4 +22,5 @@ test("npm launcher has no legacy dist fallback", () => {
   assert.match(launcher, /cache.*agbox-darwin-arm64/s);
   const packageJson = JSON.parse(fs.readFileSync(path.join(root, "npm/cli/package.json"), "utf8"));
   assert.equal(packageJson.scripts["test:cutover"], "node --test test/rust-cutover.test.js");
+  assert.equal(packageJson.files.includes("cache/"), false);
 });
