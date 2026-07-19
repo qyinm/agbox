@@ -26,7 +26,7 @@ pub async fn run(command: DaemonCommand, paths: &AgboxPaths) -> Result<(), CliEr
         DaemonCommand::Start { foreground: true } => foreground(paths).await,
         DaemonCommand::Start { foreground: false } => service_change(true),
         DaemonCommand::Stop => service_change(false),
-        DaemonCommand::Logs { follow } => logs(paths, follow),
+        DaemonCommand::Logs { follow } => logs(paths, follow).await,
     }
 }
 
@@ -42,25 +42,45 @@ fn service_change(start: bool) -> Result<(), CliError> {
     result.map(|_| ()).map_err(|_| CliError::Unavailable)
 }
 
-fn logs(paths: &AgboxPaths, follow: bool) -> Result<(), CliError> {
-    if follow {
-        return Err(CliError::Unavailable);
-    }
+async fn logs(paths: &AgboxPaths, follow: bool) -> Result<(), CliError> {
     let path = paths.logs.join("agbox.log");
-    let metadata = std::fs::symlink_metadata(&path).map_err(|_| CliError::Unavailable)?;
+    let mut emitted = 0_usize;
+    loop {
+        let contents = read_bounded_log(&path)?;
+        let entries = contents.lines().collect::<Vec<_>>();
+        let start = if emitted == 0 {
+            entries.len().saturating_sub(200)
+        } else if entries.len() < emitted {
+            0
+        } else {
+            emitted
+        };
+        for entry in entries.iter().skip(start) {
+            if entry.len() > agbox_service::logging::MAX_LOG_ENTRY_BYTES {
+                return Err(CliError::Unavailable);
+            }
+            println!("{entry}");
+        }
+        emitted = entries.len();
+        if !follow {
+            return Ok(());
+        }
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                let _ = result;
+                return Ok(());
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+        }
+    }
+}
+
+fn read_bounded_log(path: &Path) -> Result<String, CliError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| CliError::Unavailable)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 1_048_576 {
         return Err(CliError::Unavailable);
     }
-    let contents = std::fs::read_to_string(path).map_err(|_| CliError::Unavailable)?;
-    let entries = contents.lines().collect::<Vec<_>>();
-    let start = entries.len().saturating_sub(200);
-    for entry in entries.into_iter().skip(start) {
-        if entry.len() > agbox_service::logging::MAX_LOG_ENTRY_BYTES {
-            return Err(CliError::Unavailable);
-        }
-        println!("{entry}");
-    }
-    Ok(())
+    std::fs::read_to_string(path).map_err(|_| CliError::Unavailable)
 }
 
 /// Runs the single-writer foreground service until an interrupt signal arrives.
