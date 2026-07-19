@@ -1,3 +1,4 @@
+mod attribution;
 mod coordinator;
 mod discovery;
 mod history;
@@ -8,6 +9,7 @@ mod record;
 mod spool;
 mod watcher;
 
+pub use attribution::{SourceAttributionError, resolve_source_project};
 pub use discovery::{
     DISCOVERY_ENTRIES_PER_YIELD, DiscoveryBatch, DiscoveryCursor, DiscoveryError, DiscoveryFault,
     DiscoveryFaultClass, DiscoveryWalker, MAX_DISCOVERY_CURSOR_BYTES,
