@@ -1,0 +1,19 @@
+name: Rust release gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        required: true
+        default: ci-smoke
+
+jobs:
+  contract:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - run: cargo test -p agbox-release-gate
+      - run: cargo build --locked --release --target aarch64-apple-darwin -p agbox-cli
