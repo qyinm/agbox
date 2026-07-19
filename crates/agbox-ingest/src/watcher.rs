@@ -548,7 +548,9 @@ fn join_error(_: tokio::task::JoinError) -> WatcherError {
 
 pub struct WatcherHandle {
     receiver: mpsc::Receiver<QueueItem>,
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     bridge: WatchSignalBridge,
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     control: mpsc::Sender<Control>,
     task: Option<tokio::task::JoinHandle<Result<(), WatcherError>>>,
     readiness: Option<oneshot::Receiver<()>>,
@@ -682,6 +684,7 @@ impl WatcherHandle {
 }
 
 enum Control {
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     Flush(oneshot::Sender<()>),
 }
 

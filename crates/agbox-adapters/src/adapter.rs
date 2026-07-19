@@ -5,9 +5,10 @@ use std::{
 };
 
 use agbox_core::{
-    ActivityEventV1, ByteRange, ContentRef, DecodeStatus, EventId, EvidenceId, ProjectId, Provider,
-    SourceObservation, SourceObservationDraft, SourceRef, SourceRefDraft,
+    ActivityEventV1, ContentRef, EventId, EvidenceId, ProjectId, Provider, SourceObservation,
 };
+#[cfg(feature = "test-support")]
+use agbox_core::{ByteRange, DecodeStatus, SourceObservationDraft, SourceRef, SourceRefDraft};
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
@@ -16,6 +17,7 @@ pub use agbox_core::limits::{
     MAX_RECORD_SEMANTIC_BYTES,
 };
 
+#[cfg(feature = "test-support")]
 use crate::BoundedJsonReader;
 
 const MAX_NATIVE_IDENTIFIER_BYTES: usize = 128;

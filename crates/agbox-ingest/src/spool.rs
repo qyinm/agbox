@@ -326,6 +326,7 @@ impl fmt::Debug for SpoolError {
 }
 
 pub struct HookSpool {
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     directory_path: PathBuf,
     directory: File,
     key: Zeroizing<[u8; 32]>,

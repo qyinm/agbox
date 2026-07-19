@@ -14,11 +14,23 @@ agbox-ingest.workspace = true
 agbox-store.workspace = true
 agbox-workgraph.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+hdrhistogram.workspace = true
+interprocess.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sysinfo.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
