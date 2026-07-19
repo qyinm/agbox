@@ -65,6 +65,7 @@ pub async fn run(cli: args::Cli) -> Result<(), CliError> {
                 commands::doctor::DoctorReport::inspect(&paths, daemon_reachable),
             )
         }
+        args::Command::Agent { command } => run_agent(command).await,
         args::Command::Work { command } => {
             let client = human_client(cli.project_root).await?;
             let request = match command {
@@ -209,6 +210,37 @@ async fn human_client(
         agbox_service::ipc::WireActor::HumanCli,
     )
     .await
+}
+
+async fn run_agent(command: args::AgentCommand) -> Result<(), CliError> {
+    let executable = std::env::current_exe().map_err(|_| CliError::Unavailable)?;
+    let platform = platform::macos::MacOsPlatform::for_current_user(executable)
+        .map_err(|_| CliError::Unavailable)?;
+    match command {
+        args::AgentCommand::List => {
+            let home = platform.home().map_err(|_| CliError::Unavailable)?;
+            println!(
+                "claude: {}\ncodex: {}",
+                if home.join(".claude.json").is_file() {
+                    "configured"
+                } else {
+                    "not configured"
+                },
+                if home.join(".codex/config.toml").is_file() {
+                    "configured"
+                } else {
+                    "not configured"
+                }
+            );
+            Ok(())
+        }
+        args::AgentCommand::Connect => Initializer::new(platform)
+            .run(InitOptions { quiet: true })
+            .await
+            .map(|_| ())
+            .map_err(|_| CliError::Unavailable),
+        args::AgentCommand::Disconnect => commands::agent::disconnect(&platform),
+    }
 }
 
 async fn call(

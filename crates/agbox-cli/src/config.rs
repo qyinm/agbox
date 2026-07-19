@@ -86,6 +86,35 @@ pub fn merge_codex_config(
     Ok(document.to_string().into_bytes())
 }
 
+/// Removes only agbox's Claude MCP entry, preserving every unrelated field.
+pub fn remove_claude_user(existing: &[u8]) -> Result<Vec<u8>, PlatformError> {
+    let mut root: Value =
+        serde_json::from_slice(existing).map_err(|_| PlatformError::InvalidConfiguration)?;
+    let object = root
+        .as_object_mut()
+        .ok_or(PlatformError::InvalidConfiguration)?;
+    if let Some(servers) = object.get_mut("mcpServers").and_then(Value::as_object_mut) {
+        servers.remove("agbox");
+    }
+    serde_json::to_vec_pretty(&root).map_err(|_| PlatformError::InvalidConfiguration)
+}
+
+/// Removes only agbox's Codex MCP table, preserving every unrelated TOML key.
+pub fn remove_codex_config(existing: &[u8]) -> Result<Vec<u8>, PlatformError> {
+    let source = std::str::from_utf8(existing).map_err(|_| PlatformError::InvalidConfiguration)?;
+    let mut document = source
+        .parse::<DocumentMut>()
+        .map_err(|_| PlatformError::InvalidConfiguration)?;
+    if let Some(servers) = document
+        .as_table_mut()
+        .get_mut("mcp_servers")
+        .and_then(Item::as_table_mut)
+    {
+        servers.remove("agbox");
+    }
+    Ok(document.to_string().into_bytes())
+}
+
 fn string_array<const N: usize>(values: [&str; N]) -> Item {
     let mut array = Array::new();
     for entry in values {
