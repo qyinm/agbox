@@ -118,6 +118,21 @@ pub async fn run(cli: args::Cli) -> Result<(), CliError> {
             .await?;
             commands::output::response(output, value)
         }
+        args::Command::Tui => {
+            let client = human_client(cli.project_root).await?;
+            let value = call(
+                &client,
+                agbox_core::api::AppRequest::ListWork {
+                    status: None,
+                    limit: 100,
+                },
+            )
+            .await?;
+            let agbox_core::api::AppResponse::WorkList(page) = value else {
+                return Err(CliError::Unavailable);
+            };
+            tui::run(page.items).map_err(|_| CliError::Unavailable)
+        }
         args::Command::Forget { command } => {
             let client = human_client(cli.project_root).await?;
             let request = match command {

@@ -51,24 +51,31 @@ pub struct App {
 }
 
 impl App {
+    /// Creates a bounded screen model from already-scoped immutable summaries.
+    #[must_use]
+    pub fn from_work(mut work: Vec<WorkSummary>) -> Self {
+        work.truncate(MAX_WORK);
+        Self {
+            status: None,
+            work,
+            selected: 0,
+            focus: Focus::List,
+        }
+    }
+
     #[must_use]
     pub fn fixture() -> Self {
         let work_id = WorkId::parse_wire("work_fixture").unwrap_or_else(|| unreachable!());
         let contract_id =
             ContractId::parse_wire("contract_fixture").unwrap_or_else(|| unreachable!());
-        Self {
-            status: None,
-            work: vec![WorkSummary {
-                work_id,
-                contract_id,
-                revision: 1,
-                status: WorkStatus::Active,
-                objective: Some("Bound memory".into()),
-                summary: "Fixture work".into(),
-            }],
-            selected: 0,
-            focus: Focus::List,
-        }
+        Self::from_work(vec![WorkSummary {
+            work_id,
+            contract_id,
+            revision: 1,
+            status: WorkStatus::Active,
+            objective: Some("Bound memory".into()),
+            summary: "Fixture work".into(),
+        }])
     }
     #[must_use]
     pub fn focus(&self) -> Focus {
