@@ -1,5 +1,9 @@
 //! Machine-readable release threshold evaluation.
 
+pub mod corpus;
+pub mod metrics;
+pub mod recovery;
+
 use serde::{Deserialize, Serialize};
 
 /// Immutable performance and recovery thresholds for a release candidate.
@@ -54,6 +58,59 @@ pub struct GateReport {
 pub struct GateEvaluation {
     pub passed: bool,
     pub failures: Vec<String>,
+}
+
+/// Candidate-bound report consumed by the cutover guard. A report that lacks
+/// any one of these immutable bindings is never eligible for Go removal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReleaseArtifact {
+    pub schema_version: u16,
+    pub profile: String,
+    pub duration_seconds: u64,
+    pub commit_sha: String,
+    pub target: String,
+    pub binary_sha256: String,
+    pub corpus_manifest_hash: String,
+    pub thresholds: Thresholds,
+    pub report: GateReport,
+    pub evaluation: GateEvaluation,
+}
+
+impl ReleaseArtifact {
+    /// Validates the non-negotiable Task 27 predecessor contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded machine-readable reason if this report cannot prove
+    /// the exact candidate is eligible for cutover.
+    pub fn verify_for_cutover(
+        &self,
+        current_commit: &str,
+        expected_binary_sha256: &str,
+    ) -> Result<(), &'static str> {
+        if self.schema_version != 1 {
+            return Err("schema_version");
+        }
+        if self.profile != "release" || self.duration_seconds != 24 * 60 * 60 {
+            return Err("duration");
+        }
+        if self.commit_sha != current_commit || self.binary_sha256 != expected_binary_sha256 {
+            return Err("candidate_binding");
+        }
+        if self.target != "aarch64-apple-darwin" {
+            return Err("target");
+        }
+        if self.thresholds != Thresholds::release() {
+            return Err("thresholds");
+        }
+        if !self.evaluation.passed || !self.report.evaluate(&self.thresholds).passed {
+            return Err("failed_measurement");
+        }
+        if self.corpus_manifest_hash.len() != 64 {
+            return Err("corpus_manifest_hash");
+        }
+        Ok(())
+    }
 }
 
 impl GateReport {

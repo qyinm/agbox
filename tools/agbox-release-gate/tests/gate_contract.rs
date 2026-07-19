@@ -1,5 +1,8 @@
 #![allow(clippy::unwrap_used)]
-use agbox_release_gate::{GateReport, Thresholds};
+use agbox_release_gate::{
+    GateReport, ReleaseArtifact, Thresholds,
+    corpus::{CorpusSpec, manifest},
+};
 #[test]
 fn release_thresholds_match_the_approved_spec() {
     let thresholds = Thresholds::release();
@@ -18,4 +21,27 @@ fn release_thresholds_match_the_approved_spec() {
 fn any_failed_measurement_fails_the_report() {
     let report = GateReport::fixture_with_peak_rss(256 * 1024 * 1024 + 1);
     assert!(!report.evaluate(&Thresholds::release()).passed);
+}
+
+#[test]
+fn release_artifact_rejects_short_or_unbound_reports() {
+    let corpus = manifest(&CorpusSpec::release());
+    let report = GateReport::fixture_with_peak_rss(1);
+    let evaluation = report.evaluate(&Thresholds::release());
+    let artifact = ReleaseArtifact {
+        schema_version: 1,
+        profile: "release".into(),
+        duration_seconds: 600,
+        commit_sha: "candidate".into(),
+        target: "aarch64-apple-darwin".into(),
+        binary_sha256: "binary".into(),
+        corpus_manifest_hash: corpus.hash,
+        thresholds: Thresholds::release(),
+        report,
+        evaluation,
+    };
+    assert_eq!(
+        artifact.verify_for_cutover("candidate", "binary"),
+        Err("duration")
+    );
 }
