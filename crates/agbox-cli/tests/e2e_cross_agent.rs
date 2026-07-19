@@ -206,11 +206,21 @@ impl E2eRuntime {
 }
 
 #[tokio::test]
-async fn claude_and_codex_share_one_scoped_handoff_but_not_another_project() {
+async fn claude_and_codex_share_scoped_handoffs_in_both_directions() {
     let codex = include_str!("../../agbox-adapters/tests/fixtures/codex/subagents.jsonl");
     let claude = include_str!("../../agbox-adapters/tests/fixtures/claude/sidechain.jsonl");
-    let runtime = E2eRuntime::start(Provider::Claude, claude).await;
-    runtime.add_source(Provider::Codex, codex, 2).await;
+    assert_shared_handoff(Provider::Claude, claude, Provider::Codex, codex).await;
+    assert_shared_handoff(Provider::Codex, codex, Provider::Claude, claude).await;
+}
+
+async fn assert_shared_handoff(
+    first_provider: Provider,
+    first_records: &str,
+    second_provider: Provider,
+    second_records: &str,
+) {
+    let runtime = E2eRuntime::start(first_provider, first_records).await;
+    runtime.add_source(second_provider, second_records, 2).await;
     let (server, cancel, serving) = runtime.start_ipc().await;
     runtime.publish().await;
     let socket = runtime.ipc_directory.path().join("agbox.sock");

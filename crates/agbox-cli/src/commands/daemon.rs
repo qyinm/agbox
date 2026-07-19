@@ -1,6 +1,10 @@
 //! Foreground daemon composition.
 
-use std::{os::unix::ffi::OsStrExt, path::Path, sync::Arc};
+use std::{
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use agbox_adapters::{RootClass, adapters};
 use agbox_ingest::{
@@ -47,11 +51,9 @@ fn service_change(start: bool) -> Result<(), CliError> {
 }
 
 async fn logs(paths: &AgboxPaths, follow: bool) -> Result<(), CliError> {
-    let path = paths.logs.join("agbox.log");
     let mut emitted = 0_usize;
     loop {
-        let contents = read_bounded_log(&path)?;
-        let entries = contents.lines().collect::<Vec<_>>();
+        let entries = read_bounded_logs(paths)?;
         let start = if emitted == 0 {
             entries.len().saturating_sub(200)
         } else if entries.len() < emitted {
@@ -60,9 +62,6 @@ async fn logs(paths: &AgboxPaths, follow: bool) -> Result<(), CliError> {
             emitted
         };
         for entry in entries.iter().skip(start) {
-            if entry.len() > agbox_service::logging::MAX_LOG_ENTRY_BYTES {
-                return Err(CliError::Unavailable);
-            }
             println!("{entry}");
         }
         emitted = entries.len();
@@ -79,12 +78,74 @@ async fn logs(paths: &AgboxPaths, follow: bool) -> Result<(), CliError> {
     }
 }
 
-fn read_bounded_log(path: &Path) -> Result<String, CliError> {
+#[derive(serde::Deserialize)]
+struct LogWire {
+    kind: String,
+    result: String,
+    byte_length: u32,
+}
+
+fn read_bounded_logs(paths: &AgboxPaths) -> Result<Vec<String>, CliError> {
+    let mut entries = Vec::new();
+    let mut total_bytes = 0_u64;
+    for path in rotated_log_paths(&paths.logs) {
+        if !path.exists() {
+            continue;
+        }
+        let metadata = checked_log_file(&path)?;
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        if total_bytes > 1_048_576 {
+            return Err(CliError::Unavailable);
+        }
+        let contents = std::fs::read_to_string(&path).map_err(|_| CliError::Unavailable)?;
+        for line in contents.lines() {
+            if line.len() > agbox_service::logging::MAX_LOG_ENTRY_BYTES {
+                return Err(CliError::Unavailable);
+            }
+            entries.push(render_log_line(line)?);
+        }
+    }
+    Ok(entries)
+}
+
+fn rotated_log_paths(directory: &Path) -> Vec<PathBuf> {
+    let mut paths = (1..=agbox_service::logging::RETAINED_LOG_FILES)
+        .rev()
+        .map(|index| directory.join(format!("agbox.log.{index}")))
+        .collect::<Vec<_>>();
+    paths.push(directory.join("agbox.log"));
+    paths
+}
+
+fn checked_log_file(path: &Path) -> Result<std::fs::Metadata, CliError> {
     let metadata = std::fs::symlink_metadata(path).map_err(|_| CliError::Unavailable)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 1_048_576 {
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o077 != 0
+    {
         return Err(CliError::Unavailable);
     }
-    std::fs::read_to_string(path).map_err(|_| CliError::Unavailable)
+    Ok(metadata)
+}
+
+fn render_log_line(line: &str) -> Result<String, CliError> {
+    let event: LogWire = serde_json::from_str(line).map_err(|_| CliError::Unavailable)?;
+    if !safe_log_atom(&event.kind) || !safe_log_atom(&event.result) {
+        return Err(CliError::Unavailable);
+    }
+    Ok(format!(
+        "kind={} result={} bytes={}",
+        event.kind, event.result, event.byte_length
+    ))
+}
+
+fn safe_log_atom(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 /// Runs the single-writer foreground service until an interrupt signal arrives.
@@ -290,5 +351,27 @@ const fn source_format(provider: agbox_core::Provider) -> &'static str {
     match provider {
         agbox_core::Provider::Claude => "claude-transcript-2.1",
         agbox_core::Provider::Codex => "codex-rollout-1",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_log_line;
+
+    #[test]
+    fn typed_log_decoder_rejects_unstructured_or_secret_bearing_fields() {
+        let Ok(rendered) =
+            render_log_line(r#"{"kind":"daemon.ready","result":"ok","byte_length":12}"#)
+        else {
+            panic!("valid typed log line");
+        };
+        assert_eq!(rendered, "kind=daemon.ready result=ok bytes=12");
+        assert!(render_log_line("raw native transcript secret=abc").is_err());
+        assert!(
+            render_log_line(
+                r#"{"kind":"daemon.ready","result":"secret=/Users/alice","byte_length":12}"#
+            )
+            .is_err()
+        );
     }
 }
