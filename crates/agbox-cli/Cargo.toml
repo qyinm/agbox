@@ -1,0 +1,32 @@
+[package]
+name = "agbox-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+agbox-adapters.workspace = true
+agbox-core.workspace = true
+agbox-ingest.workspace = true
+agbox-service.workspace = true
+agbox-store.workspace = true
+agbox-workgraph.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+plist.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml_edit.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,7 @@
+notify = "existing-notify --json"
+
+[unrelated]
+keep = "yes"
+
+[mcp_servers.other]
+command = "keep-me"

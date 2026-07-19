@@ -4,10 +4,12 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use time::OffsetDateTime;
 
 use crate::{
-    ContentError, ContentRef, DisclosureClass, EventId, PrivacyLabel, ProjectId, Provider,
-    RedactionPolicy, SemanticKey, SessionId, SourceError, SourceIdentity, SourceRef,
-    SourceRefDraft, limits::MAX_INLINE_BYTES,
+    ContentError, ContentRef, EventId, PrivacyLabel, ProjectId, SemanticKey, SessionId,
+    SourceError, SourceRef, limits::MAX_INLINE_BYTES,
 };
+
+#[cfg(feature = "test-support")]
+use crate::{DisclosureClass, Provider, RedactionPolicy, SourceIdentity, SourceRefDraft};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

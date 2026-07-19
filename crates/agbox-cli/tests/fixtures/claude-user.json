@@ -1,0 +1,6 @@
+{
+  "unknownPlugin": { "keep": true },
+  "mcpServers": {
+    "other": { "command": "keep-me" }
+  }
+}
