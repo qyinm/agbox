@@ -97,6 +97,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "agbox-release-gate"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "agbox-service"
 version = "0.2.0"
 dependencies = [
