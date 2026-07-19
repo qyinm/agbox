@@ -50,6 +50,7 @@ dependencies = [
  "crossterm",
  "plist",
  "ratatui",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",

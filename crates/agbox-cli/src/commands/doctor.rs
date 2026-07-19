@@ -76,7 +76,7 @@ impl DoctorReport {
         };
         report.checks.push(DoctorCheck {
             code: "state_db.v2",
-            severity: regular_owner_file(&paths.state_db),
+            severity: state_database(&paths.state_db),
             remediation: "run agbox daemon start",
         });
         for (code, directory) in [
@@ -150,4 +150,26 @@ fn regular_owner_file(path: &Path) -> DoctorSeverity {
             DoctorSeverity::Healthy
         }
     })
+}
+
+fn state_database(path: &Path) -> DoctorSeverity {
+    let ownership = regular_owner_file(path);
+    if ownership != DoctorSeverity::Healthy {
+        return ownership;
+    }
+    let connection = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    );
+    let Ok(connection) = connection else {
+        return DoctorSeverity::Failing;
+    };
+    let version = connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0));
+    let integrity =
+        connection.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0));
+    if version == Ok(2) && integrity.as_deref() == Ok("ok") {
+        DoctorSeverity::Healthy
+    } else {
+        DoctorSeverity::Failing
+    }
 }

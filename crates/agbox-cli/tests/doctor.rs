@@ -30,7 +30,11 @@ fn owner_only_runtime_layout_is_checked_component_by_component() {
         std::fs::create_dir_all(directory).unwrap();
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    std::fs::write(&paths.state_db, b"not a database; metadata-only doctor").unwrap();
+    let connection = rusqlite::Connection::open(&paths.state_db).unwrap();
+    connection
+        .pragma_update(None, "user_version", 2_i64)
+        .unwrap();
+    drop(connection);
     std::fs::set_permissions(&paths.state_db, std::fs::Permissions::from_mode(0o600)).unwrap();
 
     let report = DoctorReport::inspect(&paths, true);
@@ -44,4 +48,10 @@ fn owner_only_runtime_layout_is_checked_component_by_component() {
     assert!(report.checks.iter().any(
         |check| check.code == "runtime.owner_only" && check.severity == DoctorSeverity::Healthy
     ));
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.code == "state_db.v2" && check.severity == DoctorSeverity::Healthy)
+    );
 }
