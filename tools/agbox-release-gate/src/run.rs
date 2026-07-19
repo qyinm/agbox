@@ -680,7 +680,10 @@ const fn source_format(provider: Provider) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{Profile, RunOptions, validate_options};
-    use std::{path::PathBuf, time::{Duration, Instant}};
+    use std::{
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
 
     fn options(profile: Profile, duration: Duration) -> RunOptions {
         RunOptions {
