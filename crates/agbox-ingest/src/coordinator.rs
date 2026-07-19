@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     future::Future,
     io,
@@ -914,6 +914,95 @@ impl IngestionCoordinator {
         Err(IngestError::Store(StoreError::ReducerWatermarkConflict))
     }
 
+    /// Reduces one global graph page and publishes one independent work
+    /// visibility revision for every project represented in that page. Project
+    /// visibility watermarks are intentionally distinct: a busy or malformed
+    /// project must not make another project's handoff disappear.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded graph, correlation, contract, or storage error. The
+    /// graph watermark advances before work publication, so a later retry can
+    /// safely re-read and publish the same immutable graph facts.
+    pub async fn reduce_and_publish_grouped_next(
+        &self,
+    ) -> Result<Vec<WorkPublicationReport>, IngestError> {
+        for attempt in 0..GRAPH_REDUCER_CONFLICT_RETRIES {
+            let watermark = self.read.reducer_watermark(GRAPH_REDUCER_NAME).await?;
+            let events = reducer_events_after(
+                &self.read,
+                watermark.through_event_seq,
+                agbox_store::MAX_EVENT_PAGE_ROWS,
+                agbox_store::MAX_EVENT_PAGE_BYTES,
+            )
+            .await?;
+            if events.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut event_order = HashMap::with_capacity(events.len());
+            let mut event_provider = HashMap::with_capacity(events.len());
+            for event in &events {
+                event_order.insert(event.event.event_id().clone(), event.event_seq);
+                event_provider.insert(
+                    event.event.event_id().clone(),
+                    event.event.source().provider(),
+                );
+            }
+            let mutation = DeterministicReducer.reduce(&events)?;
+            let graph = graph_write_batch(mutation.clone())?;
+            match self.writer.apply_graph(graph).await {
+                Ok(_) => {
+                    let mut by_project = BTreeMap::<ProjectId, Vec<ReducedFact>>::new();
+                    for fact in mutation.facts {
+                        by_project
+                            .entry(fact.project_id().clone())
+                            .or_default()
+                            .push(fact);
+                    }
+                    let mut reports = Vec::with_capacity(by_project.len());
+                    for (project_id, facts) in by_project {
+                        let Some((through_event_id, through_event_seq)) = facts
+                            .iter()
+                            .filter_map(|fact| {
+                                event_order
+                                    .get(fact.evidence_id())
+                                    .map(|sequence| (fact.evidence_id().clone(), *sequence))
+                            })
+                            .max_by_key(|(_, sequence)| *sequence)
+                        else {
+                            return Err(IngestError::InvalidGraphMutation);
+                        };
+                        let provider = event_provider
+                            .get(&through_event_id)
+                            .copied()
+                            .ok_or(IngestError::InvalidGraphMutation)?;
+                        let visibility_name = work_visibility_name(&project_id);
+                        let current = self.read.reducer_watermark(&visibility_name).await?;
+                        let project_mutation = GraphMutation {
+                            facts,
+                            expected_event_seq: current.through_event_seq,
+                            through_event_seq: Some(through_event_seq),
+                            through_event_id: Some(through_event_id),
+                        };
+                        reports.push(
+                            self.publish_work_to_visibility(
+                                project_mutation,
+                                WorkPublicationRequest::new(provider),
+                                visibility_name,
+                            )
+                            .await?,
+                        );
+                    }
+                    return Ok(reports);
+                }
+                Err(StoreError::ReducerWatermarkConflict)
+                    if attempt + 1 < GRAPH_REDUCER_CONFLICT_RETRIES => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(IngestError::Store(StoreError::ReducerWatermarkConflict))
+    }
+
     /// Correlates one reduced fact page, builds its immediate provisional
     /// contract, and atomically publishes the store-owned work batch.
     ///
@@ -931,6 +1020,17 @@ impl IngestionCoordinator {
         &self,
         mutation: GraphMutation,
         request: WorkPublicationRequest,
+    ) -> Result<WorkPublicationReport, IngestError> {
+        self.publish_work_to_visibility(mutation, request, WORK_VISIBILITY_REDUCER_NAME.to_owned())
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn publish_work_to_visibility(
+        &self,
+        mutation: GraphMutation,
+        request: WorkPublicationRequest,
+        visibility_name: String,
     ) -> Result<WorkPublicationReport, IngestError> {
         let project_id = mutation
             .facts
@@ -1048,7 +1148,8 @@ impl IngestionCoordinator {
         let contract = ProvisionalContractBuilder::new(request.extractor_version)
             .for_work(work_id.clone())
             .build(previous.as_ref(), &mutation.facts)?;
-        let batch = work_write_batch(&mutation, work_id.clone(), &correlation, &contract)?;
+        let mut batch = work_write_batch(&mutation, work_id.clone(), &correlation, &contract)?;
+        batch.visibility_name = visibility_name;
         let receipt = self.writer.apply_work(batch).await?;
         Ok(WorkPublicationReport {
             receipt,
@@ -1462,6 +1563,10 @@ impl IngestionCoordinator {
         health.insert(key.clone(), value);
         Ok(())
     }
+}
+
+fn work_visibility_name(project_id: &ProjectId) -> String {
+    stable_graph_id("work_visibility", &[project_id.as_str()])
 }
 
 struct AttemptReport {

@@ -269,6 +269,12 @@ pub mod test_support {
             self.coordinator.reduce_and_publish_next().await
         }
 
+        pub async fn reduce_and_publish_grouped_next(
+            &self,
+        ) -> Result<Vec<crate::WorkPublicationReport>, IngestError> {
+            self.coordinator.reduce_and_publish_grouped_next().await
+        }
+
         #[must_use]
         pub fn read(&self) -> FixtureRead {
             FixtureRead {

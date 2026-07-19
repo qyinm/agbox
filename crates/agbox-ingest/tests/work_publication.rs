@@ -90,6 +90,24 @@ async fn production_supervisor_reduces_and_publishes_one_ingested_project_page()
     assert!(visible.is_some());
 }
 
+#[tokio::test]
+async fn grouped_supervisor_keeps_visibility_project_scoped() {
+    let fixture = FixtureRuntime::codex_records(1).await;
+    fixture.drain().await.unwrap();
+
+    let published = fixture.reduce_and_publish_grouped_next().await.unwrap();
+    assert_eq!(published.len(), 1);
+    let current = fixture
+        .read_store()
+        .work(
+            &ProjectId::for_test("project_fixture"),
+            &published[0].work_id,
+        )
+        .await
+        .unwrap();
+    assert!(current.is_some());
+}
+
 #[test]
 fn tied_candidates_translate_to_split_provenance_edges_without_execution_semantics() {
     let project_id = ProjectId::for_test("project-tie");
