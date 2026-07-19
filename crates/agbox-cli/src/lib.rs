@@ -16,7 +16,9 @@ pub use platform::{Change, Platform, PlatformError, ServiceSpec};
 ///
 /// # Errors
 ///
+#[allow(clippy::too_many_lines)]
 pub async fn run(cli: args::Cli) -> Result<(), CliError> {
+    let output = cli.output;
     match cli.command {
         args::Command::Init(arguments) => {
             let executable = std::env::current_exe().map_err(|_| CliError::Unavailable)?;
@@ -36,9 +38,77 @@ pub async fn run(cli: args::Cli) -> Result<(), CliError> {
             }
             Ok(())
         }
-        args::Command::Daemon {
-            command: args::DaemonCommand::Start { foreground: true },
-        } => commands::daemon::foreground(&AgboxPaths::from_home(&user_home()?)).await,
+        args::Command::Daemon { command } => {
+            commands::daemon::run(command, &AgboxPaths::from_home(&user_home()?)).await
+        }
+        args::Command::Status => {
+            let client = human_client(cli.project_root).await?;
+            let value = call(&client, agbox_core::api::AppRequest::Health).await?;
+            commands::output::response(output, value)
+        }
+        args::Command::Work { command } => {
+            let client = human_client(cli.project_root).await?;
+            let request = match command {
+                args::WorkCommand::List => agbox_core::api::AppRequest::ListWork {
+                    status: None,
+                    limit: 20,
+                },
+                args::WorkCommand::Current => agbox_core::api::AppRequest::CurrentWork,
+                args::WorkCommand::Show { work_id } => agbox_core::api::AppRequest::GetWork {
+                    work_id: parse_work_id(&work_id)?,
+                },
+            };
+            commands::output::response(output, call(&client, request).await?)
+        }
+        args::Command::Handoff { work_id } => {
+            let client = human_client(cli.project_root).await?;
+            let value = call(
+                &client,
+                agbox_core::api::AppRequest::GetWork {
+                    work_id: parse_work_id(&work_id)?,
+                },
+            )
+            .await?;
+            commands::output::response(output, value)
+        }
+        args::Command::Evidence { evidence_id, raw } => {
+            let client = human_client(cli.project_root).await?;
+            let evidence_id = agbox_core::EvidenceId::parse_wire(&evidence_id)
+                .ok_or(CliError::InvalidIdentifier)?;
+            let disclosure = if raw {
+                agbox_core::api::EvidenceDisclosure::AuthorizedRaw
+            } else {
+                agbox_core::api::EvidenceDisclosure::Redacted
+            };
+            let value = call(
+                &client,
+                agbox_core::api::AppRequest::GetEvidence {
+                    evidence_id,
+                    disclosure,
+                },
+            )
+            .await?;
+            commands::output::response(output, value)
+        }
+        args::Command::Search { query, limit } => {
+            let client = human_client(cli.project_root).await?;
+            let value = call(
+                &client,
+                agbox_core::api::AppRequest::SearchWork { query, limit },
+            )
+            .await?;
+            commands::output::response(output, value)
+        }
+        args::Command::Forget { command } => {
+            let client = human_client(cli.project_root).await?;
+            let request = match command {
+                args::ForgetCommand::Work { work_id } => agbox_core::api::AppRequest::ForgetWork {
+                    work_id: parse_work_id(&work_id)?,
+                },
+                args::ForgetCommand::Project => agbox_core::api::AppRequest::ForgetProject,
+            };
+            commands::output::response(output, call(&client, request).await?)
+        }
         args::Command::Mcp { provider } => {
             let root = project_root(cli.project_root)?;
             let provider = match provider {
@@ -70,6 +140,10 @@ pub enum CliError {
     InvalidProject,
     #[error("owner home directory is unavailable")]
     HomeUnavailable,
+    #[error("identifier is invalid")]
+    InvalidIdentifier,
+    #[error("unable to write bounded CLI output")]
+    Output,
 }
 
 fn project_root(configured: Option<std::path::PathBuf>) -> Result<std::path::PathBuf, CliError> {
@@ -89,4 +163,32 @@ impl CliError {
     pub const fn exit_code(&self) -> u8 {
         69
     }
+}
+
+async fn human_client(
+    configured: Option<std::path::PathBuf>,
+) -> Result<agbox_service::IpcAppClient, CliError> {
+    let root = project_root(configured)?;
+    commands::client::scoped_client(
+        &AgboxPaths::from_home(&user_home()?),
+        &root,
+        agbox_service::ipc::WireActor::HumanCli,
+    )
+    .await
+}
+
+async fn call(
+    client: &agbox_service::IpcAppClient,
+    request: agbox_core::api::AppRequest,
+) -> Result<agbox_core::api::AppResponse, CliError> {
+    use agbox_service::AppClient;
+
+    client
+        .call(request)
+        .await
+        .map_err(|_| CliError::Unavailable)
+}
+
+fn parse_work_id(value: &str) -> Result<agbox_core::WorkId, CliError> {
+    agbox_core::WorkId::parse_wire(value).ok_or(CliError::InvalidIdentifier)
 }

@@ -9,6 +9,7 @@ pub mod evidence;
 pub mod forget;
 pub mod handoff;
 pub mod hook;
+pub mod output;
 pub mod search;
 pub mod status;
 pub mod work;
