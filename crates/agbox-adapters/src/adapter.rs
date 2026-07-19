@@ -21,6 +21,7 @@ pub use agbox_core::limits::{
 use crate::BoundedJsonReader;
 
 const MAX_NATIVE_IDENTIFIER_BYTES: usize = 128;
+const MAX_PROJECT_HINT_BYTES: u64 = 4_096;
 // A reduced diagnostic is mechanically bounded. If checked serialization ever
 // fails despite that invariant, preserve fail-closed semantics rather than
 // publishing an apparently small semantic count.
@@ -62,6 +63,58 @@ pub struct DiscoveredSource {
     pub mtime: OffsetDateTime,
     pub ctime: OffsetDateTime,
     pub session_time: Option<OffsetDateTime>,
+}
+
+/// Ephemeral, bounded workspace hint extracted before source enrollment.
+///
+/// It is not an authorization decision: callers must independently canonicalize
+/// and bind the directory with `ProjectResolver` before assigning a project.
+pub struct ProjectHint {
+    value: Zeroizing<String>,
+}
+
+impl ProjectHint {
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        Path::new(&self.value)
+    }
+}
+
+impl fmt::Debug for ProjectHint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProjectHint")
+            .field("byte_length", &self.value.len())
+            .finish()
+    }
+}
+
+/// Extracts a bounded provider workspace hint from one JSON record.
+///
+/// # Errors
+///
+/// Returns a decoding error when the record is malformed or the selected path
+/// is oversized; callers must then leave the source unassigned.
+pub fn project_hint(provider: Provider, record: &[u8]) -> Result<Option<ProjectHint>, DecodeError> {
+    let path = match provider {
+        Provider::Claude => &["cwd"][..],
+        Provider::Codex => &["payload", "cwd"][..],
+    };
+    let mut reader = crate::BoundedJsonReader::new(record);
+    let Some(captured) = reader.capture_string(path)? else {
+        return Ok(None);
+    };
+    if captured.total_bytes > MAX_PROJECT_HINT_BYTES {
+        return Err(DecodeError::OutputTooLarge);
+    }
+    let value = String::from_utf8(captured.bytes)
+        .map_err(|_| DecodeError::Malformed("project-hint-utf8".into()))?;
+    if !Path::new(&value).is_absolute() {
+        return Ok(None);
+    }
+    Ok(Some(ProjectHint {
+        value: Zeroizing::new(value),
+    }))
 }
 
 impl fmt::Debug for DiscoveredSource {
