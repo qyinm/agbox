@@ -1369,6 +1369,49 @@ impl IngestionCoordinator {
         Ok(key)
     }
 
+    /// Replaces the in-memory snapshot for one append-only source generation.
+    ///
+    /// Source registration is intentionally immutable in SQLite: it records the
+    /// facts observed when the generation was enrolled.  A live JSONL file does
+    /// grow, however, so the coordinator needs a newer *in-memory* snapshot
+    /// before it can securely open and decode the newly appended suffix.  This
+    /// method accepts only a strictly larger snapshot of the exact same file;
+    /// replacement, truncation, metadata-only rewrites, and reassociation must
+    /// go through generation reconciliation and a new registration instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::IdentityChanged`] unless `source` is a strict
+    /// append of the registered source generation.
+    pub fn refresh_appended_source(
+        &self,
+        source: CoordinatorSource,
+    ) -> Result<SourceKey, IngestError> {
+        let key = SourceKey::new(
+            source.discovered.source_id.clone(),
+            source.discovered.generation,
+        )
+        .map_err(|_| IngestError::SourceNotRegistered)?;
+        let mut sources = self
+            .sources
+            .write()
+            .map_err(|_| IngestError::StateUnavailable)?;
+        let current = sources.get(&key).ok_or(IngestError::SourceNotRegistered)?;
+        let same_identity = current.discovered.provider == source.discovered.provider
+            && current.discovered.root == source.discovered.root
+            && current.discovered.path == source.discovered.path
+            && current.discovered.class == source.discovered.class
+            && current.discovered.file_identity == source.discovered.file_identity
+            && current.project_id == source.project_id
+            && current.project_root == source.project_root
+            && current.format == source.format;
+        if !same_identity || source.discovered.size <= current.discovered.size {
+            return Err(IngestError::IdentityChanged);
+        }
+        sources.insert(key.clone(), source);
+        Ok(key)
+    }
+
     /// Adds or coalesces one source signal.
     ///
     /// # Errors

@@ -109,6 +109,22 @@ async fn grouped_supervisor_keeps_visibility_project_scoped() {
 }
 
 #[tokio::test]
+async fn live_append_refreshes_only_the_same_source_generation() {
+    let fixture = FixtureRuntime::codex_records(1).await;
+    fixture.drain().await.unwrap();
+    let before = fixture.read().event_count().await.unwrap();
+
+    fixture
+        .append_records([
+            r#"{"type":"event_msg","ordinal":2,"payload":{"type":"user_message","message":"append only handoff update"}}"#,
+        ])
+        .unwrap();
+    fixture.process_one().await.unwrap();
+
+    assert!(fixture.read().event_count().await.unwrap() > before);
+}
+
+#[tokio::test]
 async fn claude_and_codex_sources_publish_one_same_project_handoff_contract() {
     let codex = include_str!("../../agbox-adapters/tests/fixtures/codex/subagents.jsonl");
     let claude = include_str!("../../agbox-adapters/tests/fixtures/claude/sidechain.jsonl");

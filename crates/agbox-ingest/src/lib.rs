@@ -42,6 +42,7 @@ pub mod test_support {
     #![allow(clippy::missing_errors_doc)]
 
     use std::{
+        io::Write,
         os::unix::ffi::OsStrExt,
         path::{Path, PathBuf},
         sync::Arc,
@@ -66,6 +67,7 @@ pub mod test_support {
         key: SourceKey,
         source_size: u64,
         source_path: PathBuf,
+        provider: Provider,
         database_path: PathBuf,
     }
 
@@ -263,6 +265,7 @@ pub mod test_support {
                 key,
                 source_size,
                 source_path,
+                provider,
                 database_path: database,
             })
         }
@@ -287,6 +290,56 @@ pub mod test_support {
         pub fn enqueue(&self) -> Result<(), IngestError> {
             self.coordinator
                 .try_enqueue(self.key.clone(), self.source_size, WorkPriority::Live)
+        }
+
+        /// Appends complete JSONL records and atomically refreshes the trusted
+        /// in-memory append snapshot before enqueueing the new suffix.
+        pub fn append_records<I, S>(&self, records: I) -> Result<u64, IngestError>
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<str>,
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&self.source_path)
+                .map_err(IngestError::Io)?;
+            for record in records {
+                file.write_all(record.as_ref().as_bytes())?;
+                file.write_all(b"\n")?;
+            }
+            file.sync_data()?;
+            let stat = fs::stat(&self.source_path).map_err(|_| IngestError::IdentityChanged)?;
+            let size = u64::try_from(stat.st_size).map_err(|_| IngestError::IdentityChanged)?;
+            let root = self
+                .source_path
+                .parent()
+                .ok_or(IngestError::IdentityChanged)?
+                .canonicalize()
+                .map_err(IngestError::Io)?;
+            let device = u64::try_from(stat.st_dev).map_err(|_| IngestError::IdentityChanged)?;
+            let refreshed = CoordinatorSource {
+                discovered: DiscoveredSource {
+                    source_id: self.key.source_id().to_owned(),
+                    provider: self.provider,
+                    root: root.clone(),
+                    path: self.source_path.clone(),
+                    class: RootClass::Active,
+                    file_identity: format!("unix:{device}:{}", stat.st_ino),
+                    generation: self.key.generation(),
+                    size,
+                    mtime: stat_time(stat.st_mtime, stat.st_mtime_nsec)?,
+                    ctime: stat_time(stat.st_ctime, stat.st_ctime_nsec)?,
+                    session_time: None,
+                },
+                project_id: ProjectId::for_test("project_fixture"),
+                project_root: Some(root),
+                format: source_format(self.provider).to_owned(),
+                observed_at: OffsetDateTime::UNIX_EPOCH,
+            };
+            let key = self.coordinator.refresh_appended_source(refreshed)?;
+            self.coordinator
+                .try_enqueue(key, size, WorkPriority::Live)?;
+            Ok(size)
         }
 
         pub fn replace_source(&self, bytes: &[u8]) -> Result<(), IngestError> {
