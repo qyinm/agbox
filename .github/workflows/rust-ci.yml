@@ -17,3 +17,4 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
       - run: cargo test -p agbox-release-gate
+      - run: cargo build --locked --release --target aarch64-apple-darwin -p agbox-cli

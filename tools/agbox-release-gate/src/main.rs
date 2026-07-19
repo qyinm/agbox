@@ -1,8 +1,9 @@
-use std::{path::PathBuf, process::ExitCode};
+use std::{path::PathBuf, process::ExitCode, time::Duration};
 
 use agbox_release_gate::{
     ReleaseArtifact, Thresholds,
     corpus::{CorpusSpec, manifest},
+    run::{Profile, RunOptions, execute},
 };
 use clap::Parser;
 
@@ -26,10 +27,26 @@ enum Command {
         #[arg(long)]
         binary_sha256: String,
     },
+    /// Runs the isolated corpus, ingestion, IPC, recovery, and RSS gate.
+    Run {
+        #[arg(long, value_parser = parse_profile)]
+        profile: Profile,
+        #[arg(long, value_parser = parse_duration)]
+        duration: Duration,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        commit: String,
+        #[arg(long, default_value = "aarch64-apple-darwin")]
+        target: String,
+        #[arg(long)]
+        binary: PathBuf,
+    },
 }
 
-fn main() -> ExitCode {
-    match run(Cli::parse()) {
+#[tokio::main]
+async fn main() -> ExitCode {
+    match run(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("agbox release gate: {error}");
@@ -38,7 +55,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<(), &'static str> {
+async fn run(cli: Cli) -> Result<(), &'static str> {
     match cli.command {
         Command::Contract => print_json(&Thresholds::release()),
         Command::Manifest => print_json(&manifest(&CorpusSpec::release())),
@@ -61,7 +78,57 @@ fn run(cli: Cli) -> Result<(), &'static str> {
             println!("release artifact verified");
             Ok(())
         }
+        Command::Run {
+            profile,
+            duration,
+            output,
+            commit,
+            target,
+            binary,
+        } => {
+            let artifact = execute(RunOptions {
+                profile,
+                duration,
+                output_directory: output,
+                commit_sha: commit,
+                target,
+                binary,
+            })
+            .await
+            .map_err(|error| {
+                eprintln!("agbox release gate run failure: {error}");
+                "run_failed"
+            })?;
+            print_json(&artifact)
+        }
     }
+}
+
+fn parse_profile(value: &str) -> Result<Profile, String> {
+    match value {
+        "ci-smoke" => Ok(Profile::CiSmoke),
+        "release" => Ok(Profile::Release),
+        _ => Err("profile must be ci-smoke or release".into()),
+    }
+}
+
+fn parse_duration(value: &str) -> Result<Duration, String> {
+    let (number, multiplier) = match value.as_bytes().last().copied() {
+        Some(b'm') => (&value[..value.len() - 1], 60_u64),
+        Some(b'h') => (&value[..value.len() - 1], 60 * 60),
+        Some(b's') => (&value[..value.len() - 1], 1),
+        _ => return Err("duration must end in s, m, or h".into()),
+    };
+    let count = number
+        .parse::<u64>()
+        .map_err(|_| "duration must have a positive integer value".to_owned())?;
+    if count == 0 {
+        return Err("duration must be positive".into());
+    }
+    count
+        .checked_mul(multiplier)
+        .map(Duration::from_secs)
+        .ok_or_else(|| "duration is too large".into())
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> Result<(), &'static str> {

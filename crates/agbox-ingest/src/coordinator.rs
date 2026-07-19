@@ -1371,7 +1371,7 @@ impl IngestionCoordinator {
 
     /// Replaces the in-memory snapshot for one append-only source generation.
     ///
-    /// Source registration is intentionally immutable in SQLite: it records the
+    /// Source registration is intentionally immutable in `SQLite`: it records the
     /// facts observed when the generation was enrolled.  A live JSONL file does
     /// grow, however, so the coordinator needs a newer *in-memory* snapshot
     /// before it can securely open and decode the newly appended suffix.  This

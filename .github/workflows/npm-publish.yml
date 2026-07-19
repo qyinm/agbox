@@ -18,11 +18,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          go-version-file: go.mod
-          cache: true
+          toolchain: 1.97.1
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -30,36 +29,23 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Test
-        run: go test ./...
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Race-sensitive ingestion ownership
-        run: go test -race ./internal/store/... ./internal/session/... ./internal/watcher/... ./internal/pipeline/...
-
-      - name: Ingestion resource gate (smoke)
-        run: go run ./cmd/agbox-release-gate --profile smoke
-
-      - name: Ingestion resource gate (production scale)
-        timeout-minutes: 5
-        run: go run ./cmd/agbox-release-gate --profile release
-
-      - name: Build macOS arm64 binary
+      - name: Verify exact Rust release-gate artifact before cutover
         run: |
-          VERSION="${GITHUB_REF#refs/tags/}"
-          if [[ "$VERSION" == "$GITHUB_REF" ]]; then
-            VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
-          fi
-          VERSION="${VERSION#v}"
-          GOOS=darwin GOARCH=arm64 go build -trimpath \
-            -ldflags "-s -w -X github.com/hippoom/agbox/internal/telemetry.Version=${VERSION}" \
-            -o npm/cli/dist/agbox-darwin-arm64 ./cmd/agbox
-          chmod +x npm/cli/bin/agbox npm/cli/dist/agbox-darwin-arm64
-          strings npm/cli/dist/agbox-darwin-arm64 | grep -q "${VERSION}"
+          test -f release-gate-report.json
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --all-features
+          cargo build --locked --release --target aarch64-apple-darwin -p agbox-cli
+          BINARY=target/aarch64-apple-darwin/release/agbox
+          SHA="$(shasum -a 256 "$BINARY" | awk '{print $1}')"
+          cargo run --locked --release -p agbox-release-gate -- verify \
+            --report release-gate-report.json --commit "$(git rev-parse HEAD)" --binary-sha256 "$SHA"
+          echo "A valid 24-hour report is present; legacy removal remains a separate reviewed cutover."
 
       - name: Bundle telemetry env
+        # A Rust report alone must not publish the tracked Go payload. The
+        # downloader/cutover change stays disabled until its own reviewed task.
+        if: ${{ false }}
         env:
           POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
         run: |
@@ -71,13 +57,18 @@ jobs:
           fi
 
       - name: Verify npm package
+        if: ${{ false }}
         working-directory: npm/cli
         run: |
           node bin/agbox --help
           npm pack --dry-run
 
       - name: Publish npm package
+        if: ${{ false }}
         working-directory: npm/cli
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public
+
+      - name: Hold package publication pending Rust npm cutover
+        run: echo "Release report verified; legacy npm publication remains intentionally disabled until Task 27 cutover is separately approved."

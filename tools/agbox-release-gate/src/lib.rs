@@ -2,7 +2,9 @@
 
 pub mod corpus;
 pub mod metrics;
+pub mod process;
 pub mod recovery;
+pub mod run;
 
 use serde::{Deserialize, Serialize};
 

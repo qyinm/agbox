@@ -102,10 +102,22 @@ dependencies = [
 name = "agbox-release-gate"
 version = "0.2.0"
 dependencies = [
+ "agbox-adapters",
+ "agbox-core",
+ "agbox-ingest",
+ "agbox-service",
+ "agbox-store",
  "blake3",
  "clap",
  "serde",
  "serde_json",
+ "sha2",
+ "sysinfo",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-util",
+ "zeroize",
 ]
 
 [[package]]

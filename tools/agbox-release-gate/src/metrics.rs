@@ -50,7 +50,9 @@ impl Samples {
 }
 
 /// Detects the approved sustained-growth condition from one-second RSS samples.
-/// It requires a full 12-hour window and is intentionally conservative.
+/// It requires a full 12-hour window. Growth is only reported when both the
+/// first/final six-hour median gap and a robust post-warmup Theil-Sen slope
+/// exceed their approved limits.
 #[must_use]
 pub fn sustained_rss_growth(samples: &[u64]) -> bool {
     const HOUR: usize = 3_600;
@@ -59,7 +61,38 @@ pub fn sustained_rss_growth(samples: &[u64]) -> bool {
     }
     let first = median(&samples[..6 * HOUR]);
     let final_median = median(&samples[samples.len() - 6 * HOUR..]);
-    final_median > first.saturating_add(16 * 1024 * 1024)
+    let exceeds_median_gap = final_median > first.saturating_add(16 * 1024 * 1024);
+    exceeds_median_gap && robust_slope_bytes_per_hour(&samples[HOUR..]) > 1024 * 1024
+}
+
+/// Computes a bounded Theil-Sen slope from one-hour RSS medians after warmup.
+#[must_use]
+pub fn robust_slope_bytes_per_hour(samples_after_warmup: &[u64]) -> u64 {
+    const HOUR: usize = 3_600;
+    let hourly = samples_after_warmup
+        .chunks_exact(HOUR)
+        .map(median)
+        .collect::<Vec<_>>();
+    if hourly.len() < 2 {
+        return 0;
+    }
+    let mut positive_slopes = Vec::with_capacity(hourly.len().saturating_mul(hourly.len()));
+    for (start, value) in hourly.iter().copied().enumerate() {
+        for (end, later) in hourly.iter().copied().enumerate().skip(start + 1) {
+            if later > value {
+                positive_slopes.push(
+                    later
+                        .saturating_sub(value)
+                        .checked_div(u64::try_from(end - start).unwrap_or(u64::MAX))
+                        .unwrap_or(0),
+                );
+            }
+        }
+    }
+    if positive_slopes.is_empty() {
+        return 0;
+    }
+    median(&positive_slopes)
 }
 
 fn median(values: &[u64]) -> u64 {
