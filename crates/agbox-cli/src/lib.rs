@@ -6,6 +6,7 @@ pub mod config;
 pub mod init;
 pub mod paths;
 pub mod platform;
+pub mod tui;
 
 pub use init::{InitOptions, InitReport, Initializer};
 pub use paths::AgboxPaths;
@@ -15,12 +16,28 @@ pub use platform::{Change, Platform, PlatformError, ServiceSpec};
 ///
 /// # Errors
 ///
-/// Returns a bounded recovery error until the daemon-backed command handlers
-/// are available.
-#[allow(clippy::unused_async)]
 pub async fn run(cli: args::Cli) -> Result<(), CliError> {
-    let _ = cli;
-    Err(CliError::Unavailable)
+    match cli.command {
+        args::Command::Mcp { provider } => {
+            let root = project_root(cli.project_root)?;
+            let provider = match provider {
+                args::ProviderArg::Claude => agbox_core::Provider::Claude,
+                args::ProviderArg::Codex => agbox_core::Provider::Codex,
+            };
+            let client = commands::client::scoped_client(
+                &AgboxPaths::from_home(&user_home()?),
+                &root,
+                agbox_service::ipc::WireActor::Agent { provider },
+            )
+            .await?;
+            agbox_service::serve_stdio(agbox_service::HandoffMcpServer::new(std::sync::Arc::new(
+                client,
+            )))
+            .await
+            .map_err(|_| CliError::Unavailable)
+        }
+        _ => Err(CliError::Unavailable),
+    }
 }
 
 /// Bounded public CLI failures.
@@ -28,6 +45,22 @@ pub async fn run(cli: args::Cli) -> Result<(), CliError> {
 pub enum CliError {
     #[error("agbox daemon is unavailable; run `agbox daemon start`")]
     Unavailable,
+    #[error("project root is not a safe Git repository")]
+    InvalidProject,
+    #[error("owner home directory is unavailable")]
+    HomeUnavailable,
+}
+
+fn project_root(configured: Option<std::path::PathBuf>) -> Result<std::path::PathBuf, CliError> {
+    configured
+        .map_or_else(std::env::current_dir, Ok)
+        .map_err(|_| CliError::InvalidProject)
+}
+
+fn user_home() -> Result<std::path::PathBuf, CliError> {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or(CliError::HomeUnavailable)
 }
 
 impl CliError {

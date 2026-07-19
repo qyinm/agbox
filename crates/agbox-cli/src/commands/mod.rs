@@ -1,6 +1,7 @@
 //! Command handlers are kept separate from parsing and transport scope.
 
 pub mod agent;
+pub mod client;
 pub mod config;
 pub mod daemon;
 pub mod doctor;

@@ -42,4 +42,10 @@ impl AgboxPaths {
             &self.config,
         ]
     }
+
+    /// Returns the owner-only local daemon socket path.
+    #[must_use]
+    pub fn socket(&self) -> PathBuf {
+        self.runtime.join("agbox.sock")
+    }
 }
