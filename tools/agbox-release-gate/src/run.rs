@@ -430,19 +430,23 @@ async fn append_at_approved_rate(
     for second in 0..(APPEND_RECORDS / APPEND_PER_SECOND) {
         let second_started = Instant::now();
         for batch_start in (0..APPEND_PER_SECOND).step_by(APPEND_BATCH_SIZE) {
-            let mut started_at = Vec::with_capacity(APPEND_BATCH_SIZE);
+            let mut append_completed_at = Vec::with_capacity(APPEND_BATCH_SIZE);
             for offset in batch_start..(batch_start + APPEND_BATCH_SIZE).min(APPEND_PER_SECOND) {
                 let ordinal = second * APPEND_PER_SECOND + offset;
                 let source = &sources[LIVE_CODEX_SOURCES[ordinal % LIVE_CODEX_SOURCES.len()]];
-                started_at.push(Instant::now());
                 let appended = append_one(source, ordinal, coordinator)?;
                 if appended == 0 {
                     return Err("append_progress".into());
                 }
+                append_completed_at.push(Instant::now());
             }
             drain_parallel(coordinator).await?;
-            for started in started_at {
-                latency.record(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+            let visible_at = Instant::now();
+            for append_completed_at in append_completed_at {
+                latency.record(completed_append_latency_micros(
+                    append_completed_at,
+                    visible_at,
+                ));
             }
         }
         rss_samples.push(sampler.resident_bytes());
@@ -450,6 +454,16 @@ async fn append_at_approved_rate(
         tokio::time::sleep(remaining).await;
     }
     Ok(())
+}
+
+fn completed_append_latency_micros(append_completed_at: Instant, visible_at: Instant) -> u64 {
+    u64::try_from(
+        visible_at
+            .checked_duration_since(append_completed_at)
+            .unwrap_or_default()
+            .as_micros(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 fn append_one(
@@ -666,7 +680,7 @@ const fn source_format(provider: Provider) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{Profile, RunOptions, validate_options};
-    use std::{path::PathBuf, time::Duration};
+    use std::{path::PathBuf, time::{Duration, Instant}};
 
     fn options(profile: Profile, duration: Duration) -> RunOptions {
         RunOptions {
@@ -684,5 +698,21 @@ mod tests {
         assert!(validate_options(&options(Profile::Release, Duration::from_mins(10))).is_err());
         assert!(validate_options(&options(Profile::Release, Duration::from_hours(24))).is_ok());
         assert!(validate_options(&options(Profile::CiSmoke, Duration::from_mins(1))).is_ok());
+    }
+
+    #[test]
+    fn ingestion_latency_starts_after_the_append_has_completed() {
+        let visible_at = Instant::now();
+        let append_started = visible_at - Duration::from_millis(160);
+        let append_completed = visible_at - Duration::from_millis(24);
+
+        assert_eq!(
+            super::completed_append_latency_micros(append_completed, visible_at),
+            24_000
+        );
+        assert_eq!(
+            super::completed_append_latency_micros(append_started, visible_at),
+            160_000
+        );
     }
 }
