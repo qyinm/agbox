@@ -87,6 +87,45 @@ fn work_lines(app: &App) -> Text<'static> {
 }
 
 fn contract_lines(app: &App) -> Text<'static> {
+    if let Some(work) = app.detail() {
+        let mut lines = vec![
+            Line::from(format!(
+                "Work: {} · revision {} · {:?}",
+                work.work_id.as_str(),
+                work.revision,
+                work.status
+            )),
+            Line::from(format!(
+                "Objective: {}",
+                work.objective
+                    .as_deref()
+                    .map_or_else(|| "unknown".into(), safe_text)
+            )),
+            Line::from(format!("Summary: {}", safe_text(&work.summary))),
+        ];
+        for (label, values) in [
+            ("Completed", &work.completed_steps),
+            ("Next", &work.next_actions),
+            ("Blockers", &work.blockers),
+            ("Verification", &work.verification),
+        ] {
+            lines.push(Line::from(format!("{label}:")));
+            if values.is_empty() {
+                lines.push(Line::from("- none"));
+            } else {
+                lines.extend(
+                    values
+                        .iter()
+                        .take(12)
+                        .map(|value| Line::from(format!("- {}", safe_text(value)))),
+                );
+            }
+        }
+        lines.push(Line::from(
+            "Corrections create a new human assertion; this revision is immutable.",
+        ));
+        return Text::from(lines);
+    }
     let Some(work) = app.selected_contract() else {
         return Text::from("No selected work item");
     };

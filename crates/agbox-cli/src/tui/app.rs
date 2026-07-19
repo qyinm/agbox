@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use agbox_core::{
     ContractId, WorkId, WorkStatus,
-    api::{CorrectableField, WorkSummary},
+    api::{CorrectableField, WorkDetail, WorkSummary},
 };
 
 const MAX_WORK: usize = 100;
@@ -20,6 +20,9 @@ pub enum Focus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Effect {
     Refresh,
+    LoadWork {
+        work_id: WorkId,
+    },
     CorrectWork {
         work_id: WorkId,
         field: CorrectableField,
@@ -44,6 +47,7 @@ pub enum Message {
         value: String,
     },
     ReplaceWork(Vec<WorkSummary>),
+    ReplaceDetail(Option<Box<WorkDetail>>),
     ConnectionLost,
     ConnectionRestored,
     Notice(&'static str),
@@ -62,6 +66,7 @@ pub enum AppError {
 pub struct App {
     status: Option<WorkStatus>,
     work: Vec<WorkSummary>,
+    detail: Option<Box<WorkDetail>>,
     selected: usize,
     focus: Focus,
     editor: Option<String>,
@@ -79,6 +84,7 @@ impl App {
         Self {
             status: None,
             work,
+            detail: None,
             selected: 0,
             focus: Focus::List,
             editor: None,
@@ -121,6 +127,11 @@ impl App {
     #[must_use]
     pub fn selected_contract(&self) -> Option<&WorkSummary> {
         self.visible_work().get(self.selected).copied()
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> Option<&WorkDetail> {
+        self.detail.as_deref()
     }
 
     #[must_use]
@@ -181,11 +192,13 @@ impl App {
                 Ok(None)
             }
             Message::OpenSelected => {
-                if self.selected_contract().is_none() {
-                    return Err(AppError::NoSelection);
-                }
+                let work_id = self
+                    .selected_contract()
+                    .ok_or(AppError::NoSelection)?
+                    .work_id
+                    .clone();
                 self.focus = Focus::Contract;
-                Ok(None)
+                Ok(Some(Effect::LoadWork { work_id }))
             }
             Message::Back => {
                 self.editor = None;
@@ -238,9 +251,14 @@ impl App {
             Message::ReplaceWork(mut work) => {
                 work.truncate(MAX_WORK);
                 self.work = work;
+                self.detail = None;
                 self.selected = self
                     .selected
                     .min(self.visible_work().len().saturating_sub(1));
+                Ok(None)
+            }
+            Message::ReplaceDetail(detail) => {
+                self.detail = detail;
                 Ok(None)
             }
             Message::ConnectionLost => {

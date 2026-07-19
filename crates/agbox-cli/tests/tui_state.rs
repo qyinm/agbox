@@ -14,9 +14,10 @@ fn work_filters_and_detail_navigation_are_deterministic() {
     );
     app.update(Message::SelectStatus(WorkStatus::Active))
         .unwrap();
-    app.update(Message::OpenSelected).unwrap();
+    let effect = app.update(Message::OpenSelected).unwrap();
     assert_eq!(app.focus(), Focus::Contract);
     assert!(app.selected_contract().is_some());
+    assert!(matches!(effect, Some(Effect::LoadWork { .. })));
 }
 #[test]
 fn correction_creates_effect_without_mutating_cached_contract() {

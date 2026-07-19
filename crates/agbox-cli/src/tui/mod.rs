@@ -74,6 +74,22 @@ async fn execute_effect(app: &mut App, client: &IpcAppClient, mut effect: Effect
                 let _ = app.update(Message::ConnectionLost);
                 return;
             }
+            Effect::LoadWork { work_id } => {
+                match client.call(AppRequest::GetWork { work_id }).await {
+                    Ok(AppResponse::Work(detail)) => {
+                        let _ = app.update(Message::ReplaceDetail(Some(detail)));
+                        let _ = app.update(Message::ConnectionRestored);
+                    }
+                    Ok(AppResponse::NotFound) => {
+                        let _ = app.update(Message::ReplaceDetail(None));
+                        let _ = app.update(Message::Notice("work item is no longer available"));
+                    }
+                    _ => {
+                        let _ = app.update(Message::ConnectionLost);
+                    }
+                }
+                return;
+            }
             Effect::CorrectWork {
                 work_id,
                 field,
