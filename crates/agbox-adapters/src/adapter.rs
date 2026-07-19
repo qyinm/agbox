@@ -96,6 +96,20 @@ impl fmt::Debug for ProjectHint {
 /// Returns a decoding error when the record is malformed or the selected path
 /// is oversized; callers must then leave the source unassigned.
 pub fn project_hint(provider: Provider, record: &[u8]) -> Result<Option<ProjectHint>, DecodeError> {
+    project_hint_from_reader(provider, record)
+}
+
+/// Extracts a project hint from a streaming record reader without retaining the
+/// native record. This is intended for pre-enrollment classification only.
+///
+/// # Errors
+///
+/// Returns a decoding error when the record is malformed or the selected path
+/// is oversized; callers must then leave the source unassigned.
+pub fn project_hint_from_reader(
+    provider: Provider,
+    record: impl Read,
+) -> Result<Option<ProjectHint>, DecodeError> {
     let path = match provider {
         Provider::Claude => &["cwd"][..],
         Provider::Codex => &["payload", "cwd"][..],

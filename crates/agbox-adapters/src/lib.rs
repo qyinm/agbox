@@ -8,7 +8,7 @@ pub use adapter::{
     DecodedRecordDraft, DecodedRecordParts, DecoderState, DiscoveredSource,
     MAX_DECODER_STATE_BYTES, MAX_EVENTS_PER_RECORD, MAX_EVIDENCE_PER_RECORD,
     MAX_RECORD_SEMANTIC_BYTES, NativeIdentifier, ProjectHint, RecordSource, RootClass, RootSpec,
-    SourceAdapter, project_hint,
+    SourceAdapter, project_hint, project_hint_from_reader,
 };
 #[cfg(feature = "test-support")]
 pub use adapter::{MemoryRecordSource, decode_fixture};

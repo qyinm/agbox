@@ -2,11 +2,8 @@
 
 use std::sync::Arc;
 
-use agbox_core::EvidenceId;
-use agbox_service::{
-    ApplicationService, Components, Daemon, EvidenceReader, ServiceError, ipc::LocalIpcServer,
-};
-use agbox_store::StoreRuntime;
+use agbox_service::{ApplicationService, Components, Daemon, ipc::LocalIpcServer};
+use agbox_store::{EvidenceVault, KeyringKeyProvider, StoreRuntime};
 
 use crate::{CliError, args::DaemonCommand, paths::AgboxPaths, platform::Platform};
 
@@ -59,19 +56,6 @@ fn logs(paths: &AgboxPaths, follow: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-#[derive(Debug)]
-struct NoRawEvidence;
-
-impl EvidenceReader for NoRawEvidence {
-    fn get(
-        &self,
-        _: &EvidenceId,
-        _: &agbox_store::EvidenceMetadata,
-    ) -> Result<Vec<u8>, ServiceError> {
-        Err(ServiceError::Evidence)
-    }
-}
-
 /// Runs the single-writer foreground service until an interrupt signal arrives.
 ///
 /// # Errors
@@ -82,8 +66,12 @@ pub async fn foreground(paths: &AgboxPaths) -> Result<(), CliError> {
     let store = StoreRuntime::start(&paths.state_db)
         .await
         .map_err(|_| CliError::Unavailable)?;
-    let application =
-        ApplicationService::new(store.read().clone(), store.writer().clone(), NoRawEvidence);
+    let vault = EvidenceVault::open(
+        paths.evidence.clone(),
+        std::sync::Arc::new(KeyringKeyProvider),
+    )
+    .map_err(|_| CliError::Unavailable)?;
+    let application = ApplicationService::new(store.read().clone(), store.writer().clone(), vault);
     let server = LocalIpcServer::bind(paths.socket(), Arc::new(application))
         .await
         .map_err(|_| CliError::Unavailable)?;
