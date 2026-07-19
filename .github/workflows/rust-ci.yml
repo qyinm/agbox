@@ -18,3 +18,5 @@ jobs:
       - run: cargo test --workspace --all-features
       - run: cargo test -p agbox-release-gate
       - run: cargo build --locked --release --target aarch64-apple-darwin -p agbox-cli
+      - run: npm --prefix npm/cli run test:cutover
+      - run: npm --prefix npm/cli pack --dry-run

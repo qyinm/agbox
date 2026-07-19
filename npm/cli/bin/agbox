@@ -1,9 +1,26 @@
 #!/usr/bin/env node
 
+const fs = require("node:fs");
 const { spawnSync } = require("node:child_process");
 const path = require("node:path");
 
-const executable = path.join(__dirname, "..", "dist", "agbox-darwin-arm64");
+if (process.platform !== "darwin" || process.arch !== "arm64") {
+  console.error("@agboxhq/cli supports macOS arm64 only.");
+  process.exit(1);
+}
+
+const executable = path.join(__dirname, "..", "cache", "agbox-darwin-arm64");
+let stat;
+try {
+  stat = fs.lstatSync(executable);
+} catch {
+  console.error("agbox native binary is missing; reinstall @agboxhq/cli.");
+  process.exit(1);
+}
+if (stat.isSymbolicLink() || !stat.isFile() || (stat.mode & 0o100) === 0) {
+  console.error("agbox native binary is invalid; reinstall @agboxhq/cli.");
+  process.exit(1);
+}
 const result = spawnSync(executable, process.argv.slice(2), {
   stdio: "inherit",
 });

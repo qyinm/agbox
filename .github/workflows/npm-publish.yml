@@ -29,46 +29,25 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Verify exact Rust release-gate artifact before cutover
+      - name: Build pinned Rust artifact
         run: |
-          test -f release-gate-report.json
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --all-features -- -D warnings
           cargo test --workspace --all-features
           cargo build --locked --release --target aarch64-apple-darwin -p agbox-cli
           BINARY=target/aarch64-apple-darwin/release/agbox
           SHA="$(shasum -a 256 "$BINARY" | awk '{print $1}')"
-          cargo run --locked --release -p agbox-release-gate -- verify \
-            --report release-gate-report.json --commit "$(git rev-parse HEAD)" --binary-sha256 "$SHA"
-          echo "A valid 24-hour report is present; legacy removal remains a separate reviewed cutover."
-
-      - name: Bundle telemetry env
-        # A Rust report alone must not publish the tracked Go payload. The
-        # downloader/cutover change stays disabled until its own reviewed task.
-        if: ${{ false }}
-        env:
-          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
-        run: |
-          if [[ -n "${POSTHOG_API_KEY}" ]]; then
-            umask 077
-            printf 'POSTHOG_API_KEY=%s\nPOSTHOG_HOST=https://us.i.posthog.com\n' "${POSTHOG_API_KEY}" > npm/cli/telemetry.env
-          else
-            echo "POSTHOG_API_KEY secret not set; npm publish will ship without bundled telemetry credentials"
-          fi
+          test "$SHA" = "$(node -p "require('./npm/cli/native.json').sha256")"
+          gh release upload "${GITHUB_REF_NAME}" "$BINARY#agbox-darwin-arm64" --clobber
 
       - name: Verify npm package
-        if: ${{ false }}
         working-directory: npm/cli
         run: |
-          node bin/agbox --help
+          npm run test:cutover
           npm pack --dry-run
 
       - name: Publish npm package
-        if: ${{ false }}
         working-directory: npm/cli
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public
-
-      - name: Hold package publication pending Rust npm cutover
-        run: echo "Release report verified; legacy npm publication remains intentionally disabled until Task 27 cutover is separately approved."

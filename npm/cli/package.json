@@ -1,7 +1,7 @@
 {
   "name": "@agboxhq/cli",
-  "version": "0.1.9",
-  "description": "Local-first CLI for recording and replaying repeated AI-agent workflows.",
+  "version": "0.2.0",
+  "description": "Local cross-agent work handoff for Claude Code and Codex.",
   "license": "MIT",
   "homepage": "https://github.com/qyinm/agbox#readme",
   "repository": {
@@ -13,9 +13,9 @@
   },
   "files": [
     "bin/",
-    "dist/",
+    "cache/",
     "scripts/",
-    "telemetry.env",
+    "native.json",
     "README.md"
   ],
   "os": [
@@ -25,7 +25,8 @@
     "arm64"
   ],
   "scripts": {
-    "postinstall": "node scripts/postinstall.js"
+    "postinstall": "node scripts/postinstall.js",
+    "test:cutover": "node --test test/rust-cutover.test.js"
   },
   "publishConfig": {
     "access": "public"

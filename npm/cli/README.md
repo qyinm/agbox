@@ -1,12 +1,23 @@
 # @agboxhq/cli
 
-macOS arm64 npm package for agbox, a local-first CLI that records repeated AI-agent workflows, replays them once with approval, and saves them for future use only after explicit confirmation.
+`@agboxhq/cli` is the thin macOS arm64 installer for the Rust agbox runtime.
+It downloads one checksum-pinned native binary, verifies it before execution,
+then runs `agbox init --quiet`.
+
+Supported providers are Claude Code and Codex. agbox is local-only: it records
+work context for handoff, but does not start agents, execute work, or assign
+tasks.
 
 ```sh
 npm install -g @agboxhq/cli
-agbox inbox
+agbox doctor --output json
+agbox work current
 ```
 
-`npm install` runs `agbox init --quiet` automatically (set `AGBOX_SKIP_WATCHER=1` to opt out).
+The runtime stores fresh state under `~/.agbox/state.db`. It does not import,
+open, or delete the legacy `~/.agbox/agbox.db` database. Roll back by
+installing the previous published package version; that version remains
+independent of Rust state.
 
-This package installs the `agbox` command.
+The first release supports macOS Apple Silicon only. The installer rejects
+unsupported platforms and never falls back to a Go implementation.
