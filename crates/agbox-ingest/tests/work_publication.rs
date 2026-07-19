@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use agbox_core::{ContractId, EventId, ProjectId, Provider, SessionId, WorkId};
 use agbox_ingest::{
@@ -69,6 +69,25 @@ fn contract_json(
         }
     })
     .to_string()
+}
+
+#[tokio::test]
+async fn production_supervisor_reduces_and_publishes_one_ingested_project_page() {
+    let fixture = FixtureRuntime::codex_records(1).await;
+    fixture.drain().await.unwrap();
+
+    let published = fixture
+        .reduce_and_publish_next()
+        .await
+        .unwrap()
+        .expect("fixture produces one work contract");
+    assert_eq!(published.revision, 1);
+    let visible = fixture
+        .read_store()
+        .work(&ProjectId::for_test("project_fixture"), &published.work_id)
+        .await
+        .unwrap();
+    assert!(visible.is_some());
 }
 
 #[test]

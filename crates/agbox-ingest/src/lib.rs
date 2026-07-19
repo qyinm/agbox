@@ -263,6 +263,12 @@ pub mod test_support {
             Ok(())
         }
 
+        pub async fn reduce_and_publish_next(
+            &self,
+        ) -> Result<Option<crate::WorkPublicationReport>, IngestError> {
+            self.coordinator.reduce_and_publish_next().await
+        }
+
         #[must_use]
         pub fn read(&self) -> FixtureRead {
             FixtureRead {

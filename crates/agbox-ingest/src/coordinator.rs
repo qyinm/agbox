@@ -861,6 +861,59 @@ impl IngestionCoordinator {
         Err(IngestError::Store(StoreError::ReducerWatermarkConflict))
     }
 
+    /// Reduces one homogeneous-project event page and immediately publishes its
+    /// provisional work contract. This is the production handoff path used
+    /// after source ingestion; it never seeds contracts or bypasses the graph
+    /// watermark.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded reducer, graph, or work-publication error. A page
+    /// containing more than one project is rejected before either watermark
+    /// advances, so a caller can retry with its project-partitioned schedule.
+    pub async fn reduce_and_publish_next(
+        &self,
+    ) -> Result<Option<WorkPublicationReport>, IngestError> {
+        for attempt in 0..GRAPH_REDUCER_CONFLICT_RETRIES {
+            let watermark = self.read.reducer_watermark(GRAPH_REDUCER_NAME).await?;
+            let events = reducer_events_after(
+                &self.read,
+                watermark.through_event_seq,
+                agbox_store::MAX_EVENT_PAGE_ROWS,
+                agbox_store::MAX_EVENT_PAGE_BYTES,
+            )
+            .await?;
+            let Some(first) = events.first() else {
+                return Ok(None);
+            };
+            let project_id = first.event.project_id();
+            if events
+                .iter()
+                .any(|event| event.event.project_id() != project_id)
+            {
+                return Err(IngestError::InvalidGraphMutation);
+            }
+            let provider = first.event.source().provider();
+            let mutation = DeterministicReducer.reduce(&events)?;
+            if mutation.facts.is_empty() {
+                return Err(IngestError::InvalidGraphMutation);
+            }
+            let graph = graph_write_batch(mutation.clone())?;
+            match self.writer.apply_graph(graph).await {
+                Ok(_) => {
+                    return self
+                        .publish_work(mutation, WorkPublicationRequest::new(provider))
+                        .await
+                        .map(Some);
+                }
+                Err(StoreError::ReducerWatermarkConflict)
+                    if attempt + 1 < GRAPH_REDUCER_CONFLICT_RETRIES => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(IngestError::Store(StoreError::ReducerWatermarkConflict))
+    }
+
     /// Correlates one reduced fact page, builds its immediate provisional
     /// contract, and atomically publishes the store-owned work batch.
     ///
