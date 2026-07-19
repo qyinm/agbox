@@ -55,10 +55,12 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

@@ -1,9 +1,16 @@
 //! Foreground daemon composition.
 
-use std::sync::Arc;
+use std::{os::unix::ffi::OsStrExt, path::Path, sync::Arc};
 
+use agbox_adapters::{RootClass, adapters};
+use agbox_ingest::{
+    CoordinatorSource, DiscoveryWalker, HistoryDecision, HistoryPolicy, IngestionCoordinator,
+    RecordScanner, ScanOutcome, VerifiedSourceOpener, WorkPriority, resolve_source_project,
+};
 use agbox_service::{ApplicationService, Components, Daemon, ipc::LocalIpcServer};
-use agbox_store::{EvidenceVault, KeyringKeyProvider, StoreRuntime};
+use agbox_store::{EvidenceVault, KeyringKeyProvider, SourceRegistration, StoreRuntime};
+use time::OffsetDateTime;
+use zeroize::Zeroizing;
 
 use crate::{CliError, args::DaemonCommand, paths::AgboxPaths, platform::Platform};
 
@@ -71,6 +78,13 @@ pub async fn foreground(paths: &AgboxPaths) -> Result<(), CliError> {
         std::sync::Arc::new(KeyringKeyProvider),
     )
     .map_err(|_| CliError::Unavailable)?;
+    let coordinator = Arc::new(IngestionCoordinator::new(
+        store.read().clone(),
+        store.writer().clone(),
+        agbox_ingest::SOURCE_QUEUE_CAPACITY,
+    ));
+    let home = paths.root.parent().ok_or(CliError::HomeUnavailable)?;
+    bootstrap_sources(home, &store, &coordinator).await?;
     let application = ApplicationService::new(store.read().clone(), store.writer().clone(), vault);
     let server = LocalIpcServer::bind(paths.socket(), Arc::new(application))
         .await
@@ -81,4 +95,118 @@ pub async fn foreground(paths: &AgboxPaths) -> Result<(), CliError> {
         .map_err(|_| CliError::Unavailable)?;
     daemon.shutdown().await.map_err(|_| CliError::Unavailable)?;
     store.shutdown().await.map_err(|_| CliError::Unavailable)
+}
+
+async fn bootstrap_sources(
+    home: &Path,
+    store: &StoreRuntime,
+    coordinator: &Arc<IngestionCoordinator>,
+) -> Result<(), CliError> {
+    for adapter in adapters() {
+        for root in adapter.roots(home) {
+            if !root.path.is_dir() {
+                continue;
+            }
+            let Ok(mut walker) = DiscoveryWalker::new(adapter.provider(), root) else {
+                continue;
+            };
+            loop {
+                let batch = walker
+                    .next_batch(agbox_ingest::DISCOVERY_ENTRIES_PER_YIELD)
+                    .map_err(|_| CliError::Unavailable)?;
+                for source in batch.sources {
+                    register_replay_source(store, coordinator, source).await?;
+                }
+                if batch.cursor.is_none() {
+                    break;
+                }
+            }
+        }
+    }
+    while let Some(lease) = coordinator.lease_one().map_err(|_| CliError::Unavailable)? {
+        let _ = coordinator
+            .process_one(lease)
+            .await
+            .map_err(|_| CliError::Unavailable)?;
+    }
+    while !coordinator
+        .reduce_and_publish_grouped_next()
+        .await
+        .map_err(|_| CliError::Unavailable)?
+        .is_empty()
+    {}
+    Ok(())
+}
+
+async fn register_replay_source(
+    store: &StoreRuntime,
+    coordinator: &Arc<IngestionCoordinator>,
+    source: agbox_adapters::DiscoveredSource,
+) -> Result<(), CliError> {
+    if !matches!(
+        HistoryPolicy.decide(source.session_time, OffsetDateTime::now_utc(), source.size),
+        HistoryDecision::ReplayFrom(0)
+    ) {
+        return Ok(());
+    }
+    let Some(project) = source_project(&source) else {
+        return Ok(());
+    };
+    store
+        .writer()
+        .register_source(SourceRegistration {
+            project_id: project.project_id.clone(),
+            repository_identity: project.repository_identity,
+            project_root: Zeroizing::new(project.root.as_os_str().as_bytes().to_vec()),
+            source_id: source.source_id.clone(),
+            provider: source.provider,
+            root_class: root_class(source.class).into(),
+            source_path: Zeroizing::new(source.path.as_os_str().as_bytes().to_vec()),
+            file_identity: source.file_identity.clone(),
+            generation: source.generation,
+            size_bytes: source.size,
+            mtime: source.mtime,
+            session_time: source.session_time,
+            initial_cursor: 0,
+        })
+        .await
+        .map_err(|_| CliError::Unavailable)?;
+    let key = coordinator
+        .register_source(CoordinatorSource {
+            discovered: source.clone(),
+            project_id: project.project_id,
+            project_root: Some(project.root),
+            format: source_format(source.provider).into(),
+            observed_at: OffsetDateTime::now_utc(),
+        })
+        .map_err(|_| CliError::Unavailable)?;
+    coordinator
+        .try_enqueue(key, source.size, WorkPriority::ActiveCatchup)
+        .map_err(|_| CliError::Unavailable)
+}
+
+fn source_project(
+    source: &agbox_adapters::DiscoveredSource,
+) -> Option<agbox_ingest::ResolvedProject> {
+    let opener = VerifiedSourceOpener::new(&source.root).ok()?;
+    let file = opener.open(source).ok()?;
+    let mut scanner = RecordScanner::new(file, 0, source.size).ok()?;
+    let ScanOutcome::Complete(record) = scanner.next().ok()? else {
+        return None;
+    };
+    resolve_source_project(source.provider, record.open().ok()?).ok()?
+}
+
+const fn root_class(class: RootClass) -> &'static str {
+    match class {
+        RootClass::Active => "active",
+        RootClass::Archive => "archive",
+    }
+}
+
+const fn source_format(provider: agbox_core::Provider) -> &'static str {
+    match provider {
+        agbox_core::Provider::Claude => "claude-transcript-2.1",
+        agbox_core::Provider::Codex => "codex-rollout-1",
+    }
 }
