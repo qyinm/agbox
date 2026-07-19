@@ -21,6 +21,7 @@ use agbox_service::{AppClient, IpcAppClient};
 ///
 /// Returns terminal setup, draw, or input errors after best-effort cleanup.
 pub async fn run(work: Vec<WorkSummary>, client: IpcAppClient) -> io::Result<()> {
+    let _panic_guard = terminal::PanicHookGuard::install();
     let mut stdout = io::stdout();
     let _guard = terminal::TerminalGuard::enter(&mut stdout)?;
     let backend = CrosstermBackend::new(stdout);
