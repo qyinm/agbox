@@ -1,0 +1,1 @@
+{"type":"user","uuid":"u3","sessionId":"s1","timestamp":"2026-07-17T01:00:03Z","message":{"role":"user","content":[{"type":"text","text":"Use a 64 KiB window"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"REDACTED_FIXTURE"}},{"type":"thinking","thinking":"PRIVATE_REASONING_FIXTURE"}]}}

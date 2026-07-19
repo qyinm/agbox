@@ -159,7 +159,7 @@ The scanner should stop treating corrections and events as mutually exclusive in
 - **Goal:** Align user expectations with the new behavior.
 - **Requirements:** R1, R2, R5, R6
 - **Dependencies:** U1, U2, U3, U4
-- **Files:** `README.md`, `docs/superpowers/specs/2026-06-22-session-watcher-design.md`, `docs/superpowers/plans/2026-06-22-session-watcher.md`
+- **Files:** `README.md`, `docs/specs/2026-06-22-session-watcher-design.md`, `docs/plans/2026-06-22-session-watcher.md`
 - **Approach:** Update public copy from "corrections only" toward "repeated corrections and recurring workflow prompts" while preserving the review-first, local-first posture. Keep examples concrete and avoid implying agbox learns arbitrary preferences from one-off requests.
 - **Patterns to follow:** Existing README sections "The 30-second aha", "How it works", "Features", and "Privacy & local-first".
 - **Test scenarios:** Test expectation: none -- prose-only documentation. CLI tests in U4 cover the user-visible command output.

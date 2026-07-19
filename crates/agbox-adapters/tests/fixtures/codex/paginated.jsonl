@@ -1,0 +1,4 @@
+{"timestamp":"2026-07-17T03:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"codex-s2","cwd":"/fixture/project","history_mode":"paginated"}}
+{"timestamp":"2026-07-17T03:00:01Z","ordinal":1,"type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch","call_id":"call-2"}}
+{"timestamp":"2026-07-17T03:00:02Z","ordinal":2,"type":"event_msg","payload":{"type":"item_completed","item":{"type":"file_change","call_id":"call-2","status":"completed","changes":[{"path":"src/lib.rs","kind":"update"}]}}}
+{"timestamp":"2026-07-17T03:00:03Z","ordinal":3,"type":"compacted","payload":{"replacement_history":[]}}

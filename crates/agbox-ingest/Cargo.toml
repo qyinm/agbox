@@ -1,0 +1,38 @@
+[package]
+name = "agbox-ingest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+test-support = [
+    "agbox-adapters/test-support",
+    "agbox-core/test-support",
+    "agbox-store/test-support",
+    "agbox-workgraph/test-support",
+    "dep:tempfile",
+]
+
+[dependencies]
+agbox-adapters.workspace = true
+agbox-core.workspace = true
+agbox-store.workspace = true
+agbox-workgraph.workspace = true
+blake3.workspace = true
+notify.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tempfile = { workspace = true, optional = true }
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+rusqlite.workspace = true
+
+[lints]
+workspace = true

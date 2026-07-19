@@ -247,6 +247,6 @@ This makes the regression suite easier to extend when adding states or hooks, an
 
 - `docs/brainstorms/2026-06-25-auto-workflow-record-replay-requirements.md` - product requirements for automatic workflow recording, instruction-only replay, apply once, explicit save/auto-apply confirmation, inbox management, and lifecycle vocabulary.
 - `docs/plans/2026-06-25-003-feat-recorded-workflow-replay-plan.md` - primary implementation plan for prompt-submit replay, apply-once persistence, save-for-future prompts, inbox lifecycle labels, and implementation files.
-- `docs/superpowers/specs/2026-06-22-session-watcher-design.md` - broader system design for watcher, prompt-submit hooks, stop hooks, and instruction-only replay.
+- `docs/specs/2026-06-22-session-watcher-design.md` - broader system design for watcher, prompt-submit hooks, stop hooks, and instruction-only replay.
 - `docs/plans/2026-06-23-001-feat-beta-aha-loop-plan.md` - predecessor plan for proposal lifecycle visibility and acknowledgement behavior.
 - `docs/plans/2026-06-25-001-fix-repeated-prompt-candidates-plan.md` - upstream prompt-pattern candidate source work that feeds prompt-submit replay matching.

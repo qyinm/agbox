@@ -1,0 +1,6 @@
+{"timestamp":"2026-07-17T03:00:00Z","ordinal":0,"type":"session_meta","payload":{"history_mode":"paginated"}}
+{"timestamp":"2026-07-17T03:00:01Z","ordinal":1,"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call-dup"}}
+{"timestamp":"2026-07-17T03:00:02Z","ordinal":2,"type":"response_item","payload":{"type":"function_call_output","call_id":"call-dup","status":"failed","output":"response view"}}
+{"timestamp":"2026-07-17T03:00:03Z","ordinal":3,"type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-dup","exit_code":17,"stdout":"event fallback view"}}
+{"timestamp":"2026-07-17T03:00:04Z","ordinal":4,"type":"event_msg","payload":{"type":"item_completed","item":{"type":"command_execution","call_id":"call-dup","status":"completed","output":"authoritative view"}}}
+{"timestamp":"2026-07-17T03:00:05Z","ordinal":5,"type":"event_msg","payload":{"type":"item_completed","item":{"type":"command_execution","call_id":"call-dup","status":"failed","output":"contradictory replay"}}}

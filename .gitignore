@@ -1,17 +1,12 @@
-# Go build/test output
-/agbox
-*.test
-*.out
-coverage.*
-
-# Local Go caches
-.gocache/
+# Rust build output
+/target/
 
 # Local runtime data
 *.db
 *.db-*
 .env
 npm/cli/telemetry.env
+npm/cli/cache/
 
 # Temporary files
 tmp/

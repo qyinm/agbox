@@ -1,0 +1,1089 @@
+#![allow(clippy::unwrap_used)]
+
+use std::io::Write;
+
+use agbox_adapters::{
+    ClaudeAdapter, DecodeContext, DecodeDisposition, DecodeError, DecoderState, MemoryRecordSource,
+    SourceAdapter,
+};
+use agbox_core::{ActionOutcome, Actor, EventPayload, ProjectId};
+use agbox_ingest::{RecordScanner, ScanOutcome};
+use proptest::prelude::*;
+use time::OffsetDateTime;
+
+fn context() -> DecodeContext {
+    DecodeContext {
+        project_id: ProjectId::for_test("project_fixture"),
+        project_root: Some("/fixture/project".into()),
+        source_id: "source_fixture".to_owned(),
+        observed_at: OffsetDateTime::UNIX_EPOCH,
+        source_generation: 7,
+        format: "claude-transcript-2.1".to_owned(),
+    }
+}
+
+fn decode_lines(fixture: &str) -> Vec<agbox_adapters::DecodedRecord> {
+    let adapter = ClaudeAdapter;
+    let mut state = DecoderState::default();
+    fixture
+        .lines()
+        .map(|line| {
+            let source = MemoryRecordSource::new(line.as_bytes().to_vec());
+            let decoded = adapter.decode(&source, &context(), &state).unwrap();
+            state = decoded.next_state().clone();
+            decoded
+        })
+        .collect()
+}
+
+fn decode_one(
+    json: &str,
+    state: &DecoderState,
+) -> Result<agbox_adapters::DecodedRecord, DecodeError> {
+    ClaudeAdapter.decode(
+        &MemoryRecordSource::new(json.as_bytes().to_vec()),
+        &context(),
+        state,
+    )
+}
+
+fn event_json(record: &agbox_adapters::DecodedRecord) -> String {
+    serde_json::to_string(record.events()).unwrap()
+}
+
+#[test]
+fn claude_basic_fixture_maps_messages_and_tool_pair() {
+    let records = decode_lines(include_str!("fixtures/claude/basic.jsonl"));
+    let events = records
+        .iter()
+        .flat_map(agbox_adapters::DecodedRecord::events)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.payload(), EventPayload::MessageCreated { .. }))
+            .count(),
+        2
+    );
+    let requested = events
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::ActionRequested {
+                native_action_id,
+                tool_name,
+                ..
+            } => Some((native_action_id, tool_name)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(requested.0, "tool-1");
+    assert_eq!(requested.1, "Read");
+    assert!(events.iter().any(|event| matches!(
+        event.payload(),
+        EventPayload::ActionFinished { native_action_id, .. } if native_action_id == "tool-1"
+    )));
+}
+
+#[test]
+fn roots_and_matcher_are_claude_jsonl_only() {
+    let root = ClaudeAdapter
+        .roots(std::path::Path::new("/home/test"))
+        .remove(0);
+    assert!(root.path.ends_with(".claude/projects"));
+    assert!(root.recursive);
+    assert!(ClaudeAdapter.matches(&root, std::path::Path::new("project/session.jsonl")));
+    assert!(!ClaudeAdapter.matches(&root, std::path::Path::new("../session.jsonl")));
+    assert!(!ClaudeAdapter.matches(&root, std::path::Path::new("session.json")));
+    assert!(
+        ClaudeAdapter
+            .trusted_session_time(
+                &root,
+                std::path::Path::new("session.jsonl"),
+                OffsetDateTime::UNIX_EPOCH
+            )
+            .is_none()
+    );
+}
+
+#[test]
+fn multiple_text_blocks_form_one_message_semantic_fact() {
+    let decoded = decode_one(
+        r#"{"type":"assistant","uuid":"a-multi","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"text","text":"first"},{"type":"thinking","thinking":"DO_NOT_KEEP"},{"type":"text","text":"second"}]}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let messages = decoded
+        .events()
+        .iter()
+        .filter(|event| matches!(event.payload(), EventPayload::MessageCreated { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), 1);
+    let EventPayload::MessageCreated { content } = messages[0].payload() else {
+        unreachable!();
+    };
+    assert_eq!(content.redacted_excerpt(), Some("first\nsecond"));
+    assert!(!event_json(&decoded).contains("DO_NOT_KEEP"));
+    assert!(!format!("{decoded:?}").contains("DO_NOT_KEEP"));
+}
+
+#[test]
+fn parallel_tools_correlate_out_of_order_and_ignore_duplicates_and_unknown_ids() {
+    let request = decode_one(
+        r#"{"type":"assistant","uuid":"a-tools","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"src/a.rs"}},{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"src/b.rs"}}]}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let second = decode_one(
+        r#"{"type":"user","uuid":"u-t2","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"two","is_error":false}]}}"#,
+        request.next_state(),
+    )
+    .unwrap();
+    let first = decode_one(
+        r#"{"type":"user","uuid":"u-t1","sessionId":"s1","timestamp":"2026-07-17T01:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"one","is_error":false}]}}"#,
+        second.next_state(),
+    )
+    .unwrap();
+    for (record, expected) in [(&second, "t2"), (&first, "t1")] {
+        assert!(record.events().iter().any(|event| matches!(
+            event.payload(),
+            EventPayload::ActionFinished { native_action_id, .. } if native_action_id == expected
+        )));
+    }
+    for id in ["t1", "unknown"] {
+        let duplicate = decode_one(
+            &format!(
+                r#"{{"type":"user","uuid":"u-{id}","sessionId":"s1","timestamp":"2026-07-17T01:00:03Z","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","content":"ignored","is_error":false}}]}}}}"#
+            ),
+            first.next_state(),
+        )
+        .unwrap();
+        assert!(
+            !duplicate
+                .events()
+                .iter()
+                .any(|event| matches!(event.payload(), EventPayload::ActionFinished { .. }))
+        );
+    }
+}
+
+#[test]
+fn block_result_text_wins_over_duplicate_top_level_representation() {
+    let request = decode_one(
+        r#"{"type":"assistant","uuid":"a-request","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let result = decode_one(
+        r#"{"type":"user","uuid":"u-result","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"block-safe"}]},"toolUseResult":{"content":"TOP_DUPLICATE"}}"#,
+        request.next_state(),
+    )
+    .unwrap();
+    let output = result
+        .events()
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::ActionFinished {
+                output: Some(output),
+                ..
+            } => Some(output),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(output.hash(), blake3::hash(b"block-safe").to_hex().as_str());
+    assert!(result.evidence().iter().any(|evidence| {
+        &evidence.content == output && evidence.plaintext.as_slice() == b"block-safe"
+    }));
+    assert!(!event_json(&result).contains("TOP_DUPLICATE"));
+    assert!(!result.evidence().iter().any(|evidence| {
+        evidence
+            .plaintext
+            .windows("TOP_DUPLICATE".len())
+            .any(|window| window == b"TOP_DUPLICATE")
+    }));
+}
+
+#[test]
+fn top_level_result_is_ignored_when_multiple_result_blocks_exist() {
+    let request = decode_one(
+        r#"{"type":"assistant","uuid":"a-requests","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{}},{"type":"tool_use","id":"t2","name":"Read","input":{}}]}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let result = decode_one(
+        r#"{"type":"user","uuid":"u-results","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1"},{"type":"tool_result","tool_use_id":"t2"}]},"toolUseResult":{"content":"MUST_NOT_ATTACH","isError":true}}"#,
+        request.next_state(),
+    )
+    .unwrap();
+    let finished = result
+        .events()
+        .iter()
+        .filter_map(|event| match event.payload() {
+            EventPayload::ActionFinished {
+                outcome, output, ..
+            } => Some((outcome, output)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(finished.len(), 2);
+    assert!(
+        finished
+            .iter()
+            .all(|(outcome, output)| **outcome == ActionOutcome::Succeeded && output.is_none())
+    );
+    assert!(!event_json(&result).contains("MUST_NOT_ATTACH"));
+    assert!(result.evidence().is_empty());
+}
+
+#[test]
+fn duplicate_tool_id_replaces_the_older_link_deterministically() {
+    let first = decode_one(
+        r#"{"type":"assistant","uuid":"a-old","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"tool_use","id":"same","name":"Read","input":{"path":"old"}}]}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let second = decode_one(
+        r#"{"type":"assistant","uuid":"a-new","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{"content":[{"type":"tool_use","id":"same","name":"Read","input":{"path":"new"}}]}}"#,
+        first.next_state(),
+    )
+    .unwrap();
+    let result = decode_one(
+        r#"{"type":"user","uuid":"u-result","sessionId":"s1","timestamp":"2026-07-17T01:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"same","content":"done","is_error":false}]}}"#,
+        second.next_state(),
+    )
+    .unwrap();
+    let requested = second
+        .events()
+        .iter()
+        .find(|event| matches!(event.payload(), EventPayload::ActionRequested { .. }))
+        .unwrap();
+    let finished = result
+        .events()
+        .iter()
+        .find(|event| matches!(event.payload(), EventPayload::ActionFinished { .. }))
+        .unwrap();
+    assert_eq!(finished.causation_id(), Some(requested.event_id().as_str()));
+}
+
+#[test]
+fn the_129th_tool_evicts_the_front_and_state_stays_bounded() {
+    let mut state = DecoderState::default();
+    for index in 0..129 {
+        let decoded = decode_one(
+            &format!(
+                r#"{{"type":"assistant","uuid":"a-{index}","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{{"content":[{{"type":"tool_use","id":"tool-{index}","name":"Read","input":{{"path":"src/{index}.rs"}}}}]}}}}"#
+            ),
+            &state,
+        )
+        .unwrap();
+        state = decoded.next_state().clone();
+        assert!(state.as_bytes().len() <= 32 * 1024);
+    }
+    let evicted = decode_one(
+        r#"{"type":"user","uuid":"u-evicted","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"tool-0","content":"old","is_error":false}]}}"#,
+        &state,
+    )
+    .unwrap();
+    assert!(
+        !evicted
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::ActionFinished { .. }))
+    );
+    let retained = decode_one(
+        r#"{"type":"user","uuid":"u-retained","sessionId":"s1","timestamp":"2026-07-17T01:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"tool-128","content":"new","is_error":false}]}}"#,
+        &state,
+    )
+    .unwrap();
+    assert!(retained.events().iter().any(|event| matches!(
+        event.payload(),
+        EventPayload::ActionFinished { native_action_id, .. } if native_action_id == "tool-128"
+    )));
+}
+
+#[test]
+fn write_artifact_requires_success_and_a_trusted_project_path() {
+    let request = decode_one(
+        r#"{"type":"assistant","uuid":"a-write","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","cwd":"/malicious/root","message":{"content":[{"type":"tool_use","id":"write-1","name":"Write","input":{"file_path":"/fixture/project/src/lib.rs","content":"secret token=abc"}}]}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let request_json = event_json(&request);
+    assert!(request_json.contains("$PROJECT/src/lib.rs"));
+    assert!(!request_json.contains("/fixture/project"));
+    assert!(!request_json.contains("/malicious/root"));
+    assert!(!request_json.contains("token=abc"));
+
+    let success = decode_one(
+        r#"{"type":"user","uuid":"u-write","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"write-1","content":{"bytes":12},"is_error":false}]}}"#,
+        request.next_state(),
+    )
+    .unwrap();
+    assert!(success.events().iter().any(|event| matches!(
+        event.payload(),
+        EventPayload::ArtifactChanged {
+            path,
+            content_hash,
+            ..
+        } if path.redacted_excerpt() == Some("$PROJECT/src/lib.rs")
+            && content_hash.is_none()
+    )));
+
+    let failed_request = decode_one(
+        r#"{"type":"assistant","uuid":"a-fail","sessionId":"s1","timestamp":"2026-07-17T01:00:02Z","message":{"content":[{"type":"tool_use","id":"write-fail","name":"Edit","input":{"file_path":"src/lib.rs"}}]}}"#,
+        success.next_state(),
+    )
+    .unwrap();
+    let failed = decode_one(
+        r#"{"type":"user","uuid":"u-fail","sessionId":"s1","timestamp":"2026-07-17T01:00:03Z","message":{"content":[{"type":"tool_result","tool_use_id":"write-fail","content":"no","is_error":true}]}}"#,
+        failed_request.next_state(),
+    )
+    .unwrap();
+    assert!(failed.events().iter().any(|event| matches!(
+        event.payload(),
+        EventPayload::ActionFinished {
+            outcome: ActionOutcome::Failed,
+            ..
+        }
+    )));
+    assert!(
+        !failed
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::ArtifactChanged { .. }))
+    );
+}
+
+#[test]
+fn relative_write_path_without_trusted_project_root_never_authorizes_artifact() {
+    let mut untrusted = context();
+    untrusted.project_root = None;
+    let request_source = MemoryRecordSource::new(
+        br#"{"type":"assistant","uuid":"a-untrusted","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"tool_use","id":"untrusted-write","name":"Write","input":{"file_path":"src/lib.rs"}}]}}"#.to_vec(),
+    );
+    let request = ClaudeAdapter
+        .decode(&request_source, &untrusted, &DecoderState::default())
+        .unwrap();
+    let result_source = MemoryRecordSource::new(
+        br#"{"type":"user","uuid":"u-untrusted","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"untrusted-write","content":"ok","is_error":false}]}}"#.to_vec(),
+    );
+    let result = ClaudeAdapter
+        .decode(&result_source, &untrusted, request.next_state())
+        .unwrap();
+    assert!(
+        !result
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::ArtifactChanged { .. }))
+    );
+}
+
+#[test]
+fn outside_traversal_and_long_paths_never_create_artifacts() {
+    for (index, path) in [
+        "/outside/project/file.rs".to_owned(),
+        "../escape.rs".to_owned(),
+        format!("/fixture/project/{}", "x".repeat(600)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request = decode_one(
+            &format!(
+                r#"{{"type":"assistant","uuid":"a-path-{index}","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{{"content":[{{"type":"tool_use","id":"path-{index}","name":"Write","input":{{"file_path":{}}}}}]}}}}"#,
+                serde_json::to_string(&path).unwrap()
+            ),
+            &DecoderState::default(),
+        )
+        .unwrap();
+        let result = decode_one(
+            &format!(
+                r#"{{"type":"user","uuid":"u-path-{index}","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{{"content":[{{"type":"tool_result","tool_use_id":"path-{index}","content":"ok","is_error":false}}]}}}}"#
+            ),
+            request.next_state(),
+        )
+        .unwrap();
+        assert!(
+            !result
+                .events()
+                .iter()
+                .any(|event| matches!(event.payload(), EventPayload::ArtifactChanged { .. }))
+        );
+    }
+}
+
+#[test]
+fn required_identity_boundaries_and_timestamp_are_enforced() {
+    let valid = "s".repeat(128);
+    decode_one(
+        &format!(
+            r#"{{"type":"user","uuid":"u","sessionId":"{valid}","timestamp":"2026-07-17T01:00:00Z","message":{{"content":"ok"}}}}"#
+        ),
+        &DecoderState::default(),
+    )
+    .unwrap();
+    for json in [
+        r#"{"type":"user","uuid":"u","timestamp":"2026-07-17T01:00:00Z","message":{"content":"x"}}"#.to_owned(),
+        format!(
+            r#"{{"type":"user","uuid":"u","sessionId":"{}","timestamp":"2026-07-17T01:00:00Z","message":{{"content":"x"}}}}"#,
+            "s".repeat(129)
+        ),
+        r#"{"type":"user","uuid":"u","sessionId":"s","timestamp":"yesterday","message":{"content":"x"}}"#.to_owned(),
+    ] {
+        assert!(decode_one(&json, &DecoderState::default()).is_err());
+    }
+}
+
+#[test]
+fn duplicate_sibling_fields_are_rejected() {
+    let error = decode_one(
+        r#"{"type":"assistant","uuid":"a","sessionId":"s","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"tool_use","id":"one","id":"two","name":"Read","input":{}}]}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, DecodeError::Malformed(_)));
+
+    let heterogeneous = decode_one(
+        r#"{"type":"assistant","uuid":"a2","sessionId":"s","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"text","text":"safe","text":{"nested":"ambiguous"}}]}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(heterogeneous, DecodeError::Malformed(_)));
+}
+
+#[test]
+fn metadata_has_observation_without_human_intent_or_activity_facts() {
+    let decoded = decode_one(
+        r#"{"type":"attachment","message":{"content":"not human intent"}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    assert!(decoded.events().is_empty());
+    assert!(decoded.evidence().is_empty());
+    assert!(matches!(decoded.disposition(), DecodeDisposition::Known));
+}
+
+#[test]
+fn context_change_uses_only_trusted_project_labels_and_branch_hashes() {
+    let first = decode_one(
+        r#"{"type":"system","uuid":"sys1","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","cwd":"/fixture/project/sub","gitBranch":"secret/customer-branch","mode":"plan","permissionMode":"safe"}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let serialized = event_json(&first);
+    assert!(serialized.contains("$PROJECT/sub"));
+    assert!(!serialized.contains("/fixture/project"));
+    assert!(!serialized.contains("secret/customer-branch"));
+    assert!(serialized.contains("branch_hash"));
+
+    let repeated = decode_one(
+        r#"{"type":"system","uuid":"sys2","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","cwd":"/fixture/project/sub","gitBranch":"secret/customer-branch","mode":"plan","permissionMode":"safe"}"#,
+        first.next_state(),
+    )
+    .unwrap();
+    assert!(
+        !repeated
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::SessionContextChanged { .. }))
+    );
+
+    let partial = decode_one(
+        r#"{"type":"system","uuid":"sys3","sessionId":"s1","timestamp":"2026-07-17T01:00:02Z","mode":"build"}"#,
+        repeated.next_state(),
+    )
+    .unwrap();
+    let partial_json = event_json(&partial);
+    assert!(partial_json.contains("$PROJECT/sub"));
+    assert!(partial_json.contains("mode=build"));
+    assert!(partial_json.contains("permission=safe"));
+    let EventPayload::SessionContextChanged { branch_hash, .. } = partial.events()[0].payload()
+    else {
+        panic!("expected merged context");
+    };
+    assert!(branch_hash.is_some());
+}
+
+#[test]
+fn unknown_context_labels_never_enter_events_state_or_debug() {
+    let safe = decode_one(
+        r#"{"type":"system","uuid":"safe","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","mode":"plan","permissionMode":"safe"}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let unsafe_record = decode_one(
+        r#"{"type":"system","uuid":"unsafe","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","mode":"/Users/alice/key","permissionMode":"token=SECRET"}"#,
+        safe.next_state(),
+    )
+    .unwrap();
+    assert!(unsafe_record.events().is_empty());
+    assert_eq!(unsafe_record.next_state(), safe.next_state());
+    let event = event_json(&unsafe_record);
+    let debug = format!("{unsafe_record:?}");
+    let state = unsafe_record.next_state().as_bytes();
+    for forbidden in [
+        "/Users/alice/key",
+        "token=SECRET",
+        "Bearer ",
+        "sk-ant-",
+        "api_key",
+    ] {
+        assert!(!event.contains(forbidden));
+        assert!(!debug.contains(forbidden));
+        assert!(
+            !state
+                .windows(forbidden.len())
+                .any(|window| window == forbidden.as_bytes())
+        );
+    }
+}
+
+#[test]
+fn legacy_context_hash_state_is_accepted_and_not_reemitted() {
+    let mut legacy = DecoderState::default();
+    legacy
+        .replace(
+            br#"{"unresolved_tools":[],"last_human_turn":null,"last_context_hash":"LEGACY_PRIVATE_HASH"}"#
+                .to_vec(),
+        )
+        .unwrap();
+    let decoded = decode_one(
+        r#"{"type":"system","uuid":"legacy","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","cwd":"/fixture/project"}"#,
+        &legacy,
+    )
+    .unwrap();
+    assert!(
+        decoded
+            .events()
+            .iter()
+            .filter(|event| matches!(event.payload(), EventPayload::SessionContextChanged { .. }))
+            .count()
+            <= 1
+    );
+    assert!(
+        !decoded
+            .next_state()
+            .as_bytes()
+            .windows("LEGACY_PRIVATE_HASH".len())
+            .any(|window| window == b"LEGACY_PRIVATE_HASH")
+    );
+}
+
+#[test]
+fn unknown_fields_are_bounded_and_only_shape_changes_schema_fingerprint() {
+    let field = "f".repeat(4096);
+    let one = decode_one(
+        &format!(r#"{{"type":"future","{field}":"private-one"}}"#),
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let two = decode_one(
+        &format!(r#"{{"type":"future","{field}":"private-two"}}"#),
+        &DecoderState::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        one.observation().schema_fingerprint(),
+        two.observation().schema_fingerprint()
+    );
+    assert!(!format!("{one:?}").contains("private-one"));
+    assert!(matches!(
+        one.disposition(),
+        DecodeDisposition::UnknownType { .. }
+    ));
+}
+
+#[test]
+fn cardinality_limit_returns_a_bounded_oversized_diagnostic() {
+    let blocks = (0..65)
+        .map(|index| format!(r#"{{"type":"text","text":"{index}"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let decoded = decode_one(
+        &format!(
+            r#"{{"type":"assistant","uuid":"many","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{{"content":[{blocks}]}}}}"#
+        ),
+        &DecoderState::default(),
+    )
+    .unwrap();
+    assert!(decoded.events().is_empty());
+    assert!(decoded.evidence().is_empty());
+    assert!(matches!(
+        decoded.disposition(),
+        DecodeDisposition::Oversized { .. }
+    ));
+}
+
+#[test]
+fn content_media_types_distinguish_text_structured_json_and_paths() {
+    let message = decode_one(
+        r#"{"type":"user","uuid":"u-media","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":"hello"}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let message_content = message
+        .events()
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::MessageCreated { content } => Some(content),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(message_content.media_type(), "text/plain");
+
+    let request = decode_one(
+        r#"{"type":"assistant","uuid":"a-media","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{"content":[{"type":"tool_use","id":"media-tool","name":"Write","input":{"file_path":"src/a.rs"}}]}}"#,
+        message.next_state(),
+    )
+    .unwrap();
+    let request_content = request
+        .events()
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::ActionRequested { input, .. } => Some(input),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(request_content.media_type(), "application/json");
+
+    let result = decode_one(
+        r#"{"type":"user","uuid":"u-media-result","sessionId":"s1","timestamp":"2026-07-17T01:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"media-tool","content":{"ok":true},"is_error":false}]}}"#,
+        request.next_state(),
+    )
+    .unwrap();
+    let path = result
+        .events()
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::ArtifactChanged { path, .. } => Some(path),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(path.media_type(), "text/uri-list");
+}
+
+#[test]
+fn structured_input_is_hashed_whole_but_tool_result_keeps_only_safe_text() {
+    let request = decode_one(
+        r#"{"type":"assistant","uuid":"a-raw","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"tool_use","id":"raw-array","name":"Read","input":["src/a.rs",{"line":1}]}]}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let EventPayload::ActionRequested { input, .. } = request.events()[0].payload() else {
+        panic!("expected request");
+    };
+    let raw_input = br#"["src/a.rs",{"line":1}]"#;
+    assert_eq!(input.hash(), blake3::hash(raw_input).to_hex().as_str());
+    assert_eq!(input.byte_length(), u64::try_from(raw_input.len()).unwrap());
+
+    let result = decode_one(
+        r#"{"type":"user","uuid":"u-raw","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"raw-array","content":[{"type":"image","source":{"type":"base64","data":"PRIVATE_BASE64"}},{"type":"thinking","thinking":"PRIVATE_THINKING"}],"is_error":false}]},"toolUseResult":[{"type":"text","text":"ok"},{"type":"image","source":{"data":"TOP_PRIVATE_BASE64"}},{"type":"redacted_thinking","data":"TOP_PRIVATE_REASONING"}]}"#,
+        request.next_state(),
+    )
+    .unwrap();
+    let output = result
+        .events()
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::ActionFinished {
+                output: Some(output),
+                ..
+            } => Some(output),
+            _ => None,
+        })
+        .unwrap();
+    let safe_output = b"ok";
+    assert_eq!(output.hash(), blake3::hash(safe_output).to_hex().as_str());
+    assert_eq!(output.media_type(), "text/plain");
+    assert_eq!(
+        result
+            .evidence()
+            .iter()
+            .find(|evidence| &evidence.content == output)
+            .unwrap()
+            .plaintext
+            .as_slice(),
+        safe_output
+    );
+    let event_json = event_json(&result);
+    let debug = format!("{result:?}");
+    let state = result.next_state().as_bytes();
+    for forbidden in [
+        "PRIVATE_BASE64",
+        "PRIVATE_THINKING",
+        "TOP_PRIVATE_BASE64",
+        "TOP_PRIVATE_REASONING",
+    ] {
+        assert!(!event_json.contains(forbidden));
+        assert!(!debug.contains(forbidden));
+        assert!(
+            !state
+                .windows(forbidden.len())
+                .any(|window| window == forbidden.as_bytes())
+        );
+        assert!(!result.evidence().iter().any(|evidence| {
+            evidence
+                .plaintext
+                .windows(forbidden.len())
+                .any(|window| window == forbidden.as_bytes())
+        }));
+    }
+}
+
+#[test]
+fn source_identity_and_observation_are_distinct_across_files() {
+    let json = r#"{"type":"user","uuid":"same","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":"same"}}"#;
+    let source = MemoryRecordSource::new(json.as_bytes().to_vec());
+    let mut second_context = context();
+    second_context.source_id = "source_other".to_owned();
+    let first = ClaudeAdapter
+        .decode(&source, &context(), &DecoderState::default())
+        .unwrap();
+    let second = ClaudeAdapter
+        .decode(&source, &second_context, &DecoderState::default())
+        .unwrap();
+    assert_ne!(first.events()[0].event_id(), second.events()[0].event_id());
+    assert_ne!(
+        first.evidence()[0].evidence_id,
+        second.evidence()[0].evidence_id
+    );
+    assert_ne!(
+        first.observation().observation_id(),
+        second.observation().observation_id()
+    );
+}
+
+#[test]
+fn invalid_trusted_project_root_fails_closed() {
+    let mut invalid = context();
+    invalid.project_root = Some("../fixture/project".into());
+    let source = MemoryRecordSource::new(
+        br#"{"type":"user","uuid":"u","sessionId":"s","timestamp":"2026-07-17T01:00:00Z","message":{"content":"x"}}"#.to_vec(),
+    );
+    assert!(matches!(
+        ClaudeAdapter.decode(&source, &invalid, &DecoderState::default()),
+        Err(DecodeError::Malformed(_))
+    ));
+}
+
+#[test]
+fn multi_block_hash_matches_exact_joined_evidence_bytes() {
+    let json = r#"{"type":"assistant","uuid":"joined","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"text","text":"alpha🦀"},{"type":"text","text":"beta"}]}}"#;
+    let decoded = decode_one(json, &DecoderState::default()).unwrap();
+    let EventPayload::MessageCreated { content } = decoded.events()[0].payload() else {
+        panic!("expected message");
+    };
+    let joined = "alpha🦀\nbeta".as_bytes();
+    assert_eq!(content.hash(), blake3::hash(joined).to_hex().as_str());
+    let evidence = decoded
+        .evidence()
+        .iter()
+        .find(|evidence| &evidence.content == content)
+        .unwrap();
+    assert_eq!(evidence.plaintext.as_slice(), joined);
+}
+
+#[test]
+fn aggregate_text_over_inline_limit_preserves_message_hash_and_tool_action() {
+    let first = "a".repeat(40 * 1024);
+    let second = "b".repeat(40 * 1024);
+    let joined = format!("{first}\n{second}");
+    let decoded = decode_one(
+        &format!(
+            r#"{{"type":"assistant","uuid":"large-joined","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{{"content":[{{"type":"text","text":"{first}"}},{{"type":"tool_use","id":"kept-action","name":"Read","input":{{}}}},{{"type":"text","text":"{second}"}}]}}}}"#
+        ),
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let message = decoded
+        .events()
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::MessageCreated { content } => Some(content),
+            _ => None,
+        })
+        .unwrap();
+    assert!(message.is_truncated());
+    assert_eq!(message.byte_length(), joined.len() as u64);
+    assert_eq!(
+        message.hash(),
+        blake3::hash(joined.as_bytes()).to_hex().as_str()
+    );
+    assert!(
+        !decoded
+            .evidence()
+            .iter()
+            .any(|evidence| &evidence.content == message)
+    );
+    assert!(decoded.events().iter().any(|event| matches!(
+        event.payload(),
+        EventPayload::ActionRequested { native_action_id, .. }
+            if native_action_id == "kept-action"
+    )));
+    assert!(
+        decoded
+            .next_state()
+            .as_bytes()
+            .windows("kept-action".len())
+            .any(|window| window == b"kept-action")
+    );
+}
+
+#[test]
+fn large_typed_tool_result_streams_exact_output_without_plaintext_evidence() {
+    let request = decode_one(
+        r#"{"type":"assistant","uuid":"typed-request","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"tool_use","id":"typed-large","name":"Read","input":{}}]}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let secret = "TOOL_SECRET_AT_END";
+    let large = format!("{}{secret}", "x".repeat(70 * 1024 - secret.len()));
+    let tail = "small-safe";
+    let result = decode_one(
+        &format!(
+            r#"{{"type":"user","uuid":"typed-result","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{{"content":[{{"type":"text","text":"unrelated-human"}},{{"type":"tool_result","tool_use_id":"typed-large","content":[{{"type":"text","text":"{large}"}},{{"type":"image","source":{{"data":"PRIVATE_IMAGE_BYTES"}}}},{{"type":"text","text":"{tail}"}}]}}]}}}}"#
+        ),
+        request.next_state(),
+    )
+    .unwrap();
+    let output = result
+        .events()
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::ActionFinished {
+                output: Some(output),
+                ..
+            } => Some(output),
+            _ => None,
+        })
+        .unwrap();
+    let joined = format!("{large}\n{tail}");
+    assert_eq!(output.byte_length(), joined.len() as u64);
+    assert_eq!(
+        output.hash(),
+        blake3::hash(joined.as_bytes()).to_hex().as_str()
+    );
+    assert!(output.is_truncated());
+    assert!(
+        !result
+            .evidence()
+            .iter()
+            .any(|evidence| &evidence.content == output)
+    );
+    assert!(
+        result
+            .events()
+            .iter()
+            .any(|event| matches!(event.payload(), EventPayload::MessageCreated { .. }))
+    );
+    let serialized = event_json(&result);
+    let debug = format!("{result:?}");
+    let state = result.next_state().as_bytes();
+    for forbidden in [secret, "PRIVATE_IMAGE_BYTES", tail] {
+        assert!(!serialized.contains(forbidden));
+        assert!(!debug.contains(forbidden));
+        assert!(
+            !state
+                .windows(forbidden.len())
+                .any(|window| window == forbidden.as_bytes())
+        );
+        assert!(!result.evidence().iter().any(|evidence| {
+            evidence
+                .plaintext
+                .windows(forbidden.len())
+                .any(|window| window == forbidden.as_bytes())
+        }));
+    }
+}
+
+#[test]
+fn sixty_four_full_text_blocks_stream_to_one_truncated_message() {
+    let text = "x".repeat(64 * 1024);
+    let blocks = (0..64)
+        .map(|_| format!(r#"{{"type":"text","text":"{text}"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let decoded = decode_one(
+        &format!(
+            r#"{{"type":"assistant","uuid":"budget","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{{"content":[{blocks}]}}}}"#
+        ),
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let EventPayload::MessageCreated { content } = decoded.events()[0].payload() else {
+        panic!("expected message");
+    };
+    let mut hasher = blake3::Hasher::new();
+    for index in 0..64 {
+        if index > 0 {
+            hasher.update(b"\n");
+        }
+        hasher.update(text.as_bytes());
+    }
+    assert_eq!(content.hash(), hasher.finalize().to_hex().as_str());
+    assert_eq!(content.byte_length(), 64_u64 * 64 * 1024 + 63);
+    assert!(content.is_truncated());
+    assert!(decoded.evidence().is_empty());
+    assert!(matches!(decoded.disposition(), DecodeDisposition::Known));
+}
+
+#[test]
+fn late_top_result_uses_only_the_record_projection_budget_remaining() {
+    let request = decode_one(
+        r#"{"type":"assistant","uuid":"budget-request","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{"content":[{"type":"tool_use","id":"budget-tool","name":"Read","input":{}}]}}"#,
+        &DecoderState::default(),
+    )
+    .unwrap();
+    let full = "x".repeat(64 * 1024 - 2);
+    let nearly_full = "y".repeat(63 * 1024 - 2);
+    let mut blocks = (0..62)
+        .map(|index| format!(r#"{{"type":"metadata-{index}","input":"{full}"}}"#))
+        .collect::<Vec<_>>();
+    blocks.push(format!(
+        r#"{{"type":"metadata-last","input":"{nearly_full}"}}"#
+    ));
+    blocks.push(r#"{"type":"tool_result","tool_use_id":"budget-tool"}"#.to_owned());
+    let top_result = "z".repeat(2 * 1024);
+    let result = decode_one(
+        &format!(
+            r#"{{"type":"user","uuid":"budget-result","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{{"content":[{}]}},"toolUseResult":{{"content":"{top_result}"}}}}"#,
+            blocks.join(",")
+        ),
+        request.next_state(),
+    )
+    .unwrap();
+    let output = result
+        .events()
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::ActionFinished {
+                output: Some(output),
+                ..
+            } => Some(output),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        output.hash(),
+        blake3::hash(top_result.as_bytes()).to_hex().as_str()
+    );
+    assert!(
+        output
+            .redacted_excerpt()
+            .is_some_and(|excerpt| excerpt.len() <= 1024)
+    );
+    assert!(
+        !result
+            .evidence()
+            .iter()
+            .any(|evidence| &evidence.content == output)
+    );
+}
+
+#[test]
+fn fixture_file_helper_preserves_correlation_state() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude/basic.jsonl");
+    let records = agbox_adapters::test_support::decode_fixture_file("claude", path).unwrap();
+    assert_eq!(records.len(), 3);
+    assert!(records[2].events().iter().any(|event| matches!(
+        event.payload(),
+        EventPayload::ActionFinished { native_action_id, .. } if native_action_id == "tool-1"
+    )));
+}
+
+#[test]
+fn terminal_window_integrity_error_overrides_an_early_json_diagnostic() {
+    let mut bytes = br#"{"type":!"#.to_vec();
+    bytes.extend(std::iter::repeat_n(b' ', 9 * 1024));
+    bytes.push(b'\n');
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(&bytes).unwrap();
+    let mutator = file.try_clone().unwrap();
+    let mut scanner = RecordScanner::new(file, 0, u64::try_from(bytes.len()).unwrap()).unwrap();
+    let ScanOutcome::Complete(window) = scanner.next().unwrap() else {
+        panic!("expected complete record");
+    };
+    mutator.set_len(32).unwrap();
+
+    let error = ClaudeAdapter
+        .decode(&window, &context(), &DecoderState::default())
+        .unwrap_err();
+    assert!(
+        matches!(error, DecodeError::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof)
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    #[test]
+    fn tool_result_order_preserves_exactly_once_correlation(
+        priorities in prop::collection::vec(any::<u16>(), 1..8)
+    ) {
+        let expected = priorities.len();
+        let request_blocks = priorities
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format!(
+                r#"{{"type":"tool_use","id":"p-{index}","name":"Read","input":{{"path":"src/{index}.rs"}}}}"#
+            ))
+            .collect::<Vec<_>>()
+            .join(",");
+        let request = decode_one(
+            &format!(
+                r#"{{"type":"assistant","uuid":"prop-request","sessionId":"s1","timestamp":"2026-07-17T01:00:00Z","message":{{"content":[{request_blocks}]}}}}"#
+            ),
+            &DecoderState::default(),
+        ).unwrap();
+        let mut order = priorities.into_iter().enumerate().collect::<Vec<_>>();
+        order.sort_by_key(|(index, priority)| (*priority, *index));
+        let mut state = request.next_state().clone();
+        let mut finished = Vec::new();
+        for (sequence, (index, _)) in order.into_iter().enumerate() {
+            let result = decode_one(
+                &format!(
+                    r#"{{"type":"user","uuid":"prop-{sequence}","sessionId":"s1","timestamp":"2026-07-17T01:00:01Z","message":{{"content":[{{"type":"tool_result","tool_use_id":"p-{index}","content":"ok","is_error":false}}]}}}}"#
+                ),
+                &state,
+            ).unwrap();
+            state = result.next_state().clone();
+            finished.extend(result.events().iter().filter_map(|event| match event.payload() {
+                EventPayload::ActionFinished { native_action_id, .. } => Some(native_action_id.clone()),
+                _ => None,
+            }));
+        }
+        finished.sort();
+        finished.dedup();
+        prop_assert_eq!(finished.len(), expected);
+    }
+}
+
+#[test]
+fn claude_array_user_content_keeps_text_and_excludes_private_blocks() {
+    let records = decode_lines(include_str!("fixtures/claude/array-content.jsonl"));
+    let serialized = serde_json::to_string(
+        &records
+            .iter()
+            .flat_map(agbox_adapters::DecodedRecord::events)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let debug = format!("{records:?}");
+
+    assert!(records[0].events().iter().any(|event| {
+        event.actor() == Actor::Human
+            && matches!(event.payload(), EventPayload::MessageCreated { .. })
+    }));
+    for forbidden in ["REDACTED_FIXTURE", "PRIVATE_REASONING_FIXTURE"] {
+        assert!(!serialized.contains(forbidden));
+        assert!(!debug.contains(forbidden));
+        assert!(
+            !records[0]
+                .next_state()
+                .as_bytes()
+                .windows(forbidden.len())
+                .any(|window| window == forbidden.as_bytes())
+        );
+    }
+}
