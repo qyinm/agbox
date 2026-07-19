@@ -8,6 +8,10 @@ license.workspace = true
 [features]
 test-support = []
 
+[[bin]]
+name = "agbox"
+path = "src/main.rs"
+
 [dependencies]
 agbox-adapters.workspace = true
 agbox-core.workspace = true
