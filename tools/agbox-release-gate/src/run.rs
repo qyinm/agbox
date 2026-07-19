@@ -430,19 +430,19 @@ async fn append_at_approved_rate(
     for second in 0..(APPEND_RECORDS / APPEND_PER_SECOND) {
         let second_started = Instant::now();
         for batch_start in (0..APPEND_PER_SECOND).step_by(APPEND_BATCH_SIZE) {
-            let mut appended_at = Vec::with_capacity(APPEND_BATCH_SIZE);
+            let mut started_at = Vec::with_capacity(APPEND_BATCH_SIZE);
             for offset in batch_start..(batch_start + APPEND_BATCH_SIZE).min(APPEND_PER_SECOND) {
                 let ordinal = second * APPEND_PER_SECOND + offset;
                 let source = &sources[LIVE_CODEX_SOURCES[ordinal % LIVE_CODEX_SOURCES.len()]];
+                started_at.push(Instant::now());
                 let appended = append_one(source, ordinal, coordinator)?;
-                appended_at.push(Instant::now());
                 if appended == 0 {
                     return Err("append_progress".into());
                 }
             }
             drain_parallel(coordinator).await?;
-            for completed in appended_at {
-                latency.record(u64::try_from(completed.elapsed().as_micros()).unwrap_or(u64::MAX));
+            for started in started_at {
+                latency.record(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
             }
         }
         rss_samples.push(sampler.resident_bytes());
@@ -493,7 +493,7 @@ async fn drain_one(coordinator: &Arc<IngestionCoordinator>) -> Result<(), String
             .await
             .map_err(|_| "process")?;
     }
-    Ok(())
+    publish_ready_work(coordinator).await
 }
 
 async fn drain_parallel(coordinator: &Arc<IngestionCoordinator>) -> Result<(), String> {
@@ -508,16 +508,32 @@ async fn drain_parallel(coordinator: &Arc<IngestionCoordinator>) -> Result<(), S
     while let Some(result) = workers.join_next().await {
         result.map_err(|_| "worker_join")?.map_err(|_| "process")?;
     }
+    publish_ready_work(coordinator).await
+}
+
+async fn publish_ready_work(coordinator: &Arc<IngestionCoordinator>) -> Result<(), String> {
+    while !coordinator
+        .reduce_and_publish_grouped_next()
+        .await
+        .map_err(|_| "publish")?
+        .is_empty()
+    {}
     Ok(())
 }
 
 async fn measure_current_work(client: &IpcAppClient, samples: &mut Samples) -> Result<(), String> {
     for _ in 0..MCP_WARMUP_CALLS {
-        let _ = client.call(AppRequest::CurrentWork).await;
+        match client.call(AppRequest::CurrentWork).await {
+            Ok(agbox_core::api::AppResponse::Work(_)) => {}
+            _ => return Err("mcp_warmup".into()),
+        }
     }
     for _ in 0..MCP_MEASURED_CALLS {
         let started = Instant::now();
-        let _ = client.call(AppRequest::CurrentWork).await;
+        match client.call(AppRequest::CurrentWork).await {
+            Ok(agbox_core::api::AppResponse::Work(_)) => {}
+            _ => return Err("mcp_current_work".into()),
+        }
         samples.record(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
     }
     Ok(())
