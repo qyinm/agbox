@@ -34,7 +34,12 @@ impl Samples {
         }
         let mut sorted = self.values.clone();
         sorted.sort_unstable();
-        let index = (sorted.len() - 1).saturating_mul(numerator) / denominator;
+        let index = sorted
+            .len()
+            .saturating_mul(numerator)
+            .div_ceil(denominator)
+            .saturating_sub(1)
+            .min(sorted.len() - 1);
         sorted.get(index).copied()
     }
 
