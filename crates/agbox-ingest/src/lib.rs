@@ -140,6 +140,46 @@ pub mod test_support {
             retry_policy: RetryPolicy,
             clock: Arc<dyn RetryClock>,
         ) -> Result<Self, IngestError> {
+            Self::try_source_bytes_for_provider_with_retry(
+                Provider::Codex,
+                bytes,
+                queue_capacity,
+                retry_policy,
+                clock,
+            )
+            .await
+        }
+
+        pub async fn provider_records<I, S>(
+            provider: Provider,
+            records: I,
+        ) -> Result<Self, IngestError>
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<str>,
+        {
+            let mut bytes = Vec::new();
+            for record in records {
+                bytes.extend_from_slice(record.as_ref().as_bytes());
+                bytes.push(b'\n');
+            }
+            Self::try_source_bytes_for_provider_with_retry(
+                provider,
+                bytes,
+                crate::SOURCE_QUEUE_CAPACITY,
+                RetryPolicy::default(),
+                Arc::new(TokioRetryClock),
+            )
+            .await
+        }
+
+        async fn try_source_bytes_for_provider_with_retry(
+            provider: Provider,
+            bytes: Vec<u8>,
+            queue_capacity: usize,
+            retry_policy: RetryPolicy,
+            clock: Arc<dyn RetryClock>,
+        ) -> Result<Self, IngestError> {
             let directory = tempfile::tempdir().map_err(IngestError::Io)?;
             #[cfg(unix)]
             std::fs::set_permissions(
@@ -166,7 +206,7 @@ pub mod test_support {
             let project_id = ProjectId::for_test("project_fixture");
             let discovered = DiscoveredSource {
                 source_id: source_id.clone(),
-                provider: Provider::Codex,
+                provider,
                 root: root.clone(),
                 path: source_path.clone(),
                 class: RootClass::Active,
@@ -190,7 +230,7 @@ pub mod test_support {
                     repository_identity,
                     project_root: Zeroizing::new(path_bytes(&root)),
                     source_id: source_id.clone(),
-                    provider: Provider::Codex,
+                    provider,
                     root_class: "active".to_owned(),
                     source_path: Zeroizing::new(path_bytes(&source_path)),
                     file_identity,
@@ -212,7 +252,7 @@ pub mod test_support {
                 discovered,
                 project_id,
                 project_root: Some(root),
-                format: "codex-rollout-1".to_owned(),
+                format: source_format(provider).to_owned(),
                 observed_at: OffsetDateTime::UNIX_EPOCH,
             })?;
             coordinator.try_enqueue(key.clone(), source_size, WorkPriority::Live)?;

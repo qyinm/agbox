@@ -139,6 +139,33 @@ async fn claude_and_codex_sources_publish_one_same_project_handoff_contract() {
     );
 }
 
+#[tokio::test]
+async fn codex_and_claude_sources_publish_the_reverse_same_project_handoff_contract() {
+    let codex = include_str!("../../agbox-adapters/tests/fixtures/codex/subagents.jsonl");
+    let claude = include_str!("../../agbox-adapters/tests/fixtures/claude/sidechain.jsonl");
+    let fixture = FixtureRuntime::provider_records(Provider::Claude, claude.lines())
+        .await
+        .unwrap();
+    fixture.drain().await.unwrap();
+    fixture
+        .add_provider_records(Provider::Codex, codex.lines())
+        .await
+        .unwrap();
+    fixture.drain().await.unwrap();
+
+    let reports = fixture.reduce_and_publish_grouped_next().await.unwrap();
+    assert_eq!(reports.len(), 1);
+    assert!(
+        fixture
+            .read_store()
+            .graph_counts_for_test()
+            .await
+            .unwrap()
+            .runs
+            >= 2
+    );
+}
+
 #[test]
 fn tied_candidates_translate_to_split_provenance_edges_without_execution_semantics() {
     let project_id = ProjectId::for_test("project-tie");
